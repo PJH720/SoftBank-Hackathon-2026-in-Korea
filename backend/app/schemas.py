@@ -22,7 +22,8 @@ from pydantic import BaseModel, Field
 MAX_RETRIES = 3
 
 # node = SSH-reachable Docker host in the node pool (any cloud); see docs/node-pool-fleet.md
-DeployTarget = Literal["local", "cloudrun", "node", "function"]  # function = Cloud Run functions (gen2)
+# function = Cloud Run functions (gen2); agent = the user's own machine via cloudmorph_agent.py (app/agents.py)
+DeployTarget = Literal["local", "cloudrun", "node", "function", "agent"]
 # Cloud service models an app can run on (IaaS / container / PaaS / function)
 ServiceModel = Literal["iaas", "caas", "paas", "faas"]
 

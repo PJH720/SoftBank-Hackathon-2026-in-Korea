@@ -1,22 +1,24 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Cloud, KeyRound } from 'lucide-react';
-import { getDeployment, getFleet, getHealth, getProjects, getToken, setToken, startDeploy, subscribe } from './api';
+import { getAgents, getDeployment, getFleet, getHealth, getMe, getProjects, getToken, setToken, startDeploy, subscribe } from './api';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
 import Stepper from './components/Stepper';
 import LogConsole from './components/LogConsole';
 import { AnalysisCard, Endpoints, PatchList } from './components/ResultPanels';
-import { FleetPanel, ProjectsPanel } from './components/OpsPanels';
+import { AgentPanel, FleetPanel, ProjectsPanel } from './components/OpsPanels';
 import { Dot } from './components/ui';
 
 export default function App() {
-  const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', targets: { local: true, cloudrun: true, node: false, function: false } });
+  const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', targets: { agent: false, local: true, cloudrun: true, node: false, function: false } });
+  const [agents, setAgents] = useState([]);
   const [run, setRun] = useState(() => emptyRun());
   const [projects, setProjects] = useState(null);
   const [fleet, setFleet] = useState(null);
   const [healthy, setHealthy] = useState(null);
   const [token, setTokenState] = useState(getToken());
   const [showToken, setShowToken] = useState(false);
+  const [me, setMe] = useState(null);
   const [autoFollow, setAutoFollow] = useState(true);
   const [notice, setNotice] = useState(null);
   const closeRef = useRef(null);
@@ -48,9 +50,10 @@ export default function App() {
   useEffect(() => {
     let alive = true;
     const poll = async () => {
-      const [h, p] = await Promise.all([getHealth(), getProjects().catch(() => null)]);
+      const [h, p, a] = await Promise.all([getHealth(), getProjects().catch(() => null), getAgents().catch(() => [])]);
       if (!alive) return;
       setHealthy(h);
+      setAgents(a);
       if (p) {
         setProjects(p);
         // auto-follow deployments started by a GitHub push
@@ -92,6 +95,13 @@ export default function App() {
   const watchProject = (p) => attach(p.last_deployment_id, { source: p.source, targets: p.targets || [], name: p.name, trigger: p.trigger });
   const saveToken = (v) => { setToken(v); setTokenState(v); };
 
+  // whose dashboard this is: projects, deployments and CD links are per user
+  useEffect(() => {
+    let alive = true;
+    const t = setTimeout(() => getMe().then((m) => alive && setMe(m)).catch(() => alive && setMe(null)), 300);
+    return () => { alive = false; clearTimeout(t); };
+  }, [token]);
+
   return (
     <div className="min-h-screen bg-[#0a0d14] text-slate-100">
       <div className="pointer-events-none fixed inset-x-0 top-0 h-72 bg-gradient-to-b from-violet-900/20 via-indigo-900/5 to-transparent" />
@@ -111,11 +121,11 @@ export default function App() {
               <Dot tone={healthy ? 'emerald' : healthy === false ? 'rose' : 'slate'} pulse={!!healthy} /> 백엔드 {healthy ? '연결됨' : healthy === false ? '끊김' : '확인 중'}
             </span>
             {fleet && <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-slate-300">노드 {fleet.nodes.filter((n) => n.ok).length}/{fleet.nodes.length}</span>}
-            <button type="button" onClick={() => setShowToken((s) => !s)} className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 ${token ? 'border-emerald-500/30 text-emerald-300' : 'border-white/10 text-slate-400'} hover:text-white`}>
-              <KeyRound className="h-3.5 w-3.5" /> {token ? '토큰 설정됨' : 'API 토큰'}
+            <button type="button" onClick={() => setShowToken((s) => !s)} className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 ${me ? 'border-emerald-500/30 text-emerald-300' : token ? 'border-rose-500/30 text-rose-300' : 'border-white/10 text-slate-400'} hover:text-white`}>
+              <KeyRound className="h-3.5 w-3.5" /> {me ? `${me.user}${me.admin ? ' (관리자)' : ''}` : token ? '토큰 확인 안 됨' : 'API 토큰'}
             </button>
             {showToken && (
-              <input autoFocus type="password" value={token} onChange={(e) => saveToken(e.target.value)} placeholder="공개 터널일 때만 필요"
+              <input autoFocus type="password" value={token} onChange={(e) => saveToken(e.target.value)} placeholder="내 API 토큰"
                 className="w-52 rounded-lg border border-white/10 bg-black/40 px-2.5 py-1 text-slate-100 focus:border-violet-500/60 focus:outline-none" />
             )}
           </div>
@@ -129,7 +139,7 @@ export default function App() {
 
         <div className="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
           <div className="space-y-5">
-            <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={run.status === 'running'} fleetAvailable={!!fleet} />
+            <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={run.status === 'running'} fleetAvailable={!!fleet} agentOnline={agents.some((x) => x.online)} />
             <AnalysisCard run={run} />
           </div>
           <div className="min-w-0 space-y-5">
@@ -146,6 +156,7 @@ export default function App() {
 
         <div className="mt-5 space-y-5">
           <ProjectsPanel projects={projects} currentId={run.id} onWatch={watchProject} autoFollow={autoFollow} setAutoFollow={setAutoFollow} />
+          <AgentPanel agents={agents} token={token} />
           <FleetPanel fleet={fleet} />
         </div>
       </div>

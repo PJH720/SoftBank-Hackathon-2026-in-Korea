@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import hmac
 import ipaddress
 import json
 import logging
@@ -38,13 +37,16 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from app import analyzer, deployer, healer, webhooks
+from app import accounts, agents, analyzer, deployer, healer, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
-from app.schemas import AnalysisResult, DeployRequest, DeployTarget, PipelineEvent
+from app.accounts import User
+from app.agents import hub as agent_hub
+from app.schemas import AnalysisResult, DeployRequest, DeployResult, DeployTarget, PipelineEvent
 
 load_dotenv()
 
@@ -89,9 +91,9 @@ _LOCAL_SOURCE_DENY_ROOTS = tuple(
     Path(p) for p in ("/", "/dev", "/etc", "/proc", "/root", "/run", "/sys", "/var/run")
 )
 _logger = logging.getLogger(__name__)
-# API token guard: every path under these prefixes needs CLOUDMORPH_API_TOKEN. /health and the
-# GitHub webhook (HMAC-verified on its own) stay open.
-PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects")
+# API token guard: every path under these prefixes needs a token (admin or per-user, see accounts.py).
+# /health and the GitHub webhooks (HMAC-verified on their own) stay open.
+PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects", "/agent")
 # "testclient" is Starlette TestClient's client host; ASGI servers only ever report IPs here.
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 _PROXY_HEADERS = ("cf-connecting-ip", "x-forwarded-for", "forwarded")
@@ -118,6 +120,7 @@ class Job:
     targets: dict[str, dict] = field(default_factory=dict)
     error: str | None = None
     completed: bool = False
+    owner: str = accounts.ADMIN
 
 
 _jobs: dict[str, Job] = {}
@@ -141,12 +144,60 @@ def _load_projects() -> dict[str, dict]:
 def _save_projects() -> None:
     try:
         PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PROJECTS_FILE.touch(mode=0o600)
+        PROJECTS_FILE.chmod(0o600)  # holds per-project webhook secrets
         PROJECTS_FILE.write_text(json.dumps(_projects, ensure_ascii=False, indent=2))
     except OSError:
         pass  # persistence is best-effort; the in-memory copy is still correct
 
 
 _projects: dict[str, dict] = _load_projects()
+
+
+def _public_project(p: dict) -> dict:
+    return {
+        **p,
+        "owner": p.get("owner", accounts.ADMIN),
+        "cd": webhooks.public_link(p["cd"]) if p.get("cd") else None,
+    }
+
+
+def _project_by_link(link_id: str) -> dict | None:
+    return next((p for p in _projects.values() if (p.get("cd") or {}).get("id") == link_id), None)
+
+
+class CdLinkRequest(BaseModel):
+    github_token: str | None = Field(
+        default=None,
+        description="user's GitHub token with admin:repo_hook; used once to register, never stored",
+    )
+    branch: str | None = Field(
+        default=None, description="branch to deploy; default: the repo's default branch"
+    )
+
+
+class CdUnlinkRequest(BaseModel):
+    github_token: str | None = None
+
+
+class AgentPoll(BaseModel):
+    name: str = Field(max_length=100)
+    info: dict = Field(default_factory=dict)
+
+
+class AgentLog(BaseModel):
+    lines: list[str] = Field(default_factory=list)
+
+
+class AgentResult(BaseModel):
+    success: bool
+    url: str | None = None
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    duration_sec: float | None = None
+
+
 # One deployment per app name at a time: two quick pushes would otherwise race on the same Cloud Run
 # service (candidate tag / promotion) and the same local container name. Later pushes wait their turn.
 _app_locks: dict[str, threading.Lock] = {}
@@ -390,14 +441,17 @@ def run_pipeline(
     target: DeployTarget,
     emit: Callable[[PipelineEvent], None],
     analysis: AnalysisResult | None = None,
+    deploy_fn: Callable[[str, str, DeployTarget], DeployResult] | None = None,
 ) -> bool:
-    """Run one target synchronously; healer owns all retry attempts."""
+    """Run one target synchronously; healer owns all retry attempts.
+    deploy_fn defaults to deployer.deploy; the "agent" target passes one that runs on the user's machine."""
+    deploy_fn = deploy_fn or deployer.deploy
     if analysis is None:  # Preserve backward compatibility for direct calls.
         emit(PipelineEvent(type="stage", stage="analyze"))
         analysis = analyzer.analyze(source)
 
     emit(PipelineEvent(type="stage", stage="deploy", payload={"target": target}))
-    result = deployer.deploy(source, analysis.dockerfile, target)
+    result = deploy_fn(source, analysis.dockerfile, target)
     if result.success:
         emit(PipelineEvent(type="done", payload={"target": target, "url": result.url}))
         return True
@@ -412,7 +466,7 @@ def run_pipeline(
             },
         )
     )
-    report = healer.heal(source, target, result, analysis.dockerfile, deployer.deploy, emit=emit)
+    report = healer.heal(source, target, result, analysis.dockerfile, deploy_fn, emit=emit)
     payload = report.model_dump(mode="json")
     emit(PipelineEvent(type="done" if report.success else "error", payload=payload))
     return report.success
@@ -451,24 +505,41 @@ def create_app() -> FastAPI:
         allow_headers=["Content-Type", "X-API-Token"],
     )
 
-    # Demo guard: with CLOUDMORPH_API_TOKEN set, every PROTECTED_PREFIXES call must carry it.
-    # EventSource cannot set headers, so ?token= is accepted too. Unset -> fail closed: only a
-    # direct loopback client (local dev) passes; anything via a tunnel/proxy or remote gets 503.
+    # Guard: every PROTECTED_PREFIXES call carries a token that maps to a user (accounts.py); the user is
+    # put on request.state.user. EventSource cannot set headers, so ?token= is accepted too. No token
+    # configured -> fail closed: only a direct loopback client (local dev) passes, as admin; anything via
+    # a tunnel/proxy or remote gets 503.
     @app.middleware("http")
     async def require_api_token(request: Request, call_next):
         if request.method == "OPTIONS" or not _is_protected_path(request.url.path):
             return await call_next(request)
-        token = os.getenv("CLOUDMORPH_API_TOKEN")
-        if not token:
+        if not accounts.configured():
             if _is_direct_local_request(request):
+                request.state.user = accounts.LOCAL_ADMIN
                 return await call_next(request)
             return JSONResponse(
                 {"detail": "API token not configured; set CLOUDMORPH_API_TOKEN"}, status_code=503
             )
         supplied = request.headers.get("x-api-token") or request.query_params.get("token") or ""
-        if not hmac.compare_digest(supplied.encode(), token.encode()):
+        user = accounts.identify(supplied)
+        if user is None:
             return JSONResponse({"detail": "missing or invalid X-API-Token"}, status_code=401)
+        request.state.user = user
         return await call_next(request)
+
+    def _user(request: Request) -> User:
+        return request.state.user
+
+    def _own_project(request: Request, name: str) -> dict:
+        project = _projects.get(name)
+        if project is None or not _user(request).owns(project):
+            raise HTTPException(status_code=404, detail="unknown project")  # don't reveal others' names
+        return project
+
+    @app.get("/projects/me")
+    async def whoami(request: Request) -> dict:
+        user = _user(request)
+        return {"user": user.name, "admin": user.admin}
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -486,7 +557,7 @@ def create_app() -> FastAPI:
             )
 
     @app.get("/fleet")
-    async def fleet_status() -> dict:
+    async def fleet_status(request: Request) -> dict:
         """Nodes (with live load), apps, replicas and recent scale events — for the dashboard."""
         reg = nodepool.load_registry()
         state = fleetmod.load_state()
@@ -512,16 +583,15 @@ def create_app() -> FastAPI:
                     "events": a.events[-10:],
                 }
                 for a in state.apps.values()
+                # nodes are shared infrastructure; apps on them are private to their owner
+                if _user(request).owns(_projects.get(a.name, {}))
             ],
             "watch": list(fleet_events)[-20:],
         }
 
     @app.post("/fleet/{app_name}/scale/{n}")
     async def fleet_scale(app_name: str, n: int, request: Request) -> dict:
-        token = os.getenv("CLOUDMORPH_API_TOKEN")
-        if token and request.headers.get("x-api-token") != token:
-            raise HTTPException(status_code=401, detail="missing or invalid X-API-Token")
-        if app_name not in fleetmod.load_state().apps:
+        if app_name not in fleetmod.load_state().apps or not _user(request).owns(_projects.get(app_name, {})):
             raise HTTPException(status_code=404, detail="unknown app")
         result = await asyncio.to_thread(fleetmod.scale, app_name, n)
         return {"app": app_name, "replicas": [r.upstream for r in result.replicas]}
@@ -534,9 +604,12 @@ def create_app() -> FastAPI:
         ref: str | None = None,
         intro: list[str] | None = None,
         trigger: str = "api",
+        owner: str = accounts.ADMIN,
     ) -> str:
         """Create a job and run analyze -> deploy -> heal for every target in a worker thread.
-        Shared by POST /deploy (user click) and POST /webhook/github (push)."""
+        Shared by POST /deploy (user click) and the GitHub webhooks (push).
+        An app name belongs to whoever deployed it first; anyone else gets 409 (no admin override either,
+        so a shared-secret push can never overwrite a user's service)."""
         if not targets or len(targets) != len(set(targets)):
             raise HTTPException(status_code=422, detail="targets must be non-empty and unique")
         if name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
@@ -550,11 +623,15 @@ def create_app() -> FastAPI:
 
         deployment_id = uuid.uuid4().hex[:12]
         app_name = name or f"cloudmorph-{deployment_id}"
-        job = Job(targets={t: {"success": None, "url": None} for t in targets})
+        existing = _projects.get(app_name)
+        if existing is not None and existing.get("owner", accounts.ADMIN) != owner:
+            raise HTTPException(status_code=409, detail=f"app name {app_name!r} is used by another user")
+        job = Job(targets={t: {"success": None, "url": None} for t in targets}, owner=owner)
         _jobs[deployment_id] = job
         project = _projects.setdefault(
-            app_name, {"name": app_name, "source": source, "ref": ref, "history": []}
+            app_name, {"name": app_name, "source": source, "ref": ref, "history": [], "owner": owner}
         )
+        project.setdefault("owner", owner)
         project.update(
             source=source,
             ref=ref,
@@ -590,6 +667,18 @@ def create_app() -> FastAPI:
             finally:
                 lock.release()
 
+        def _deploy_fn(target: str):
+            if target != "agent":
+                return None
+
+            def on_agent(src: str, dockerfile: str, _target) -> DeployResult:
+                def log(line: str) -> None:
+                    emit(PipelineEvent(type="log", stage="deploy", payload={"target": "agent", "line": line}))
+
+                return agent_hub.dispatch(owner, app_name, src, dockerfile, log)
+
+            return on_agent
+
         def _run_locked() -> None:
             with prepare_source(source, ref) as source_dir:
                 emit(PipelineEvent(type="stage", stage="analyze"))
@@ -615,7 +704,9 @@ def create_app() -> FastAPI:
                     target_dir = work_root / f"{app_name}-{target}"
                     try:
                         target_dir = Path(_copy_for_target(source_dir, target_dir))
-                        run_pipeline(target_dir, target, emit, analysis=analysis)
+                        run_pipeline(
+                            target_dir, target, emit, analysis=analysis, deploy_fn=_deploy_fn(target)
+                        )
                     except Exception as exc:  # noqa: BLE001 — isolate target failures
                         emit(
                             PipelineEvent(
@@ -660,17 +751,188 @@ def create_app() -> FastAPI:
     app.state.launch = _launch  # tests swap this for a fake
 
     @app.post("/deploy")
-    async def start_deploy(req: DeployRequest) -> dict[str, str]:
-        return {"deployment_id": app.state.launch(req.source, req.targets, name=req.name, ref=req.ref)}
+    async def start_deploy(req: DeployRequest, request: Request) -> dict[str, str]:
+        deployment_id = app.state.launch(
+            req.source, req.targets, name=req.name, ref=req.ref, owner=_user(request).name
+        )
+        return {"deployment_id": deployment_id}
 
     @app.get("/projects")
-    async def projects() -> dict:
-        """Apps known to this server (by stable name) with their last deployment — what CD updates."""
-        return {"projects": sorted(_projects.values(), key=lambda p: -p.get("updated_at", 0))}
+    async def projects(request: Request) -> dict:
+        """The caller's apps (admin: all) with their last deployment and CD link (secret never included)."""
+        mine = [_public_project(p) for p in _projects.values() if _user(request).owns(p)]
+        return {"projects": sorted(mine, key=lambda p: -p.get("updated_at", 0))}
+
+    def _webhook_base(request: Request) -> str:
+        configured = os.getenv("CLOUDMORPH_PUBLIC_URL", "").rstrip("/")
+        if configured:
+            return configured
+        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+        return f"{proto}://{host}"
+
+    @app.post("/projects/{name}/cd")
+    async def link_cd(name: str, body: CdLinkRequest, request: Request) -> dict:
+        """Connect push-to-deploy for one project. With github_token the webhook is registered on GitHub
+        right away (the token is not stored); without it, the URL + secret are returned once for manual setup."""
+        project = _own_project(request, name)
+        if project.get("cd"):
+            raise HTTPException(status_code=409, detail="already linked; unlink first")
+        repo = webhooks.github_repo(project.get("source"))
+        if repo is None:
+            raise HTTPException(status_code=422, detail="CD needs a public github.com HTTPS source")
+        branch = (body.branch or "").strip() or None
+        if branch is not None and not re.fullmatch(r"[\w./-]{1,100}", branch):
+            raise HTTPException(status_code=422, detail="invalid branch name")
+        link_id, secret = webhooks.new_link()
+        url = f"{_webhook_base(request)}/webhook/github/{link_id}"
+        hook_id = None
+        if body.github_token:
+            try:
+                hook_id = await asyncio.to_thread(
+                    webhooks.create_github_hook, repo, url, secret, body.github_token.strip()
+                )
+            except webhooks.GitHubError as e:
+                raise HTTPException(status_code=502, detail=str(e)) from None
+        project["cd"] = {
+            "id": link_id,
+            "secret": secret,
+            "repo": repo,
+            "branch": branch,
+            "url": url,
+            "hook_id": hook_id,
+            "mode": "auto" if hook_id else "manual",
+            "created_by": _user(request).name,
+            "created_at": time.time(),
+            "last_delivery": None,
+        }
+        _save_projects()
+        out = {"linked": True, **webhooks.public_link(project["cd"])}
+        if not hook_id:
+            out["secret"] = secret  # shown once, for GitHub → Settings → Webhooks
+        return out
+
+    @app.post("/projects/{name}/cd/unlink")
+    async def unlink_cd(name: str, body: CdUnlinkRequest, request: Request) -> dict:
+        """Disconnect CD. Pushes stop deploying at once (the link id is gone); the GitHub hook itself is
+        deleted only when a token is given, otherwise remove it in the repo settings."""
+        project = _own_project(request, name)
+        link = project.get("cd")
+        if not link:
+            raise HTTPException(status_code=404, detail="not linked")
+        removed_on_github = False
+        if link.get("hook_id") and body.github_token:
+            try:
+                await asyncio.to_thread(
+                    webhooks.delete_github_hook, link["repo"], link["hook_id"], body.github_token.strip()
+                )
+                removed_on_github = True
+            except webhooks.GitHubError as e:
+                raise HTTPException(status_code=502, detail=str(e)) from None
+        project["cd"] = None
+        _save_projects()
+        return {"unlinked": True, "removed_on_github": removed_on_github}
+
+    def _push_deploy(project: dict, info: webhooks.PushInfo, source: str) -> str:
+        intro = [
+            f"github push by {info.pusher}: {info.repo_full_name}@{info.branch} {info.sha} — {info.message}"
+        ]
+        return app.state.launch(
+            source,
+            project.get("targets") or webhooks.cd_targets(),
+            name=project["name"],
+            ref=info.branch,
+            intro=intro,
+            trigger="github-push",
+            owner=project.get("owner", accounts.ADMIN),
+        )
+
+    # --- on-premises agent (target "agent", app/agents.py) ---------------------------------------------
+    AGENT_SCRIPT = REPO_ROOT / "agent" / "cloudmorph_agent.py"
+
+    @app.get("/agent/script", response_class=PlainTextResponse)
+    async def agent_script() -> str:
+        """The agent itself (stdlib Python). Same token as the dashboard: curl -H 'X-API-Token: …'."""
+        return AGENT_SCRIPT.read_text()
+
+    @app.get("/agent/status")
+    async def agent_status(request: Request) -> dict:
+        """The caller's agents (never anyone else's)."""
+        return {"agents": agent_hub.agents_of(_user(request).name)}
+
+    @app.post("/agent/poll")
+    async def agent_poll(body: AgentPoll, request: Request) -> dict:
+        """Long-poll (up to ~25 s): heartbeat, then hand this agent its owner's next job."""
+        owner = _user(request).name
+        name = re.sub(r"[^A-Za-z0-9_.-]", "-", body.name)[:40] or "agent"
+        info = {k: body.info.get(k) for k in ("os", "arch", "cpus", "docker", "public", "apps")}
+        deadline = time.monotonic() + agents.POLL_SECONDS
+        while True:
+            job = agent_hub.poll(owner, name, info)
+            if job or time.monotonic() > deadline or await request.is_disconnected():
+                return {"job": job}
+            await asyncio.sleep(0.25)
+
+    def _agent_job(request: Request, job_id: str):
+        job = agent_hub.job_for(_user(request).name, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown job")
+        return job
+
+    @app.get("/agent/jobs/{job_id}/source")
+    async def agent_source(job_id: str, request: Request) -> FileResponse:
+        job = _agent_job(request, job_id)
+        return FileResponse(job.archive, media_type="application/gzip", filename="source.tar.gz")
+
+    @app.post("/agent/jobs/{job_id}/log")
+    async def agent_log(job_id: str, body: AgentLog, request: Request) -> dict:
+        job = _agent_job(request, job_id)  # also the heartbeat while the agent builds
+        for line in body.lines[:200]:
+            job.log(str(line)[:500])
+        return {"ok": True}
+
+    @app.post("/agent/jobs/{job_id}/result")
+    async def agent_result(job_id: str, body: AgentResult, request: Request) -> dict:
+        agent_hub.finish(_agent_job(request, job_id), body.model_dump())
+        return {"ok": True}
+
+    @app.post("/webhook/github/{link_id}")
+    async def github_project_webhook(link_id: str, request: Request) -> dict:
+        """Per-project CD: signed with that project's own secret, redeploys only that project."""
+        project = _project_by_link(link_id)
+        body = await request.body()
+        link = (project or {}).get("cd") or {}
+        # unknown link and bad signature look the same, so link ids cannot be probed
+        if not project or not webhooks.verify_signature(
+            link["secret"], body, request.headers.get("x-hub-signature-256")
+        ):
+            raise HTTPException(status_code=401, detail="bad signature")
+        event = request.headers.get("x-github-event", "")
+        link["last_delivery"] = {"event": event, "at": time.time()}
+        _save_projects()
+        if event == "ping":
+            return {"ok": True, "event": "ping", "name": project["name"]}
+        if event != "push":
+            return {"ok": True, "ignored": event}
+        info = webhooks.parse_push(json.loads(body))
+        if info is None or info.deleted:
+            return {"ok": True, "ignored": "not a branch push"}
+        if info.repo_full_name.lower() != link["repo"]:
+            return {"ok": True, "ignored": f"repository {info.repo_full_name} is not linked here"}
+        if not webhooks.link_branch_allowed(link, info):
+            return {
+                "ok": True,
+                "ignored": f"branch {info.branch} (linked: {link.get('branch') or 'default'})",
+            }
+        # deploy the linked repo, not whatever the project's source was later changed to
+        deployment_id = _push_deploy(project, info, f"https://github.com/{link['repo']}.git")
+        return {"ok": True, "deployment_id": deployment_id, "name": project["name"], "sha": info.sha}
 
     @app.post("/webhook/github")
     async def github_webhook(request: Request) -> dict:
-        """GitHub push -> redeploy the repository under its own name (CD). Secret-signed; default branch only."""
+        """Shared CD endpoint (operator secret). Redeploys every *unlinked* project built from the pushed repo,
+        each under its own name/targets/owner; linked projects are served by their own endpoint only.
+        No such project: deploy the repo under its own name to CLOUDMORPH_CD_TARGETS as admin."""
         secret = os.getenv("CLOUDMORPH_WEBHOOK_SECRET", "")
         if not secret:
             raise HTTPException(status_code=503, detail="CLOUDMORPH_WEBHOOK_SECRET not configured")
@@ -687,13 +949,21 @@ def create_app() -> FastAPI:
             return {"ok": True, "ignored": "not a branch push"}
         if not webhooks.branch_allowed(info):
             return {"ok": True, "ignored": f"branch {info.branch} (not in CD branches)"}
+        repo = info.repo_full_name.lower()
+        matches = [p for p in _projects.values() if webhooks.github_repo(p.get("source")) == repo]
+        if matches:
+            deployments = []
+            for p in matches:
+                if p.get("cd"):
+                    continue  # has its own webhook; deploying here too would run it twice
+                deployments.append({"name": p["name"], "deployment_id": _push_deploy(p, info, p["source"])})
+            return {"ok": True, "deployments": deployments, "branch": info.branch, "sha": info.sha}
         targets = webhooks.cd_targets()
-        intro = [
-            f"github push by {info.pusher}: {info.repo_full_name}@{info.branch} {info.sha} — {info.message}"
-        ]
-        deployment_id = app.state.launch(
-            info.clone_url, targets, name=info.app_name, ref=info.branch, intro=intro, trigger="github-push"
-        )
+        fallback = {"name": info.app_name, "targets": targets, "owner": accounts.ADMIN}
+        try:
+            deployment_id = _push_deploy(fallback, info, info.clone_url)
+        except HTTPException as e:  # repo name already taken by a user's unrelated app
+            return {"ok": True, "ignored": e.detail}
         return {
             "ok": True,
             "deployment_id": deployment_id,
@@ -703,9 +973,15 @@ def create_app() -> FastAPI:
             "sha": info.sha,
         }
 
-    @app.get("/deploy/{deployment_id}")
-    async def deploy_status(deployment_id: str) -> dict:
+    def _own_job(request: Request, deployment_id: str) -> Job | None:
         job = _jobs.get(deployment_id)
+        if job is None or not _user(request).owns({"owner": job.owner}):
+            return None
+        return job
+
+    @app.get("/deploy/{deployment_id}")
+    async def deploy_status(deployment_id: str, request: Request) -> dict:
+        job = _own_job(request, deployment_id)
         if job is None:
             raise HTTPException(status_code=404, detail="unknown deployment_id")
         return {
@@ -717,8 +993,8 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/deploy/{deployment_id}/events")
-    async def events(deployment_id: str) -> EventSourceResponse:
-        job = _jobs.get(deployment_id)
+    async def events(deployment_id: str, request: Request) -> EventSourceResponse:
+        job = _own_job(request, deployment_id)
         if job is None:
             raise HTTPException(status_code=404, detail="unknown deployment_id")
 

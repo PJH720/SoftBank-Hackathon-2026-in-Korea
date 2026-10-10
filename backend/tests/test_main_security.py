@@ -11,10 +11,15 @@ import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from app.accounts import LOCAL_ADMIN
 from app.schemas import AnalysisResult, DeployRequest, DeployResult
+
+# handlers are called directly here, so pass the caller the auth middleware would have set
+ADMIN = SimpleNamespace(state=SimpleNamespace(user=LOCAL_ADMIN))
 
 
 @pytest.fixture
@@ -568,7 +573,7 @@ def test_two_jobs_names_api_status_and_sse(m, tmp_path, monkeypatch):
         assert await routes["/health"]() == {"status": "ok"}
         ids = []
         for _ in range(2):
-            response = await routes["/deploy"](DeployRequest(source=str(source)))
+            response = await routes["/deploy"](DeployRequest(source=str(source)), ADMIN)
             assert set(response) == {"deployment_id"}
             ids.append(response["deployment_id"])
 
@@ -578,10 +583,10 @@ def test_two_jobs_names_api_status_and_sse(m, tmp_path, monkeypatch):
 
         await asyncio.wait_for(wait_for_jobs(), timeout=5)
         for deployment_id in ids:
-            status = await routes["/deploy/{deployment_id}"](deployment_id)
+            status = await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
             assert status["status"] == "completed", status
             assert set(status["targets"]) == {"local", "cloudrun"}
-            response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+            response = await routes["/deploy/{deployment_id}/events"](deployment_id, ADMIN)
             events = [event async for event in response.body_iterator]
             # analyzer summary/notes are streamed as "log" events; the stage/done backbone is unchanged
             assert [e["event"] for e in events if e["event"] != "log"] == [
@@ -655,7 +660,7 @@ def test_cloudrun_workspace_is_removed_after_heal_finishes(m, tmp_path, monkeypa
     routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
 
     async def scenario():
-        response = await routes["/deploy"](DeployRequest(source=str(source), targets=["cloudrun"]))
+        response = await routes["/deploy"](DeployRequest(source=str(source), targets=["cloudrun"]), ADMIN)
         deployment_id = response["deployment_id"]
 
         async def wait_for_job():
@@ -663,7 +668,7 @@ def test_cloudrun_workspace_is_removed_after_heal_finishes(m, tmp_path, monkeypa
                 await asyncio.sleep(0.001)
 
         await asyncio.wait_for(wait_for_job(), timeout=5)
-        return await routes["/deploy/{deployment_id}"](deployment_id)
+        return await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
 
     status = asyncio.run(scenario())
     assert status["status"] == "completed"
@@ -716,7 +721,7 @@ def test_failed_deploy_heals_and_preserves_sse_contract(m, tmp_path, monkeypatch
     routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
 
     async def scenario():
-        response = await routes["/deploy"](DeployRequest(source=str(source), targets=["local"]))
+        response = await routes["/deploy"](DeployRequest(source=str(source), targets=["local"]), ADMIN)
         assert set(response) == {"deployment_id"}
         deployment_id = response["deployment_id"]
 
@@ -725,9 +730,9 @@ def test_failed_deploy_heals_and_preserves_sse_contract(m, tmp_path, monkeypatch
                 await asyncio.sleep(0.001)
 
         await asyncio.wait_for(wait_for_job(), timeout=5)
-        status = await routes["/deploy/{deployment_id}"](deployment_id)
+        status = await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
         assert status["status"] == "completed", status
-        events_response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        events_response = await routes["/deploy/{deployment_id}/events"](deployment_id, ADMIN)
         events = [event async for event in events_response.body_iterator]
         return events
 

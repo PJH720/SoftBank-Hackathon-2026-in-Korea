@@ -1,10 +1,10 @@
 import React from 'react';
-import { Zap, Cloud, FolderGit2, Loader2, Network, Play, Server, Tag } from 'lucide-react';
+import { Zap, Cloud, FolderGit2, Laptop, Loader2, Network, Play, Server, Tag } from 'lucide-react';
 import { TARGET_META } from '../lib/run';
 import { Card } from './ui';
 import { TONE } from '../lib/style';
 
-const ICONS = { local: Server, cloudrun: Cloud, node: Network, function: Zap };
+const ICONS = { agent: Laptop, local: Server, cloudrun: Cloud, node: Network, function: Zap };
 const PRESETS = [
   { label: '방명록 (DB)', value: 'sample-apps/guestbook' },
   { label: '고장 앱 (자가치유)', value: 'sample-apps/broken' },
@@ -12,7 +12,7 @@ const PRESETS = [
   { label: '서버리스 함수', value: 'sample-apps/function-hello' },
 ];
 
-export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailable }) {
+export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailable, agentOnline }) {
   const toggle = (t) => setForm((f) => ({ ...f, targets: { ...f.targets, [t]: !f.targets[t] } }));
   const selected = Object.keys(form.targets).filter((t) => form.targets[t]);
   return (
@@ -56,14 +56,14 @@ export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailab
             {Object.entries(TARGET_META).map(([t, m]) => {
               const Icon = ICONS[t];
               const on = form.targets[t];
-              const disabled = t === 'node' && !fleetAvailable;
+              const disabled = (t === 'node' && !fleetAvailable) || (t === 'agent' && !agentOnline);
               return (
                 <button key={t} type="button" disabled={disabled} onClick={() => toggle(t)}
                   className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition ${on ? `${TONE[m.tone].border} bg-white/[0.04]` : 'border-white/5 hover:border-white/15'} ${disabled ? 'cursor-not-allowed opacity-40' : ''}`}>
                   <span className={`grid h-8 w-8 place-items-center rounded-lg ${on ? TONE[m.tone].soft : 'bg-white/5 text-slate-500'} ring-1 ring-inset ring-white/5`}><Icon className="h-4 w-4" /></span>
                   <span className="min-w-0 flex-1">
                     <span className={`block text-[13px] font-semibold ${on ? 'text-slate-100' : 'text-slate-400'}`}>{m.label}</span>
-                    <span className="block truncate text-[11px] text-slate-500">{disabled ? '노드 풀이 설정되지 않음' : m.sub}</span>
+                    <span className="block truncate text-[11px] text-slate-500">{disabled ? (t === 'agent' ? '내 PC에서 에이전트를 실행하면 켜집니다 (아래 안내)' : '노드 풀이 설정되지 않음') : m.sub}</span>
                   </span>
                   <span className={`h-4 w-4 rounded-full border-2 ${on ? `border-transparent ${TONE[m.tone].dot}` : 'border-slate-600'}`} />
                 </button>

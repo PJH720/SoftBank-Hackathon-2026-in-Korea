@@ -21,10 +21,11 @@ CLOUDMORPH_SERVER=cloudmorph@34.64.253.41 CLOUDMORPH_DOMAIN=cloudmorph.34-64-253
 ```
 
 ## 서버에서 달라지는 점
-- **local 타깃 = 서버 자신의 Docker** (온프레미스형). 내 노트북에 배포하는 장면이 필요하면 노트북에서 `scripts/demo-up.sh`로 같은 코드를 띄운다(노트북은 공인 IP가 없어 서버가 들어갈 수 없음).
+- **local 타깃 = 서버 자신의 Docker** (대시보드 표기 "CloudMorph 서버"). 사용자 PC 자원을 쓰는 진짜 온프레미스는 `agent` 타깃이다 → [onprem-agent.md](onprem-agent.md). 내 노트북에 배포하는 장면이 필요하면 노트북에서 `scripts/demo-up.sh`로 같은 코드를 띄운다(노트북은 공인 IP가 없어 서버가 들어갈 수 없음).
 - 소스는 **서버의 임시 폴더**로 가져온다. GitHub URL을 권장. 서버 경로(`sample-apps/...`)는 서버의 저장소 기준.
 - 서버가 x86이라 Cloud Run용 amd64 빌드가 교차 빌드 없이 빠르다.
-- 토큰은 서버에 항상 설정되어 있다(대시보드에서 입력). 웹훅은 저장소별 HMAC 서명.
+- 토큰은 서버에 항상 설정되어 있다(대시보드에서 입력). `CLOUDMORPH_API_TOKEN`은 관리자, 팀원·사용자별 토큰은 `~/cloudmorph-server.env`에 `CLOUDMORPH_USERS=alice:<토큰>,bob:<토큰>`으로 넣고 백엔드를 재시작한다. 사용자는 자기 프로젝트만 보고 바꾼다.
+- push 자동 배포는 프로젝트마다 연결한다(대시보드 프로젝트 목록 → "push 자동 배포 연결"). 프로젝트별 웹훅 URL·비밀값을 쓴다. 자세한 것은 [cd-github-webhook.md](cd-github-webhook.md).
 - 자동 확장 감시 루프가 백엔드 안에서 상시 돈다(`CLOUDMORPH_FLEET_WATCH=1`).
 
 ## 실측 (서버 대시보드, Playwright + Chrome)

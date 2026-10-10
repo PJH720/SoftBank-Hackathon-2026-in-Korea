@@ -2,7 +2,8 @@
 // GitHub-push deployment, replays to the same picture). EventSource reconnects replay history; `seen` dedupes.
 
 export const TARGET_META = {
-  local: { label: 'Local Docker', sub: '온프레미스 · cloudflared 터널', tone: 'emerald' },
+  agent: { label: '내 PC (온프레미스)', sub: '에이전트가 내 컴퓨터의 Docker로 배포', tone: 'rose' },
+  local: { label: 'CloudMorph 서버', sub: '서버 VM의 Docker · cloudflared 터널', tone: 'emerald' },
   cloudrun: { label: 'Cloud Run', sub: '서버리스 컨테이너 · 블루그린', tone: 'indigo' },
   node: { label: 'Node Pool', sub: '멀티 클라우드 VM · 자동 확장', tone: 'sky' },
   function: { label: 'Cloud Run functions', sub: '서버리스 함수 · 소스만 업로드', tone: 'amber' },

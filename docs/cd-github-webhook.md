@@ -1,6 +1,45 @@
-# GitHub push → 자동 재배포 (CD) — `POST /webhook/github`
+# GitHub push → 자동 재배포 (CD)
 
-## 흐름
+## 여러 사용자 기준 설계 (10/10 추가)
+
+서버 한 대를 여러 사람이 같이 쓴다는 전제다. 그래서 세 가지를 사용자 단위로 나눴다.
+
+| 무엇 | 어떻게 |
+|---|---|
+| **누구인가** | API 토큰이 곧 사용자다 (`backend/app/accounts.py`). `CLOUDMORPH_API_TOKEN` = 관리자, `CLOUDMORPH_USERS="alice:<토큰>,bob:<토큰>"` 또는 `CLOUDMORPH_USERS_FILE`(JSON) = 일반 사용자. `GET /projects/me`로 확인한다 |
+| **무엇을 볼 수 있나** | 프로젝트·배포 상태·SSE 로그·fleet 앱·스케일은 **소유자만** (관리자는 전부). 남의 것은 404로 보여서 이름도 드러나지 않는다. 노드 목록은 공용 인프라라 모두에게 보인다 |
+| **앱 이름** | **먼저 배포한 사람의 것**이다. Cloud Run 서비스 이름은 GCP 프로젝트 전체에서 하나라서, 같은 이름으로 남의 서비스를 덮어쓰지 못하게 409로 막는다. 관리자도 남의 이름은 못 쓴다. 소유자가 없는 예전 프로젝트는 관리자 소유로 본다 |
+
+### 프로젝트별 push 자동 배포 (권장)
+```
+대시보드에서 GitHub 저장소 배포 (이름 shop, 타깃 cloudrun+node)
+  └─ 프로젝트 목록 → "push 자동 배포 연결"
+       POST /projects/shop/cd {github_token?, branch?}
+       ├─ 링크 생성: 링크 id(웹훅 URL에 들어감) + 이 프로젝트 전용 HMAC 비밀값
+       ├─ github_token 있음 → 서버가 GitHub API로 웹훅 등록 (토큰은 이 한 번만 쓰고 저장하지 않음)
+       └─ 없음            → URL + 비밀값을 한 번만 보여 줌 → 사용자가 GitHub 설정에 직접 등록
+
+git push origin main
+  └─ GitHub ─▶ POST /webhook/github/<링크 id>  (그 링크의 비밀값으로 서명)
+       ─▶ 서명 확인 ─▶ 연결한 저장소가 맞나 ─▶ 연결한 브랜치(없으면 저장소 기본 브랜치)인가
+       ─▶ 그 프로젝트의 이름·타깃·소유자 그대로 재배포 → 같은 Cloud Run 서비스에 새 리비전(블루그린)
+```
+- **UI 배포와 CD가 같은 앱이다.** 예전에는 push가 저장소 이름·전역 타깃으로 별개 서비스를 만들었다.
+- **비밀값이 프로젝트마다 다르다.** 하나가 새어도 그 프로젝트 하나만 영향을 받고, 공용 비밀값을 사용자에게 나눠 줄 필요가 없다.
+- 배포 소스는 링크한 저장소로 고정한다. 나중에 프로젝트 소스를 바꿔도 push가 엉뚱한 코드를 배포하지 않는다.
+- 해제(`POST /projects/{name}/cd/unlink`)하면 링크 id가 사라져 그 즉시 push가 401이 된다. GitHub 토큰을 주면 GitHub 쪽 웹훅도 지운다.
+- 비밀값은 `projects.json`(권한 600)에만 있고 `GET /projects`에는 나오지 않는다. 마지막 수신 시각·이벤트는 보인다.
+- GitHub 토큰: fine-grained면 대상 저장소의 **Webhooks: Read and write**, classic이면 **admin:repo_hook**.
+- 웹훅 URL은 `CLOUDMORPH_PUBLIC_URL`이 있으면 그것, 없으면 요청의 Host·X-Forwarded-Proto로 만든다.
+
+### 공용 엔드포인트 `POST /webhook/github` (예전 방식, 운영자용)
+`CLOUDMORPH_WEBHOOK_SECRET`로 서명한다. 이제는 push된 저장소로 배포한 **링크 없는 프로젝트 전부**를 각자의 이름·타깃·소유자로 재배포한다
+(링크가 있는 프로젝트는 자기 엔드포인트로만 받아 두 번 배포되지 않는다). 그런 프로젝트가 없을 때만 예전처럼 저장소 이름·`CLOUDMORPH_CD_TARGETS`로
+관리자 소유 앱을 만들고, 그 이름이 다른 사용자 것이면 배포하지 않는다.
+
+## (예전 방식 설명)
+
+### 흐름
 ```
 개발자 git push ─▶ GitHub ─webhook(push, HMAC 서명)─▶ 터널 ─▶ 대시보드 프록시 ─▶ 백엔드 /webhook/github
    ─▶ 서명 검증 ─▶ 기본 브랜치인지 확인 ─▶ _launch(저장소 URL, 타깃, name=저장소이름, ref=브랜치)
@@ -10,7 +49,7 @@
 CD는 저장소 이름을 앱 이름으로 쓰므로 푸시할 때마다 **같은 Cloud Run 서비스에 새 리비전**이 올라가고(블루그린),
 Cloud SQL의 앱별 데이터베이스도 그대로 재사용되어 데이터가 남는다. `POST /deploy`에도 `name`을 주면 같은 동작을 한다.
 
-## 설정
+### 설정
 | 환경변수 | 뜻 | 기본 |
 |---|---|---|
 | `CLOUDMORPH_WEBHOOK_SECRET` | GitHub 웹훅 비밀값. 없으면 엔드포인트가 503으로 꺼짐 | (없음) |

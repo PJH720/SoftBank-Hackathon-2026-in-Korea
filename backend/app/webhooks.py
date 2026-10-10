@@ -1,23 +1,36 @@
 """GitHub push -> redeploy (CD).
 
-    GitHub ──POST /webhook/github (X-Hub-Signature-256)──▶ verify HMAC ──▶ parse push ──▶ launch deployment
-                                                                                   (same app name every time
-                                                                                    => same Cloud Run service /
-                                                                                       node app gets the new version)
+Per-project link (multi-user, preferred): POST /projects/{name}/cd creates a link with its own id and secret.
+
+    GitHub ──POST /webhook/github/<link id> (X-Hub-Signature-256 with that link's secret)
+          ──▶ verify HMAC ──▶ same repo? allowed branch? ──▶ redeploy that project with *its* name, targets, owner
+
+    The webhook is registered on GitHub with the user's own token (used once, never stored), or by hand
+    with the URL + secret the API returns. A leaked secret only reaches that one project.
+
+Shared endpoint (legacy, operator only): POST /webhook/github signed with CLOUDMORPH_WEBHOOK_SECRET.
+    Redeploys every unlinked project whose source is the pushed repo; with none, deploys the repo under
+    its own name to CLOUDMORPH_CD_TARGETS as admin.
 
 Env:
-    CLOUDMORPH_WEBHOOK_SECRET   shared secret configured on the GitHub webhook (required; unset -> endpoint disabled)
-    CLOUDMORPH_CD_TARGETS       comma list, default "local,cloudrun"
-    CLOUDMORPH_CD_BRANCHES      comma list of branches to deploy; default: the repository's default branch only
+    CLOUDMORPH_WEBHOOK_SECRET   secret of the shared endpoint (unset -> shared endpoint disabled)
+    CLOUDMORPH_CD_TARGETS       shared endpoint only: comma list, default "local,cloudrun"
+    CLOUDMORPH_CD_BRANCHES      shared endpoint only: branches to deploy; default: the repository's default branch
+    CLOUDMORPH_PUBLIC_URL       base URL GitHub should call (default: taken from the request)
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import re
+import secrets
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 
 def verify_signature(secret: str, body: bytes, signature_header: str | None) -> bool:
@@ -77,3 +90,95 @@ def branch_allowed(info: PushInfo) -> bool:
     raw = os.getenv("CLOUDMORPH_CD_BRANCHES", "").strip()
     allowed = {b.strip() for b in raw.split(",") if b.strip()} or {info.default_branch}
     return info.branch in allowed
+
+
+# --------------------------------------------------------------------------- #
+# Per-project links
+# --------------------------------------------------------------------------- #
+_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+GITHUB_API = "https://api.github.com"
+
+
+def github_repo(url: str | None) -> str | None:
+    """ "owner/repo" (lowercase) for a github.com HTTPS URL, else None."""
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() != "github.com":
+        return None
+    path = parsed.path.strip("/").removesuffix(".git")
+    return path.lower() if _REPO.fullmatch(path) else None
+
+
+def new_link() -> tuple[str, str]:
+    """(link id that goes in the webhook URL, HMAC secret)"""
+    return secrets.token_hex(8), secrets.token_hex(24)
+
+
+def public_link(link: dict) -> dict:
+    """What the dashboard may see: everything but the secret."""
+    return {k: v for k, v in link.items() if k != "secret"}
+
+
+class GitHubError(Exception):
+    """GitHub API refused (bad token, no admin rights on the repo, ...). Message is safe to show."""
+
+
+def _github(method: str, path: str, token: str, body: dict | None = None):
+    req = urllib.request.Request(
+        GITHUB_API + path,
+        method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "cloudmorph",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("message", "")
+        except ValueError:
+            msg = ""
+        hint = {
+            401: "token is invalid",
+            403: "token lacks admin:repo_hook",
+            404: "no admin access to the repo",
+        }
+        raise GitHubError(f"GitHub {e.code}: {msg or hint.get(e.code, 'request failed')}") from None
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise GitHubError(f"GitHub unreachable: {e}") from None
+
+
+def create_github_hook(repo: str, url: str, secret: str, token: str) -> int:
+    """Register a push webhook on `repo` with the user's token. Returns GitHub's hook id."""
+    hook = _github(
+        "POST",
+        f"/repos/{repo}/hooks",
+        token,
+        {
+            "name": "web",
+            "active": True,
+            "events": ["push"],
+            "config": {"url": url, "content_type": "json", "secret": secret, "insecure_ssl": "0"},
+        },
+    )
+    return int(hook["id"])
+
+
+def delete_github_hook(repo: str, hook_id: int, token: str) -> None:
+    try:
+        _github("DELETE", f"/repos/{repo}/hooks/{int(hook_id)}", token)
+    except GitHubError as e:
+        if "404" not in str(e):  # already gone on GitHub: nothing left to remove
+            raise
+
+
+def link_branch_allowed(link: dict, info: PushInfo) -> bool:
+    """A link deploys its chosen branch, or the repository's default branch when none was chosen."""
+    return info.branch == (link.get("branch") or info.default_branch)
