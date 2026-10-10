@@ -897,6 +897,14 @@ def create_app() -> FastAPI:
                 job.error = f"{type(exc).__name__}: {exc}"
                 _publish(job, PipelineEvent(type="error", payload={"message": job.error}))
             finally:
+                # A redeploy builds in a fresh work dir, so the deployer cannot see the local container it
+                # replaces; without this, every redeploy of the same app (CD push, dashboard) leaves one running.
+                old, new = (project.get("live") or {}).get("local"), live.get("local")
+                if old and new and old.get("container_name") != new.get("container_name"):
+                    try:
+                        await asyncio.to_thread(deployer.cleanup_local, old)  # keeps the database sidecar
+                    except Exception:  # the new deployment is up; a leftover is not fatal (logged)
+                        _logger.warning("could not remove the replaced local container", exc_info=True)
                 project.update(
                     last_status=job.state,
                     urls={t: v.get("url") for t, v in job.targets.items()},

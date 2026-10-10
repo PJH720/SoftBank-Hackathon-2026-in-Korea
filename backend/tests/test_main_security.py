@@ -1204,3 +1204,41 @@ def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
     items = asyncio.run(scenario())
     # only Postgres is provisioned when left blank; Redis is not, so the card must not promise it
     assert [(i["name"], i["auto"]) for i in items] == [("DATABASE_URL", True), ("REDIS_URL", False)]
+
+
+def test_redeploying_an_app_locally_removes_the_container_it_replaces(m, tmp_path, monkeypatch):
+    """Each deploy builds in a fresh work dir, so the deployer cannot clean up the previous container itself."""
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(target="local", language="python", dockerfile="FROM x\n"),
+    )
+    monkeypatch.setattr(
+        m.deployer,
+        "deploy",
+        lambda d, f, t, **kw: DeployResult(success=True, target=t, exit_code=0, url="http://127.0.0.1:1"),
+    )
+    names = iter(["gb-local-1", "gb-local-2"])
+    monkeypatch.setattr(
+        m.deployer, "last_handles", lambda d: {"container_name": next(names), "db_container": "gb-db"}
+    )
+    removed = []
+    monkeypatch.setattr(m.deployer, "cleanup_local", lambda handles, **kw: removed.append(handles) or [])
+    original_mkdtemp = m.tempfile.mkdtemp
+    monkeypatch.setattr(m.tempfile, "mkdtemp", lambda *a, **kw: original_mkdtemp(dir=tmp_path, **kw))
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+
+    async def deploy_twice():
+        for _ in range(2):
+            deployment_id = (
+                await routes["/deploy"](DeployRequest(source=str(source), targets=["local"], name="gb"))
+            )["deployment_id"]
+            job = m._jobs[deployment_id]
+            await _until(lambda job=job: job.completed)
+
+    asyncio.run(deploy_twice())
+    assert removed == [{"container_name": "gb-local-1", "db_container": "gb-db"}]  # the first one, once
+    assert m._projects["gb"]["live"]["local"]["container_name"] == "gb-local-2"
