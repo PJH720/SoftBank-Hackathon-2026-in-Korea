@@ -422,14 +422,14 @@ def _remove_workspace(path: Path) -> None:
         _logger.warning("Could not remove completed Cloud Run workspace %s", path, exc_info=True)
 
 
-ANSWER_TIMEOUT_S = 300  # no answer by then -> stop; the PR stays open
+ANSWER_TIMEOUT_S = 300  # no answer by then -> stop, and no PR is opened
 
 
 class AnswerRequest(BaseModel):
     """POST /deploy/{deployment_id}/answer body."""
 
     question_id: str
-    choice: Literal["stop", "continue"]
+    choice: Literal["stop", "continue", "pr_only"]
 
 
 class DrillRequest(BaseModel):
@@ -446,22 +446,19 @@ PR_MERGE_HINT = (
 def source_fix_confirm(
     job: Job, emit: Callable[[PipelineEvent], None], source: str, ref: str | None, trigger: str
 ) -> healer.ConfirmFn:
-    """healer's confirm_fn for one job: open a PR with the source fix, then ask the user whether to stop
-    or deploy the edited copy now. Asked once per job; later targets reuse the answer.
-    A GitHub-push deployment has nobody watching, so it stops without asking."""
-    decided: dict = {}
+    """healer's confirm_fn for one job. The user is asked *before* anything touches the repository:
+        continue  open a PR with the fix, then deploy the edited copy now
+        pr_only   open the PR and stop this deployment (merge, then deploy again)
+        stop      no PR, nothing deployed
+    Every *different* change is asked (and gets its own PR); the same change on another target reuses the
+    answer. A deployment nobody watches (GitHub push, the incident guard) cannot ask: it proposes the fix as a
+    PR and stops, so the PR review is the consent."""
+    answered: dict[str, dict] = {}  # source_diff -> {"choice", "pr_url"}
 
     def confirm(src_dir: str, fix: healer.RepoFix) -> str | None:
+        decided = answered.setdefault(fix.source_diff, {})
         if not decided:
-            pr_url = pr_error = None
-            if source.startswith("https://"):
-                try:
-                    pr_url = fixpr.open_pr(
-                        source, ref, src_dir, list(fix.changed), fix.rationale, fix.source_diff
-                    )
-                except Exception as exc:  # no PR still leaves the question
-                    _logger.warning("could not open the fix PR", exc_info=True)
-                    pr_error = f"{type(exc).__name__}: {exc}"
+            can_pr = source.startswith("https://")
             question_id = uuid.uuid4().hex[:12]
             answers: SimpleQueue[str] = SimpleQueue()
             ask = trigger not in ("github-push", "guard")  # nobody is watching these deployments
@@ -475,23 +472,32 @@ def source_fix_confirm(
                         "kind": "question",
                         "question_id": question_id,
                         "ask": ask,
-                        "pr_url": pr_url,
-                        "pr_error": pr_error,
+                        "can_pr": can_pr,
+                        "pr_url": None,
                         "rationale": fix.rationale,
                         "diff": fix.source_diff,
-                        "choices": ["stop", "continue"],
+                        "choices": ["continue", "pr_only", "stop"] if can_pr else ["continue", "stop"],
                         "timeout_s": ANSWER_TIMEOUT_S,
                     },
                 )
             )
-            choice, reason = "stop", "github-push"
+            choice, reason = ("pr_only" if can_pr else "stop"), trigger
             if ask:
                 try:
                     choice, reason = answers.get(timeout=ANSWER_TIMEOUT_S), "user"
                 except Empty:
-                    reason = "timeout"
+                    choice, reason = "stop", "timeout"
                 finally:
                     job.questions.pop(question_id, None)
+            pr_url = pr_error = None
+            if can_pr and choice in ("continue", "pr_only"):  # only after the answer
+                try:
+                    pr_url = fixpr.open_pr(
+                        source, ref, src_dir, list(fix.changed), fix.rationale, fix.source_diff
+                    )
+                except Exception as exc:  # no PR still keeps the user's choice
+                    _logger.warning("could not open the fix PR", exc_info=True)
+                    pr_error = f"{type(exc).__name__}: {exc}"
             decided.update(choice=choice, pr_url=pr_url)
             emit(
                 PipelineEvent(
@@ -502,6 +508,8 @@ def source_fix_confirm(
                         "question_id": question_id,
                         "choice": choice,
                         "reason": reason,
+                        "pr_url": pr_url,
+                        "pr_error": pr_error,
                     },
                 )
             )
@@ -542,8 +550,11 @@ def run_pipeline(
     analysis: AnalysisResult | None = None,
     confirm: healer.ConfirmFn | None = None,
     overrides: dict | None = None,
+    dockerfile_is_source: bool = False,
 ) -> bool:
     """Run one target synchronously; healer owns all retry attempts.
+    `dockerfile_is_source`: the repo brought its own Dockerfile, so a healer patch to it is a code change
+    and goes through `confirm` (ask the user, then a PR) like any other source edit.
     `overrides` (deployer options such as env/build_secrets) apply to the healer's redeploys too."""
     if analysis is None:  # Preserve backward compatibility for direct calls.
         emit(PipelineEvent(type="stage", stage="analyze"))
@@ -567,7 +578,14 @@ def run_pipeline(
         )
     )
     report = healer.heal(
-        source, target, result, analysis.dockerfile, deploy_fn, emit=emit, confirm_fn=confirm
+        source,
+        target,
+        result,
+        analysis.dockerfile,
+        deploy_fn,
+        emit=emit,
+        confirm_fn=confirm,
+        dockerfile_is_source=dockerfile_is_source,
     )
     payload = report.model_dump(mode="json")
     emit(PipelineEvent(type="done" if report.success else "error", payload=payload))
@@ -843,6 +861,7 @@ def create_app() -> FastAPI:
                 # the default name is per-deployment unique. Local state is retained for container/tunnel cleanup.
                 work_root = job.work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
                 confirm = source_fix_confirm(job, emit, source, ref, trigger)
+                own_dockerfile = (Path(source_dir) / "Dockerfile").is_file()  # before the deployer writes one
                 try:
                     for target in run_targets:
                         target_dir = work_root / f"{app_name}-{target}"
@@ -855,6 +874,7 @@ def create_app() -> FastAPI:
                                 analysis=analysis,
                                 overrides=overrides,
                                 confirm=confirm,
+                                dockerfile_is_source=own_dockerfile,
                             ):
                                 live[target] = deployer.last_handles(target_dir)
                         except DeployCancelled:

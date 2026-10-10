@@ -70,12 +70,13 @@ export function applyEvent(prev, type, p, raw) {
       const line = p.line || ''
       if (p.kind === 'question') {
         run.question = { ...p, choice: null, reason: null }
-        const pr = p.pr_url ? `PR을 올렸어요 · ${p.pr_url}` : '소스를 고쳤어요 (PR 없음)'
-        push(run, { ts, kind: 'heal', stage: 'heal', target: run.currentTarget, text: `${pr} — ${p.rationale}` })
+        const ask = p.ask ? '반영하기 전에 물어볼게요' : '아무도 보고 있지 않아 PR로만 제안해요'
+        push(run, { ts, kind: 'heal', stage: 'heal', target: run.currentTarget, text: `AI가 코드를 고쳤어요 · ${ask} — ${p.rationale}` })
       } else if (p.kind === 'answer') {
-        run.question = run.question && { ...run.question, choice: p.choice, reason: p.reason }
-        const why = { user: '사용자 선택', timeout: '응답 없음', 'github-push': 'push 배포' }[p.reason] || p.reason
-        push(run, { ts, kind: 'info', stage: 'heal', text: `${p.choice === 'continue' ? '고친 소스로 계속 배포' : '이번 배포는 여기서 중단'} (${why})` })
+        run.question = run.question && { ...run.question, choice: p.choice, reason: p.reason, pr_url: p.pr_url, pr_error: p.pr_error }
+        const why = { user: '사용자 선택', timeout: '응답 없음', 'github-push': 'push 배포', guard: '장애 대응' }[p.reason] || p.reason
+        const what = { continue: 'PR을 올리고 고친 코드로 계속 배포', pr_only: 'PR만 올리고 이번 배포는 멈춤', stop: '고치지 않고 멈춤' }[p.choice] || p.choice
+        push(run, { ts, kind: 'info', stage: 'heal', text: `${what} (${why})${p.pr_url ? ` · ${p.pr_url}` : ''}` })
       } else if (line.startsWith('analyzer: target=')) {
         run.analysis = parseSummary(line)
         const a = run.analysis

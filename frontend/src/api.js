@@ -18,7 +18,7 @@ export async function startDeploy({ source, targets, name, ref }) {
   return (await res.json()).deployment_id
 }
 
-/** Answer the healer's question after it opened a source-fix PR: 'stop' or 'continue'. */
+/** Answer the healer's question (asked before any PR): 'continue' (PR + deploy), 'pr_only' or 'stop'. */
 export async function answerQuestion(id, questionId, choice) {
   const res = await fetch(`/deploy/${id}/answer`, { method: 'POST', headers: headers(), body: JSON.stringify({ question_id: questionId, choice }) })
   if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)
