@@ -1,12 +1,13 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Cloud, KeyRound } from 'lucide-react';
-import { getAgents, getDeployment, getFleet, getHealth, getMe, getProjects, getToken, setToken, startDeploy, subscribe } from './api';
+import { Cloud, KeyRound, LogOut } from 'lucide-react';
+import { getAgents, getDeployment, getFleet, getHealth, getMe, getProjects, getToken, logOut, setToken, startDeploy, subscribe } from './api';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
 import Stepper from './components/Stepper';
 import LogConsole from './components/LogConsole';
 import { AnalysisCard, Endpoints, PatchList } from './components/ResultPanels';
 import { AgentPanel, FleetPanel, ProjectsPanel } from './components/OpsPanels';
+import AuthScreen from './components/AuthScreen';
 import { Dot } from './components/ui';
 
 export default function App() {
@@ -19,6 +20,7 @@ export default function App() {
   const [token, setTokenState] = useState(getToken());
   const [showToken, setShowToken] = useState(false);
   const [me, setMe] = useState(null);
+  const [meChecked, setMeChecked] = useState(false); // false until the first /projects/me answer
   const [autoFollow, setAutoFollow] = useState(true);
   const [notice, setNotice] = useState(null);
   const closeRef = useRef(null);
@@ -98,9 +100,14 @@ export default function App() {
   // whose dashboard this is: projects, deployments and CD links are per user
   useEffect(() => {
     let alive = true;
-    const t = setTimeout(() => getMe().then((m) => alive && setMe(m)).catch(() => alive && setMe(null)), 300);
+    const done = (m) => { if (alive) { setMe(m); setMeChecked(true); } };
+    const t = setTimeout(() => getMe().then(done).catch(() => done(null)), 300);
     return () => { alive = false; clearTimeout(t); };
   }, [token]);
+
+  // no token, or one that maps to nobody (expired login): log in / sign up first
+  if (!meChecked) return <div className="min-h-screen bg-[#0a0d14]" />; // don't flash the dashboard first
+  if (!me) return <AuthScreen onAuthed={saveToken} healthy={healthy} />;
 
   return (
     <div className="min-h-screen bg-[#0a0d14] text-slate-100">
@@ -127,6 +134,12 @@ export default function App() {
             {showToken && (
               <input autoFocus type="password" value={token} onChange={(e) => saveToken(e.target.value)} placeholder="내 API 토큰"
                 className="w-52 rounded-lg border border-white/10 bg-black/40 px-2.5 py-1 text-slate-100 focus:border-violet-500/60 focus:outline-none" />
+            )}
+            {me && token && (
+              <button type="button" onClick={async () => { await logOut(); saveToken(''); }}
+                className="flex items-center gap-1.5 rounded-full border border-white/10 px-2.5 py-1 text-slate-400 hover:text-white">
+                <LogOut className="h-3.5 w-3.5" /> 로그아웃
+              </button>
             )}
           </div>
         </header>

@@ -3,6 +3,7 @@
     CLOUDMORPH_API_TOKEN     operator token -> user "admin" (sees every project; legacy projects belong to it)
     CLOUDMORPH_USERS         "alice:<token>,bob:<token>"          per-user tokens (optional)
     CLOUDMORPH_USERS_FILE    JSON {"alice": "<token>", ...}       same, from a file (optional)
+    sign-up / login          users.py: ID + password accounts; a login's session token works like the above
 
 A user only sees and changes their own projects, deployments and CD links. An app name belongs to the
 user who deployed it first (Cloud Run service names are shared across the whole GCP project, so two
@@ -19,6 +20,8 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from app import users
 
 ADMIN = "admin"
 _USER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
@@ -55,7 +58,7 @@ def user_tokens() -> dict[str, str]:
 
 
 def configured() -> bool:
-    return bool(os.getenv("CLOUDMORPH_API_TOKEN")) or bool(user_tokens())
+    return bool(os.getenv("CLOUDMORPH_API_TOKEN")) or bool(user_tokens()) or users.has_users()
 
 
 def identify(supplied: str) -> User | None:
@@ -69,4 +72,8 @@ def identify(supplied: str) -> User | None:
     for name, token in user_tokens().items():
         if hmac.compare_digest(supplied.encode(), token.encode()) and found is None:
             found = User(name)
+    # login sessions are looked up by sha256(token), so there is nothing to compare one by one
+    session_user = users.user_for(supplied)
+    if found is None and session_user:
+        found = User(session_user)
     return found

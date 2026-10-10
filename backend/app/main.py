@@ -41,7 +41,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from app import accounts, agents, analyzer, deployer, healer, webhooks
+from app import accounts, agents, analyzer, deployer, healer, users, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
 from app.accounts import User
@@ -196,6 +196,14 @@ class AgentResult(BaseModel):
     stdout: str = ""
     stderr: str = ""
     duration_sec: float | None = None
+
+
+class AuthRequest(BaseModel):
+    """POST /auth/signup and /auth/login body."""
+
+    username: str = Field(max_length=64)
+    password: str = Field(max_length=256)
+    code: str | None = Field(default=None, max_length=256, description="invite code (CLOUDMORPH_SIGNUP_CODE)")
 
 
 # One deployment per app name at a time: two quick pushes would otherwise race on the same Cloud Run
@@ -540,6 +548,42 @@ def create_app() -> FastAPI:
     async def whoami(request: Request) -> dict:
         user = _user(request)
         return {"user": user.name, "admin": user.admin}
+
+    # --- ID/password accounts (users.py). Open routes: they are how a caller gets a token. -------------
+    @app.post("/auth/signup")
+    async def auth_signup(body: AuthRequest) -> dict:
+        # names already in use as API-token users or as project owners can't be claimed by a new account
+        taken = {
+            accounts.ADMIN,
+            *accounts.user_tokens(),
+            *(p.get("owner", accounts.ADMIN) for p in _projects.values()),
+        }
+        try:
+            token = await asyncio.to_thread(
+                users.signup, body.username.strip().lower(), body.password, body.code, taken=taken
+            )
+        except users.AuthError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+        return {"token": token, "user": body.username.strip().lower()}
+
+    @app.post("/auth/login")
+    async def auth_login(body: AuthRequest) -> dict:
+        name = body.username.strip().lower()
+        try:
+            token = await asyncio.to_thread(users.login, name, body.password)
+        except users.AuthError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+        return {"token": token, "user": name}
+
+    @app.post("/auth/logout")
+    async def auth_logout(request: Request) -> dict:
+        await asyncio.to_thread(users.logout, request.headers.get("x-api-token") or "")
+        return {"ok": True}
+
+    @app.get("/auth/config")
+    async def auth_config() -> dict:
+        """What the login screen needs to know: whether sign-up asks for an invite code."""
+        return {"signup_code": bool(os.getenv("CLOUDMORPH_SIGNUP_CODE"))}
 
     @app.get("/health")
     async def health() -> dict[str, str]:

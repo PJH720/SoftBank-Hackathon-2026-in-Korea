@@ -1,5 +1,5 @@
 // Thin client for the CloudMorph backend. Same-origin: the Vite dev server (and the demo tunnel)
-// proxy /deploy, /health, /fleet, /projects and /webhook to FastAPI, so no base URL and no CORS.
+// proxy /deploy, /health, /fleet, /projects, /auth and /webhook to FastAPI, so no base URL and no CORS.
 const TOKEN_KEY = 'cloudmorph.apiToken'
 
 export const getToken = () => localStorage.getItem(TOKEN_KEY) || ''
@@ -12,6 +12,39 @@ const headers = () => ({
   'Content-Type': 'application/json',
   ...(getToken() ? { 'X-API-Token': getToken() } : {}),
 })
+
+// --- ID/password accounts: a login returns a token that is used exactly like an API token ---------------
+const AUTH_ERRORS = {
+  401: '아이디 또는 비밀번호가 맞지 않습니다',
+  403: '가입 코드가 맞지 않습니다',
+  409: '이미 사용 중인 아이디입니다',
+  429: '로그인을 너무 많이 실패했습니다. 몇 분 뒤에 다시 시도하세요',
+}
+
+async function authPost(path, body) {
+  const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const detail = typeof data.detail === 'string' ? data.detail : '입력값을 확인하세요'
+    throw new Error(AUTH_ERRORS[res.status] || (res.status === 422 ? detail : `요청 실패 (${res.status})`))
+  }
+  setToken(data.token)
+  return data
+}
+
+export const signUp = ({ username, password, code }) => authPost('/auth/signup', { username, password, ...(code ? { code } : {}) })
+export const logIn = ({ username, password }) => authPost('/auth/login', { username, password })
+
+export async function logOut() {
+  await fetch('/auth/logout', { method: 'POST', headers: headers() }).catch(() => {})
+  setToken('')
+}
+
+/** { signup_code: bool }: whether sign-up asks for an invite code. */
+export async function getAuthConfig() {
+  const res = await fetch('/auth/config').catch(() => null)
+  return res?.ok ? res.json() : { signup_code: false }
+}
 
 export async function startDeploy({ source, targets, name, ref }) {
   const body = { source, targets, ...(name ? { name } : {}), ...(ref ? { ref } : {}) }
