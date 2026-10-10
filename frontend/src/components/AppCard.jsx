@@ -4,6 +4,8 @@ import { Badge, Bar, CopyButton, StopButton } from './ui';
 import { fmtAgo } from '../lib/style';
 import { canStop } from '../lib/run';
 import { TARGET_STATE, appStatus, appTargets, canRedeploy, deployMeta, fleetAppFor, primaryUrl, replicaRows } from '../lib/operations';
+import MiniMap from './MiniMap';
+import { Buddy } from './Mascot';
 
 const TARGET_ICON = { local: Server, cloudrun: Cloud, node: Network, function: Zap };
 const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
@@ -86,6 +88,15 @@ export default function AppCard({ project, fleet, isWatched, isHighlighted, isSt
   const redeploy = canRedeploy(project, { runRunning, redeploying: redeployBusy });
   const url = primaryUrl(targets);
 
+  const buddyStatus =
+    status.key === 'live'
+      ? 'ok'
+      : status.key === 'deploying'
+      ? 'starting'
+      : status.key === 'attention' || status.key === 'failed'
+      ? 'fail'
+      : 'idle';
+
   // Keyed by name, so the 4 s refetch keeps this instance and only a highlight change scrolls again.
   useEffect(() => {
     if (!isHighlighted) return;
@@ -93,43 +104,52 @@ export default function AppCard({ project, fleet, isWatched, isHighlighted, isSt
   }, [isHighlighted]);
 
   return (
-    <article ref={ref} className={`ops-card${isHighlighted ? ' ops-card-highlight' : ''}`} data-status={status.key} aria-labelledby={headingId}>
-      <header className="ops-card-head">
-        <span className="ops-light" data-status={status.key} aria-hidden="true" />
-        <h3 id={headingId} className="ops-card-name font-mono" title={project.name}>{project.name}</h3>
-        <Badge tone={status.tone}>{status.label}</Badge>
-        {isWatched && <span className="ops-watch-chip"><Eye className="h-3 w-3" aria-hidden="true" /> 보는 중</span>}
-      </header>
-      <p className="ops-sentence">{status.sentence}</p>
-      <p className="ops-meta">
-        <span className="ops-meta-trigger">
-          {project.trigger === 'github-push' && <GitBranch className="h-3 w-3" aria-hidden="true" />}
-          {meta.triggerLabel}
-        </span>
-        {meta.updatedAt !== null && <span>{fmtAgo(meta.updatedAt)}</span>}
-        <span>배포 {meta.count}회</span>
-      </p>
-      {project.source && <p className="ops-source font-mono" title={project.source}>{project.source}</p>}
+    <article ref={ref} className={`ops-card acard${isHighlighted ? ' ops-card-highlight' : ''}`} data-status={status.key} aria-labelledby={headingId}>
+      {/* SVG Topology MiniMap Preview */}
+      <div className="ac-map">
+        <MiniMap project={project} status={status.key} />
+      </div>
 
-      <section className="ops-targets">
-        <h4 className="ops-subheading">서비스 위치</h4>
-        {targets.length ? (
-          <ul className="ops-target-list">
-            {targets.map((row) => <TargetRow key={row.target} row={row} fleetApp={fleetApp} />)}
-          </ul>
-        ) : <p className="ops-muted">아직 서비스 위치 정보가 없어요</p>}
-      </section>
+      <div className="ac-body">
+        <header className="ops-card-head ac-top">
+          <Buddy status={buddyStatus} size={22} />
+          <h3 id={headingId} className="ops-card-name ac-name font-mono" title={project.name}>{project.name}</h3>
+          <Badge tone={status.tone}>{status.label}</Badge>
+          {isWatched && <span className="ops-watch-chip"><Eye className="h-3 w-3" aria-hidden="true" /> 보는 중</span>}
+        </header>
 
-      <CardActions
-        project={project}
-        url={url}
-        redeploy={redeploy}
-        isRedeploying={isRedeploying}
-        isStopping={isStopping}
-        onOpenLogs={onOpenLogs}
-        onRedeploy={onRedeploy}
-        onStop={onStop}
-      />
+        <p className="ops-sentence">{status.sentence}</p>
+
+        <p className="ops-meta">
+          <span className="ops-meta-trigger">
+            {project.trigger === 'github-push' && <GitBranch className="h-3 w-3" aria-hidden="true" />}
+            {meta.triggerLabel}
+          </span>
+          {meta.updatedAt !== null && <span>{fmtAgo(meta.updatedAt)}</span>}
+          <span>배포 {meta.count}회</span>
+        </p>
+        {project.source && <p className="ops-source font-mono" title={project.source}>{project.source}</p>}
+
+        <section className="ops-targets">
+          <h4 className="ops-subheading">서비스 위치</h4>
+          {targets.length ? (
+            <ul className="ops-target-list">
+              {targets.map((row) => <TargetRow key={row.target} row={row} fleetApp={fleetApp} />)}
+            </ul>
+          ) : <p className="ops-muted">아직 서비스 위치 정보가 없어요</p>}
+        </section>
+
+        <CardActions
+          project={project}
+          url={url}
+          redeploy={redeploy}
+          isRedeploying={isRedeploying}
+          isStopping={isStopping}
+          onOpenLogs={onOpenLogs}
+          onRedeploy={onRedeploy}
+          onStop={onStop}
+        />
+      </div>
     </article>
   );
 }
