@@ -93,19 +93,19 @@ export default function LogConsole({ logs, running, height = 460, active = true 
       bodyClass="p-0"
       right={
         <>
-          <div className="flex rounded-lg bg-black/30 p-0.5 text-[11px]">
+          <div className="flex rounded-full border border-[rgba(150,160,215,0.2)] bg-black/40 p-0.5 text-[11px]">
             {FILTERS.map((f) => (
-              <button key={f.id} type="button" onClick={() => setFilter(f.id)} className={`rounded-md px-2 py-1 ${filter === f.id ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'}`}>{f.label}</button>
+              <button key={f.id} type="button" onClick={() => setFilter(f.id)} className={`rounded-full px-2.5 py-1 transition ${filter === f.id ? 'bg-[#FFE27A] font-bold text-[#0b0d17] shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}>{f.label}</button>
             ))}
           </div>
           {targets.length > 1 && (
-            <select value={target} onChange={(e) => setTarget(e.target.value)} className="rounded-lg border border-white/10 bg-black/30 px-2 py-1 text-[11px] text-slate-300">
+            <select value={target} onChange={(e) => setTarget(e.target.value)} className="rounded-full border border-[rgba(150,160,215,0.2)] bg-[#0b0d17] px-2.5 py-1 text-[11px] text-slate-300 focus:outline-none focus:border-[#FFE27A]">
               <option value="all">모든 타깃</option>
               {targets.map((t) => <option key={t} value={t}>{t}</option>)}
             </select>
           )}
           <button type="button" title="맨 아래로 따라가기" onClick={() => { setFollow(true); scrollToEnd(); }}
-            className={`rounded-lg p-1.5 ${follow ? 'text-violet-300' : 'text-slate-500 hover:text-slate-200'}`}>
+            className={`rounded-full p-1.5 transition ${follow ? 'text-[#FFE27A] bg-[#FFE27A]/12' : 'text-slate-500 hover:text-slate-200'}`}>
             <ArrowDownToLine className="h-4 w-4" />
           </button>
         </>
@@ -122,17 +122,17 @@ export default function LogConsole({ logs, running, height = 460, active = true 
           shown.map((l) => <Row key={l.id} log={l} />)
         )}
         {running && (
-          <div className="flex items-center gap-2 py-2 pl-[86px] text-xs text-slate-500">
+          <div className="flex items-center gap-2 py-2 pl-[86px] text-xs text-slate-400">
             <span className="flex gap-1">
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-400 [animation-delay:-0.3s]" />
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-400 [animation-delay:-0.15s]" />
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-400" />
+              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#FFE27A] [animation-delay:-0.3s]" />
+              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#FFE27A] [animation-delay:-0.15s]" />
+              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#FFE27A]" />
             </span>
             진행 중
           </div>
         )}
       </div>
-      <footer className="flex items-center justify-between border-t border-white/5 px-4 py-2 text-[11px] text-slate-500">
+      <footer className="flex items-center justify-between border-t border-[rgba(150,160,215,0.14)] px-4 py-2.5 text-[11px] text-slate-400 bg-white/[0.01]">
         <span>{shown.length} / {logs.length} 줄</span>
         <span>{follow ? '자동 스크롤' : '스크롤 일시정지 · 위로 올려 둔 상태'}</span>
       </footer>

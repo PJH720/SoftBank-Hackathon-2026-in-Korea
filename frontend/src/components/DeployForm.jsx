@@ -19,17 +19,17 @@ export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailab
     <Card title="새 배포" icon={Play}>
       <div className="space-y-4">
         <div>
-          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-400"><FolderGit2 className="h-3.5 w-3.5" /> 소스 · 서버 경로, ZIP, 또는 GitHub URL</label>
+          <label className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold text-slate-300"><FolderGit2 className="h-3.5 w-3.5 text-[#FFE27A]" /> 소스 · 서버 경로, ZIP, 또는 GitHub URL</label>
           <input
             value={form.source}
             onChange={(e) => setForm((f) => ({ ...f, source: e.target.value }))}
             placeholder="https://github.com/owner/repo"
-            className="w-full rounded-xl border border-white/10 bg-black/30 px-3.5 py-2.5 font-mono text-[13px] text-slate-100 placeholder:text-slate-600 focus:border-violet-500/60 focus:outline-none focus:ring-2 focus:ring-violet-500/20"
+            className="w-full rounded-xl border border-[rgba(150,160,215,0.22)] bg-[#0e1122]/90 px-3.5 py-2.5 font-mono text-[13px] text-slate-100 placeholder:text-slate-600 focus:border-[#FFE27A] focus:outline-none focus:ring-2 focus:ring-[#FFE27A]/20 transition"
           />
-          <div className="mt-2 flex flex-wrap gap-1.5">
+          <div className="mt-2.5 flex flex-wrap gap-1.5">
             {PRESETS.map((p) => (
               <button key={p.value} type="button" onClick={() => setForm((f) => ({ ...f, source: p.value }))}
-                className={`rounded-full border px-2.5 py-1 text-[11px] transition ${form.source === p.value ? 'border-violet-500/50 bg-violet-500/10 text-violet-200' : 'border-white/10 text-slate-400 hover:border-white/20 hover:text-slate-200'}`}>
+                className={`rounded-full border px-3 py-1 text-[11px] font-medium transition ${form.source === p.value ? 'border-[#FFE27A]/60 bg-[#FFE27A]/12 text-[#FFE27A] shadow-sm shadow-[#FFE27A]/10' : 'border-[rgba(150,160,215,0.18)] bg-white/[0.03] text-slate-400 hover:border-[rgba(150,160,215,0.35)] hover:text-slate-200'}`}>
                 {p.label}
               </button>
             ))}
@@ -38,20 +38,20 @@ export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailab
 
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-slate-400"><Tag className="h-3.5 w-3.5" /> 앱 이름 (선택)</label>
+            <label className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold text-slate-300"><Tag className="h-3.5 w-3.5 text-[#FFE27A]" /> 앱 이름 (선택)</label>
             <input value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value.toLowerCase() }))} placeholder="자동"
-              className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 font-mono text-[13px] text-slate-100 placeholder:text-slate-600 focus:border-violet-500/60 focus:outline-none" />
+              className="w-full rounded-xl border border-[rgba(150,160,215,0.22)] bg-[#0e1122]/90 px-3 py-2 font-mono text-[13px] text-slate-100 placeholder:text-slate-600 focus:border-[#FFE27A] focus:outline-none focus:ring-2 focus:ring-[#FFE27A]/20 transition" />
           </div>
           <div>
-            <label className="mb-1.5 block text-xs font-medium text-slate-400">브랜치 (Git일 때)</label>
+            <label className="mb-1.5 block text-xs font-semibold text-slate-300">브랜치 (Git일 때)</label>
             <input value={form.ref} onChange={(e) => setForm((f) => ({ ...f, ref: e.target.value }))} placeholder="기본 브랜치"
-              className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 font-mono text-[13px] text-slate-100 placeholder:text-slate-600 focus:border-violet-500/60 focus:outline-none" />
+              className="w-full rounded-xl border border-[rgba(150,160,215,0.22)] bg-[#0e1122]/90 px-3 py-2 font-mono text-[13px] text-slate-100 placeholder:text-slate-600 focus:border-[#FFE27A] focus:outline-none focus:ring-2 focus:ring-[#FFE27A]/20 transition" />
           </div>
         </div>
-        <p className="-mt-2 text-[11px] text-slate-500">같은 이름으로 다시 배포하면 같은 서비스가 새 버전으로 갱신됩니다.</p>
+        <p className="-mt-2 text-[11px] text-slate-400">같은 이름으로 다시 배포하면 같은 서비스가 새 버전으로 갱신됩니다.</p>
 
         <div>
-          <label className="mb-1.5 block text-xs font-medium text-slate-400">배포 타깃</label>
+          <label className="mb-1.5 block text-xs font-semibold text-slate-300">배포 타깃</label>
           <div className="grid gap-2">
             {Object.entries(TARGET_META).map(([t, m]) => {
               const Icon = ICONS[t];
@@ -59,8 +59,8 @@ export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailab
               const disabled = t === 'node' && !fleetAvailable;
               return (
                 <button key={t} type="button" disabled={disabled} onClick={() => toggle(t)}
-                  className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition ${on ? `${TONE[m.tone].border} bg-white/[0.04]` : 'border-white/5 hover:border-white/15'} ${disabled ? 'cursor-not-allowed opacity-40' : ''}`}>
-                  <span className={`grid h-8 w-8 place-items-center rounded-lg ${on ? TONE[m.tone].soft : 'bg-white/5 text-slate-500'} ring-1 ring-inset ring-white/5`}><Icon className="h-4 w-4" /></span>
+                  className={`flex items-center gap-3 rounded-[14px] border px-3.5 py-2.5 text-left transition ${on ? `${TONE[m.tone].border} bg-white/[0.05]` : 'border-[rgba(150,160,215,0.12)] bg-black/20 hover:border-[rgba(150,160,215,0.25)]'} ${disabled ? 'cursor-not-allowed opacity-40' : ''}`}>
+                  <span className={`grid h-8 w-8 place-items-center rounded-lg ${on ? TONE[m.tone].soft : 'bg-white/5 text-slate-500'} ring-1 ring-inset ring-white/10`}><Icon className="h-4 w-4" /></span>
                   <span className="min-w-0 flex-1">
                     <span className={`block text-[13px] font-semibold ${on ? 'text-slate-100' : 'text-slate-400'}`}>{m.label}</span>
                     <span className="block truncate text-[11px] text-slate-500">{disabled ? '노드 풀이 설정되지 않음' : m.sub}</span>
@@ -73,7 +73,7 @@ export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailab
         </div>
 
         <button type="button" onClick={onDeploy} disabled={busy || !form.source || selected.length === 0}
-          className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/40 transition hover:from-violet-500 hover:to-indigo-500 disabled:cursor-not-allowed disabled:from-slate-700 disabled:to-slate-700 disabled:shadow-none">
+          className="deploy-submit flex w-full items-center justify-center gap-2 rounded-xl bg-[#FFE27A] px-4 py-3 text-sm font-bold text-[#0b0d17] shadow-lg shadow-[#FFE27A]/15 transition hover:bg-[#ffeb99] disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500 disabled:shadow-none">
           {busy ? <><Loader2 className="h-4 w-4 animate-spin" /> 파이프라인 실행 중</> : <><Play className="h-4 w-4 fill-current" /> One Action Deploy · {selected.length}개 타깃</>}
         </button>
       </div>

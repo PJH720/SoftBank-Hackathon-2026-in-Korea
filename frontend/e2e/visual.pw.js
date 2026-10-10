@@ -132,18 +132,18 @@ test.describe('Visual Verification Across Viewports and States', () => {
     });
   });
 
-  test('Visual capture of Details Drawer Open', async ({ page }) => {
+  test('Visual capture of Details Modal Open', async ({ page }) => {
     await page.setViewportSize({ width: 1366, height: 768 });
     await setupOps(page);
     await openAppsTab(page);
 
-    // Click '새 배포' in drawer
+    // Click '새 배포' in modal
     await page.getByRole('button', { name: '새 배포', exact: true }).click();
     const dialog = page.getByRole('dialog');
     await expect(dialog).toBeVisible();
 
     await page.screenshot({
-      path: path.join(SCREENSHOT_DIR, 'details-drawer-deploy.png'),
+      path: path.join(SCREENSHOT_DIR, 'details-modal-deploy.png'),
       fullPage: false,
     });
   });

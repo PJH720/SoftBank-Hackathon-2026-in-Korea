@@ -69,7 +69,7 @@ for (const [width, height] of [[1920, 1080], [1366, 768], [375, 667], [375, 320]
   });
 }
 
-test('drawer preserves drafts, traps focus and restores its trigger', async ({ page }) => {
+test('modal preserves drafts, traps focus and restores its trigger', async ({ page }) => {
   await setup(page);
   const trigger = page.getByRole('button', { name: '새 배포', exact: true });
   await trigger.click();
@@ -83,7 +83,7 @@ test('drawer preserves drafts, traps focus and restores its trigger', async ({ p
   await page.keyboard.press('Shift+Tab');
   await expect(dialog.getByRole('button', { name: /One Action Deploy/ })).toBeFocused();
   await page.keyboard.press('Tab');
-  await expect(dialog.getByRole('button', { name: '상세 패널 닫기' })).toBeFocused();
+  await expect(dialog.getByRole('button', { name: '팝업 닫기' })).toBeFocused();
 });
 
 test('input opens automatically and survives panel and scene changes with one SSE stream', async ({ page }) => {
@@ -105,7 +105,7 @@ test('input opens automatically and survives panel and scene changes with one SS
   await expect.poll(() => page.evaluate(() => window.testStreams.length)).toBe(1);
 });
 
-test('healing question, full stage celebration, drawer-first Escape and return to fleet', async ({ page }) => {
+test('healing question, full stage celebration, modal-first Escape and return to fleet', async ({ page }) => {
   await setup(page);
   await start(page);
   await emit(page, 'stage', { target: 'local' }, 'deploy');
@@ -151,7 +151,7 @@ test('unavailable fleet gives an accessible empty state', async ({ page }) => {
   await expect(page.getByText('노드 풀 데이터를 불러오지 못했습니다.', { exact: false }).first()).toBeVisible();
 });
 
-test('short mobile sheet scrolls internally and keeps partial results reachable', async ({ page }) => {
+test('short mobile modal scrolls internally and keeps partial results reachable', async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 320 });
   await setup(page);
   await start(page);
@@ -177,7 +177,7 @@ test('fullscreen rejection keeps the viewport dashboard usable', async ({ page }
   await start(page);
 });
 
-test('opening logs follows the latest events without scrolling the drawer or page', async ({ page }) => {
+test('opening logs follows the latest events without scrolling the modal or page', async ({ page }) => {
   await setup(page);
   await start(page);
   const append = () => page.evaluate(() => {
@@ -188,10 +188,10 @@ test('opening logs follows the latest events without scrolling the drawer or pag
   const box = page.getByRole('dialog').locator('.overflow-y-auto');
   const gap = () => box.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
   await expect.poll(gap).toBeLessThan(40);
-  await page.locator('.drawer-body').evaluate((el) => { el.scrollTop = 0; });
+  await page.locator('.modal-body').evaluate((el) => { el.scrollTop = 0; });
   await append();
   await expect.poll(gap).toBeLessThan(40);
-  expect(await page.locator('.drawer-body').evaluate((el) => el.scrollTop)).toBe(0);
+  expect(await page.locator('.modal-body').evaluate((el) => el.scrollTop)).toBe(0);
   await page.keyboard.press('Escape');
   await append();
   await page.getByRole('button', { name: '전체 로그 보기' }).click();
