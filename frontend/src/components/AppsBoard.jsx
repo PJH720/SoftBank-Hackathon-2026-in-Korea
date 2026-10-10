@@ -4,6 +4,7 @@ import AppCard from './AppCard';
 import { Badge, Bar, Dot } from './ui';
 import { STATUS_STYLE, classifyNode, loadRatio } from '../lib/fleetStatus';
 import { sortApps, summarizeApps } from '../lib/operations';
+import { GuideBubble, Mascot } from './Mascot';
 import './apps-board.css';
 
 const PERCENT = 100;
@@ -132,6 +133,25 @@ function NodesPanel({ fleet, onShowNodes }) {
   );
 }
 
+function getGuideBriefing(projects, summary, projectsState) {
+  if (projectsState?.status === 'loading') {
+    return { mood: 'building', text: '앱 목록을 불러오는 중이에요…' };
+  }
+  if (projects === null || projectsState?.status === 'error') {
+    return { mood: 'teary', text: '백엔드 연결에 문제가 생겼어요. 서버 연결을 확인해 주세요.' };
+  }
+  if (!Array.isArray(projects) || projects.length === 0) {
+    return { mood: 'sleepy', text: '오늘은 조용해요. 첫 앱을 등록하고 바로 배포해 볼까요?' };
+  }
+  if (summary.deploying > 0) {
+    return { mood: 'building', text: '새 버전을 올리는 중이에요… 잠시만 기다려 주세요.' };
+  }
+  if (summary.attention > 0) {
+    return { mood: 'fixing', text: '점검이 필요한 앱이 있어요. 로그를 확인하고 다시 배포해 보세요.' };
+  }
+  return { mood: 'sparkly', text: '모든 앱이 정상적으로 잘 돌아가고 있어요 ✦' };
+}
+
 function EmptyState({ projects, projectsState, onNewDeploy, onEnableDemo }) {
   if (projectsState?.status === 'loading') {
     return <p className="ops-empty" role="status">앱 목록을 불러오는 중이에요…</p>;
@@ -139,6 +159,7 @@ function EmptyState({ projects, projectsState, onNewDeploy, onEnableDemo }) {
   if (projects === null || projectsState?.status === 'error') {
     return (
       <div className="ops-empty ops-empty-error" role="status">
+        <Mascot mood="teary" size={60} />
         <p>앱 목록을 불러오지 못했어요. 백엔드 연결을 확인해 주세요.</p>
         {onEnableDemo && (
           <button type="button" className="dashboard-button primary" onClick={onEnableDemo}>
@@ -149,9 +170,15 @@ function EmptyState({ projects, projectsState, onNewDeploy, onEnableDemo }) {
     );
   }
   return (
-    <div className="ops-empty">
-      <p>아직 배포한 앱이 없어요</p>
-      <div className="flex flex-wrap items-center justify-center gap-2">
+    <div className="ops-empty first">
+      <div className="first-ic">
+        <Mascot mood="sleepy" size={68} />
+      </div>
+      <p className="font-semibold text-slate-100">아직 배포한 앱이 없어요</p>
+      <p className="max-w-md text-xs text-slate-400">
+        GitHub 저장소를 고르면 AI가 코드를 읽고 알아서 올려요. 다 되면 이 앱이 어디서 돌아가는지 지도로 보여 드려요.
+      </p>
+      <div className="flex flex-wrap items-center justify-center gap-2 mt-2">
         <button type="button" className="dashboard-button primary" onClick={() => onNewDeploy?.()}>
           <Plus className="h-3.5 w-3.5" aria-hidden="true" /> 새 배포
         </button>
@@ -173,6 +200,7 @@ export default function AppsBoard({
   const apps = useMemo(() => sortApps(projects), [projects]);
   const summary = useMemo(() => summarizeApps(projects, fleet), [projects, fleet]);
   const hasApps = apps.length > 0;
+  const guide = useMemo(() => getGuideBriefing(projects, summary, projectsState), [projects, summary, projectsState]);
 
   return (
     <div className="ops-board">
@@ -186,7 +214,16 @@ export default function AppsBoard({
           <AutoFollowSwitch autoFollow={autoFollow} setAutoFollow={setAutoFollow} />
         </div>
       </header>
+
+      {/* Mascot Briefing Guide */}
+      <div className="picker-guide">
+        <GuideBubble mood={guide.mood} mascotSize={52}>
+          <p>{guide.text}</p>
+        </GuideBubble>
+      </div>
+
       {demoMode && <DemoToolbar scenario={scenario} setScenario={setScenario} />}
+
       <div className="ops-board-body">
         <div className="ops-apps">
           {hasApps && projectsState?.status === 'error' && (
@@ -212,6 +249,20 @@ export default function AppsBoard({
                   onStop={onStop}
                 />
               ))}
+
+              {/* Add New App Card */}
+              <button
+                type="button"
+                className="acard add ops-card-add"
+                onClick={() => onNewDeploy?.()}
+                aria-label="새 앱 올리기"
+              >
+                <span className="add-ic">
+                  <Plus size={22} aria-hidden="true" />
+                </span>
+                <b className="font-semibold text-slate-100 text-sm">새 앱 올리기</b>
+                <span className="text-xs text-slate-400">저장소를 고르면 AI가 알아서 올려요.</span>
+              </button>
             </div>
           ) : <EmptyState projects={projects ?? null} projectsState={projectsState} onNewDeploy={onNewDeploy} onEnableDemo={onEnableDemo} />}
         </div>
