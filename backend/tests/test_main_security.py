@@ -1242,3 +1242,98 @@ def test_redeploying_an_app_locally_removes_the_container_it_replaces(m, tmp_pat
     asyncio.run(deploy_twice())
     assert removed == [{"container_name": "gb-local-1", "db_container": "gb-db"}]  # the first one, once
     assert m._projects["gb"]["live"]["local"]["container_name"] == "gb-local-2"
+
+
+# ---------- targets=[]: CloudMorph picks where to deploy ----------
+
+
+def _pick_setup(m, tmp_path, monkeypatch, analysis, decision):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    deployed = []
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        deployed.append(target)
+        return DeployResult(success=True, target=target, exit_code=0, url=f"https://{target}.example")
+
+    monkeypatch.setattr(m.analyzer, "analyze", lambda _: analysis)
+    monkeypatch.setattr(m.analyzer, "quick_decision", lambda _: decision)
+    monkeypatch.setattr(m.deployer, "deploy", fake_deploy)
+    monkeypatch.setattr(m.deployer, "last_handles", lambda d: {})
+    monkeypatch.setattr(m.nodepool, "load_registry", lambda: type("R", (), {"nodes": []})())
+    original_mkdtemp = m.tempfile.mkdtemp
+    monkeypatch.setattr(m.tempfile, "mkdtemp", lambda *a, **kw: original_mkdtemp(dir=tmp_path, **kw))
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+    return source, routes, deployed
+
+
+DECISION = {
+    "service": "serverless_container",
+    "target": "cloudrun",
+    "ms": 450,
+    "label": "Cloud Run",
+}
+
+
+def test_one_touch_deploys_to_the_pick_without_asking(m, tmp_path, monkeypatch):
+    analysis = AnalysisResult(target="cloudrun", language="python", dockerfile="FROM scratch\n")
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, DECISION)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=[], ask_env=True, name="one")
+        deployment_id = (await routes["/deploy"](request))["deployment_id"]
+        await _until(lambda: m._jobs[deployment_id].completed)
+        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id)
+
+    deployment_id, status = asyncio.run(scenario())
+    assert deployed == ["cloudrun"] and status["status"] == "completed"
+    assert status["targets"]["cloudrun"]["url"] == "https://cloudrun.example"
+    events = _events(routes, deployment_id)
+    assert not any(e == "input_required" for e, _ in events)
+    decision = next(d["payload"] for e, d in events if d["payload"].get("kind") == "decision")
+    assert decision["target"] == "cloudrun" and decision["ms"] == 450
+    assert m._projects["one"]["targets"] == ["cloudrun"]
+
+
+def test_held_back_pick_asks_and_choosing_it_is_consent(m, tmp_path, monkeypatch):
+    risk = "서버리스 컨테이너로는 갈 수 없어 local(Docker)에 배포합니다: SQLite 파일이 재시작·재배포 때 사라집니다"
+    analysis = AnalysisResult(target="local", language="python", dockerfile="FROM scratch\n", notes=[risk])
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, DECISION)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=[], ask_env=True)
+        deployment_id = (await routes["/deploy"](request))["deployment_id"]
+        job = m._jobs[deployment_id]
+        await _until(lambda: job.state == "waiting_input")
+        assert deployed == []
+        with pytest.raises(HTTPException) as bad:
+            await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(targets=["function"]))
+        assert bad.value.status_code == 422
+        answer = await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(targets=["cloudrun"]))
+        assert answer == {"accepted": [], "targets": ["cloudrun"]}
+        await _until(lambda: job.completed)
+        return deployment_id
+
+    deployment_id = asyncio.run(scenario())
+    assert deployed == ["cloudrun"]
+    events = _events(routes, deployment_id)
+    asked = next(d["payload"] for e, d in events if e == "input_required")
+    assert asked["items"] == [] and asked["choose_target"]["options"] == ["local", "cloudrun"]
+    assert asked["choose_target"]["held_back"] is True and asked["choose_target"]["risks"] == [risk]
+    lines = [d["payload"].get("line", "") for e, d in events if e == "log"]
+    assert "target: cloudrun (위험을 알고 고름)" in lines
+
+
+def test_push_deploy_with_no_targets_takes_the_safe_pick(m, tmp_path, monkeypatch):
+    analysis = AnalysisResult(target="local", language="python", dockerfile="FROM scratch\n")
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, DECISION)
+
+    async def scenario():
+        deployment_id = (await routes["/deploy"](DeployRequest(source=str(source), targets=[])))[
+            "deployment_id"
+        ]
+        await _until(lambda: m._jobs[deployment_id].completed)
+
+    asyncio.run(scenario())
+    assert deployed == ["local"]  # nobody to ask: the analyzer's (safe) target, not the decision's

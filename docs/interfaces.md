@@ -56,9 +56,9 @@ POST /deploy ─▶ analyzer.analyze(src_dir) ──AnalysisResult──▶ depl
 | type | payload |
 |---|---|
 | `stage` | `{ "target"?, "attempt"?, "stderr"? }` — 진행 단계 표시 |
-| `log` | `{ "line": "..." }` — 빌드/배포 로그 스트리밍 |
+| `log` | `{ "line": "..." }` — 빌드/배포 로그 스트리밍. `{ "kind": "decision", service, target, label, explain, probabilities, ms, prep_ms, engine, why }`는 clef-flash가 1초 안에 고른 서비스 (분석이 끝나기 전에 온다) |
 | `heal_diff` | `PatchRecord` — **AI 수정 전/후 비교 카드** |
-| `input_required` | `{ "items": [EnvRequirement], "timeout_sec" }` — 배포 전에 사용자에게 받을 값 (`ask_env`일 때만) |
+| `input_required` | `{ "items": [EnvRequirement], "timeout_sec", "choose_target"? }` — 배포 전에 사용자에게 받을 값 (`ask_env`일 때만). `targets: []`(CloudMorph가 고름)이면 `choose_target: { recommended, options, decision, held_back, risks }`도 온다. 답(`POST /deploy/{id}/env`)의 `targets`로 고르며, 위험 때문에 미뤄 둔 곳을 고르면 그 위험에 동의한 것이다 |
 | `done` | `{ "target", "url" }` 또는 `HealReport` |
 | `error` | `{ "message" }` 또는 `HealReport` (gave_up) |
 

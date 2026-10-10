@@ -156,7 +156,11 @@ class DeployRequest(BaseModel):
     """POST /deploy body."""
 
     source: str = Field(description="Git URL or server-side path of the uploaded source")
-    targets: list[DeployTarget] = Field(default_factory=lambda: ["local", "cloudrun"])
+    targets: list[DeployTarget] = Field(
+        default_factory=lambda: ["local", "cloudrun"],
+        description="[] = let CloudMorph pick (the analyzer's target). With `ask_env` the dashboard is asked "
+        "to confirm when the pick was held back by a data-loss risk.",
+    )
     name: str | None = Field(
         default=None,
         description="Stable app/service name (lowercase, [a-z0-9-]). Redeploys with the same name update the same "
@@ -174,3 +178,8 @@ class EnvInput(BaseModel):
     """POST /deploy/{deployment_id}/env body. Names not in the job's `required_env` are ignored."""
 
     values: dict[str, str] = Field(default_factory=dict)
+    targets: list[DeployTarget] | None = Field(
+        default=None,
+        description="Where to deploy, when the job asked (`input_required.payload.choose_target`). "
+        "Picking a target the analyzer held back for a data-loss risk is the user's consent to that risk.",
+    )

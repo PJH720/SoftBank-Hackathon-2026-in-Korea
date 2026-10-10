@@ -139,6 +139,8 @@ class Job:
     required_env: list[EnvRequirement] = field(default_factory=list)
     env_values: dict[str, str] | None = None
     env_ready: threading.Event = field(default_factory=threading.Event)
+    target_options: list[str] = field(default_factory=list)  # offered when CloudMorph picks the target
+    env_targets: list[str] | None = None
 
 
 _jobs: dict[str, Job] = {}
@@ -685,9 +687,10 @@ def create_app() -> FastAPI:
         ask_env: bool = False,
     ) -> str:
         """Create a job and run analyze -> deploy -> heal for every target in a worker thread.
-        Shared by POST /deploy (user click) and POST /webhook/github (push)."""
-        if not targets or len(targets) != len(set(targets)):
-            raise HTTPException(status_code=422, detail="targets must be non-empty and unique")
+        Shared by POST /deploy (user click) and POST /webhook/github (push).
+        `targets=[]`: CloudMorph picks (the analyzer's target); see _resolve_env for when the user is asked."""
+        if len(targets) != len(set(targets)):
+            raise HTTPException(status_code=422, detail="targets must be unique")
         if name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
             raise HTTPException(status_code=422, detail="name must match [a-z0-9][a-z0-9-]{0,39}")
         if len(_jobs) >= MAX_JOBS:
@@ -754,6 +757,9 @@ def create_app() -> FastAPI:
         def _run_locked() -> None:
             with prepare_source(source, ref) as source_dir:
                 emit(PipelineEvent(type="stage", stage="analyze"))
+                # clef-flash picks the service in under a second; the dashboard shows it before the analysis ends
+                if decision := analyzer.quick_decision(source_dir):
+                    emit(PipelineEvent(type="log", stage="analyze", payload={"kind": "decision", **decision}))
                 analysis = analyzer.analyze(source_dir)
                 emit(
                     PipelineEvent(
@@ -767,7 +773,11 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
-                overrides = _env_overrides(analysis.required_env, _resolve_env(analysis, source_dir))
+                values, run_targets = _resolve_env(analysis, source_dir, decision)
+                overrides = _env_overrides(analysis.required_env, values)
+                for t in run_targets:  # targets=[] (CloudMorph picks): the job learns its targets only now
+                    job.targets.setdefault(t, {"success": None, "url": None})
+                project["targets"] = run_targets
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
@@ -775,7 +785,7 @@ def create_app() -> FastAPI:
                 work_root = job.work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
                 confirm = source_fix_confirm(job, emit, source, ref, trigger)
                 try:
-                    for target in targets:
+                    for target in run_targets:
                         target_dir = work_root / f"{app_name}-{target}"
                         try:
                             target_dir = Path(_copy_for_target(source_dir, target_dir))
@@ -801,37 +811,48 @@ def create_app() -> FastAPI:
                             if target == "cloudrun":
                                 _remove_workspace(target_dir)
                 finally:
-                    if "local" not in targets:
+                    if "local" not in run_targets:
                         _remove_workspace(work_root)
 
-        def _resolve_env(analysis: AnalysisResult, source_dir: str) -> dict[str, str]:
-            """Values saved for this app (named deploys only) first; the dashboard is asked only for the rest.
-            A blank runtime secret that may be random gets one, and new values are saved for the next deploy,
-            so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same. Values are kept per
-            name *and* source: another repo deployed under the same name is asked afresh, never handed these."""
-            if not analysis.required_env:
-                return {}
+        def _resolve_env(
+            analysis: AnalysisResult, source_dir: str, decision: dict | None
+        ) -> tuple[dict[str, str], list[str]]:
+            """(env values, targets). Values saved for this app (named deploys only) first; the dashboard is
+            asked only for the rest. A blank runtime secret that may be random gets one, and new values are saved
+            for the next deploy, so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same. Values are
+            kept per name *and* source: another repo deployed under the same name is asked afresh, never handed these.
+
+            targets=[] (CloudMorph picks): the analyzer's target. The dashboard is asked when values are missing,
+            or when the 1-second decision wanted another place that a data-loss risk held back; the card offers the
+            places, and picking the held-back one is the user's consent to that risk. Otherwise nothing is asked
+            (one touch)."""
+            run_targets = list(targets) or [analysis.target]
+            held_back = not targets and bool(decision) and decision.get("target") != analysis.target
+            values: dict[str, str] = {}
+            missing: list[EnvRequirement] = []
             owner = _source_identity(source)
-            values = env_store.load(app_name, owner) if name else {}
+            if analysis.required_env:
+                values = env_store.load(app_name, owner) if name else {}
+                if used := sorted({e.name for e in analysis.required_env if values.get(e.name)}):
+                    emit(
+                        PipelineEvent(
+                            type="log", stage="analyze", payload={"line": f"env: 저장된 값 {', '.join(used)}"}
+                        )
+                    )
+                missing = [e for e in analysis.required_env if not values.get(e.name)]
+                if missing and not ask_env:  # scripts and GitHub push: nobody to ask
+                    lacking = ", ".join(sorted({e.name for e in missing}))
+                    emit(
+                        PipelineEvent(
+                            type="log", stage="analyze", payload={"line": f"env: 저장된 값 없음 {lacking}"}
+                        )
+                    )
             saved = dict(values)
-            if used := sorted({e.name for e in analysis.required_env if values.get(e.name)}):
-                emit(
-                    PipelineEvent(
-                        type="log", stage="analyze", payload={"line": f"env: 저장된 값 {', '.join(used)}"}
-                    )
-                )
-            missing = [e for e in analysis.required_env if not values.get(e.name)]
-            if not missing:
-                return values
-            if not ask_env:  # scripts and GitHub push: nobody to ask
-                lacking = ", ".join(sorted({e.name for e in missing}))
-                emit(
-                    PipelineEvent(
-                        type="log", stage="analyze", payload={"line": f"env: 저장된 값 없음 {lacking}"}
-                    )
-                )
-                return values
-            values |= _ask_env(missing, source_dir)
+            if not ask_env or not (missing or held_back):
+                return values, run_targets
+            answered, chosen = _ask_env(missing, source_dir, analysis, decision, held_back)
+            values |= answered
+            run_targets = chosen or run_targets
             for e in missing:
                 if e.scope == "runtime" and e.generate and not values.get(e.name):
                     values[e.name] = secrets.token_urlsafe(32)
@@ -841,33 +862,56 @@ def create_app() -> FastAPI:
                 except env_store.EnvStoreError as exc:
                     line = f"env: 값을 저장하지 못해 다음 배포에서 다시 묻습니다 ({exc})"
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
-            return values
+            return values, run_targets
 
-        def _ask_env(items: list[EnvRequirement], source_dir: str) -> dict[str, str]:
+        def _target_question(analysis: AnalysisResult, decision: dict | None, held_back: bool) -> dict:
+            """Places the card offers when CloudMorph picks (targets=[]): the pick first."""
+            options = [analysis.target]
+            if decision:
+                options.append(decision["target"])
+            options += ["cloudrun", "local"]
+            if nodepool.load_registry().nodes:
+                options.append("node")
+            job.target_options = list(dict.fromkeys(options))
+            risk_notes = ("서버리스 컨테이너로는 갈 수 없어", "동의를 받지 못해 위험으로 두었습니다")
+            return {
+                "recommended": analysis.target,
+                "options": job.target_options,
+                "decision": decision,
+                "held_back": held_back,
+                "risks": [n for n in analysis.notes if n.startswith(risk_notes)],
+            }
+
+        def _ask_env(
+            items: list[EnvRequirement],
+            source_dir: str,
+            analysis: AnalysisResult,
+            decision: dict | None,
+            held_back: bool,
+        ) -> tuple[dict[str, str], list[str] | None]:
             """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
-            `auto` marks what the deployer provisions when left blank, so the card can say so honestly."""
+            `auto` marks what the deployer provisions when left blank, so the card can say so honestly.
+            Returns (values, targets the user picked or None)."""
             postgres = deployer.wants_database(Path(source_dir), deployer.Config.from_env()) == "postgres"
             job.required_env = [
                 e.model_copy(update={"auto": True}) if postgres and e.name == "DATABASE_URL" else e
                 for e in items
             ]
+            payload = {
+                "items": [e.model_dump() for e in job.required_env],
+                "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,
+            }
+            if not targets:
+                payload["choose_target"] = _target_question(analysis, decision, held_back)
             job.state = "waiting_input"
-            emit(
-                PipelineEvent(
-                    type="input_required",
-                    stage="analyze",
-                    payload={
-                        "items": [e.model_dump() for e in job.required_env],
-                        "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,
-                    },
-                )
-            )
+            emit(PipelineEvent(type="input_required", stage="analyze", payload=payload))
             if not job.env_ready.wait(ENV_INPUT_TIMEOUT_SECONDS):
                 raise TimeoutError(
                     f"배포에 필요한 값을 {ENV_INPUT_TIMEOUT_SECONDS // 60}분 안에 받지 못해 배포를 멈췄습니다"
                 )
             job.state = "running"
             values, job.env_values = job.env_values or {}, None
+            chosen, job.env_targets = job.env_targets, None
             given = sorted(values)
             emit(
                 PipelineEvent(
@@ -876,7 +920,11 @@ def create_app() -> FastAPI:
                     payload={"line": f"env: 입력받은 값 {', '.join(given) if given else '없음'}"},
                 )
             )
-            return values
+            if chosen:
+                consent = held_back and analysis.target not in chosen
+                line = f"target: {', '.join(chosen)} ({'위험을 알고 고름' if consent else '사용자 선택'})"
+                emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
+            return values, chosen
 
         async def worker() -> None:
             job.state = "running"
@@ -936,10 +984,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown deployment_id")
         if job.state != "waiting_input" or job.env_ready.is_set():
             raise HTTPException(status_code=409, detail="deployment is not waiting for input")
+        if body.targets is not None:
+            picked = list(dict.fromkeys(body.targets))
+            if not picked or not set(picked) <= set(job.target_options):
+                raise HTTPException(status_code=422, detail=f"targets must be among {job.target_options}")
+            job.env_targets = picked
         wanted = {e.name for e in job.required_env}
         job.env_values = {k: v for k, v in body.values.items() if k in wanted and v}
         job.env_ready.set()
-        return {"accepted": sorted(job.env_values)}
+        accepted: dict = {"accepted": sorted(job.env_values)}
+        if job.env_targets:
+            accepted["targets"] = job.env_targets
+        return accepted
 
     @app.get("/projects")
     async def projects() -> dict:

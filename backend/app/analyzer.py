@@ -22,6 +22,7 @@ Dockerfile: 저장소에 있으면 그대로 쓰고, 없으면 템플릿 초안�
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
@@ -41,7 +42,21 @@ SERVICE_MODELS = {2: "caas", 3: "paas", 1: "faas", 4: "iaas"}
 
 
 def analyze(src_dir: str) -> AnalysisResult:
-    """Analyze `src_dir` and return the deploy decision + initial Dockerfile."""
+    """Analyze `src_dir` and return the deploy decision + initial Dockerfile.
+
+    ANALYZER_MODE: auto (기본) — 로컬 clef-flash가 켜져 있으면 빠른 분석(app/quick.py, 몇 초),
+    아니면 Claude 검사관. fast — clef-flash만. full — Claude 검사관만 (저장소를 직접 다 읽는다)."""
+    mode = (os.environ.get("ANALYZER_MODE") or "auto").strip().lower()
+    if mode != "full":
+        from app import quick
+
+        if mode == "fast" or quick.ready():
+            try:
+                return quick.analyze(src_dir)
+            except quick.Unsupported:
+                if mode == "fast" or not os.environ.get("ANTHROPIC_API_KEY"):
+                    raise
+                # 빠른 분석이 못 만드는 저장소(템플릿 없는 언어 등)는 Claude 검사관이 본다
     model = load_model(src_dir)
     if not model:
         raise ValueError("ANTHROPIC_API_KEY가 없어 분석할 수 없습니다 (analyzer는 AI 검사관으로 판정합니다)")
@@ -50,8 +65,24 @@ def analyze(src_dir: str) -> AnalysisResult:
     )
 
 
-def analyze_with(src_dir: str, inspect, write, judge) -> AnalysisResult:
-    """검사관(inspect), Dockerfile 작성자(write), Dockerfile 판정관(judge)을 바꿔 끼울 수 있게 나눴다. 테스트는 가짜를 넣는다."""
+def quick_decision(src_dir: str) -> dict | None:
+    """로컬 clef-flash가 1초 안에 고른 서비스 (코드 읽기 같은 전처리 시간은 뺀다). clef-flash가 없거나 실패하면 None.
+    analyze()는 같은 폴더면 이 판단을 다시 하지 않고 쓴다."""
+    from app import quick
+
+    try:
+        return quick.decision_for(src_dir)
+    except Exception:  # 빠른 판단은 보여 주기만 한다. 실패해도 분석은 계속한다
+        logging.getLogger(__name__).warning("quick decision failed", exc_info=True)
+        return None
+
+
+def analyze_with(
+    src_dir: str, inspect, write, judge, prefer: list[int] | None = None, targets: dict | None = None
+) -> AnalysisResult:
+    """검사관(inspect), Dockerfile 작성자(write), Dockerfile 판정관(judge)을 바꿔 끼울 수 있게 나눴다. 테스트는 가짜를 넣는다.
+    prefer: 규칙을 통과한 유형 중 먼저 고를 순서 (빠른 분석의 판단). targets: 유형 → 타깃 (기본 TARGETS)."""
+    targets = targets or TARGETS
     root = Path(src_dir).resolve()
     reports, errors = run_all(inspect, root)
     if reports["malicious"] is None:  # 검사하지 못한 저장소는 빌드하지 않는다
@@ -80,9 +111,10 @@ def analyze_with(src_dir: str, inspect, write, judge) -> AnalysisResult:
             + ", ".join(f"{e['name']} ({e['hits'][0]['evidence']})" for e in files)
         )
     candidates, removed = apply_rules(values)
-    t = next((t for t in TARGETS if t in candidates), None)
+    order = [t for t in prefer or () if t in targets] + [t for t in targets if t not in (prefer or ())]
+    t = next((t for t in order if t in candidates), None)
     if t is None:
-        reasons = [f"{TYPES[t]}: {r}" for t in TARGETS for r in removed.get(t, [])]
+        reasons = [f"{TYPES[t]}: {r}" for t in targets for r in removed.get(t, [])]
         raise ValueError("local·cloudrun 어디에도 배포할 수 없습니다. " + "; ".join(dict.fromkeys(reasons)))
 
     tools = reports["system_packages"]["tools"] if values["system_packages"] == "yes" else []
@@ -91,13 +123,13 @@ def analyze_with(src_dir: str, inspect, write, judge) -> AnalysisResult:
     )
     port = app.port if app.port and not app.port_env else 8080  # $PORT를 못 받는 앱은 고정 포트로 듣는다
     dockerfile, dockerfile_notes = _dockerfile(root, app, port, write, judge)
-    if t == 4:
+    if t == 4 and 2 in removed:
         why = f"서버리스 컨테이너로는 갈 수 없어 local(Docker)에 배포합니다: {'; '.join(dict.fromkeys(removed[2]))}"
     else:
-        why = f"{TYPES[t]} 유형으로 판단해 cloudrun에 배포합니다."
+        why = f"{TYPES[t]} 유형으로 판단해 {targets[t]}에 배포합니다."
     models = [m for n, m in SERVICE_MODELS.items() if n in candidates]
     return AnalysisResult(
-        target=TARGETS[t],
+        target=targets[t],
         service_models=["caas", "iaas"] if t == 5 else models,
         language=app.language or "unknown",
         framework=app.framework,
