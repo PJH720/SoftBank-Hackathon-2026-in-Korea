@@ -543,6 +543,55 @@ def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> di
     return {k: v for k, v in options.items() if v}
 
 
+# Connection URLs the user typed for an app's resources. Kept in memory and, like env values, in env_store
+# (Secret Manager) when GCP is configured; never in projects.json or in events.
+_resource_secrets: dict[str, dict[str, str]] = {}
+STORE_ENV = {"postgres": "DATABASE_URL", "mysql": "DATABASE_URL", "redis": "REDIS_URL"}
+
+
+class ResourceRequest(BaseModel):
+    """POST /projects/{name}/resources body (the dashboard's drag & drop).
+    new: CloudMorph makes the database (Postgres sidecar on local/node, Cloud SQL on cloudrun);
+    url: connect the user's own server; none: disconnect (the data stays where it is)."""
+
+    kind: Literal["postgres", "mysql", "redis"]
+    mode: Literal["new", "url", "none"]
+    url: str | None = None
+
+
+class MoveRequest(BaseModel):
+    """POST /projects/{name}/move body: run the app somewhere else, then take the old place down."""
+
+    to: DeployTarget
+
+
+def _apply_resources(name: str, project: dict, overrides: dict) -> dict:
+    """Deployer options for the resources the user attached or removed on the dashboard."""
+    resources = project.get("resources") or {}
+    if not resources:
+        return overrides
+    stores = (project.get("analysis") or {}).get("stores") or {}
+    env = dict(overrides.get("env") or {})
+    for kind, setting in resources.items():
+        var = stores.get(kind) or STORE_ENV[kind]
+        mode = setting.get("mode")
+        if mode == "url" and (url := _resource_secrets.get(name, {}).get(var)):
+            env[var] = url
+        elif mode == "new":
+            env.pop(var, None)  # the deployer makes one and injects DATABASE_URL
+            if kind == "postgres":
+                overrides["database"] = "postgres"
+        elif mode == "none":
+            env.pop(var, None)
+            if kind == "postgres":
+                overrides["database"] = None
+    if env:
+        overrides["env"] = env
+    else:
+        overrides.pop("env", None)
+    return overrides
+
+
 def run_pipeline(
     source: str,
     target: DeployTarget,
@@ -762,10 +811,12 @@ def create_app() -> FastAPI:
         intro: list[str] | None = None,
         trigger: str = "api",
         ask_env: bool = False,
+        retire: list[str] | None = None,
     ) -> str:
         """Create a job and run analyze -> deploy -> heal for every target in a worker thread.
         Shared by POST /deploy (user click) and POST /webhook/github (push).
-        `targets=[]`: CloudMorph picks (the analyzer's target); see _resolve_env for when the user is asked."""
+        `targets=[]`: CloudMorph picks (the analyzer's target); see _resolve_env for when the user is asked.
+        `retire`: targets to take down once every new target is up (POST /projects/{name}/move)."""
         if len(targets) != len(set(targets)):
             raise HTTPException(status_code=422, detail="targets must be unique")
         if name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
@@ -850,8 +901,18 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
+                project["analysis"] = {
+                    "target": analysis.target,
+                    "language": analysis.language,
+                    "framework": analysis.framework,
+                    "port": analysis.port,
+                    "service_models": analysis.service_models,
+                    "stores": {e.resource: e.name for e in reversed(analysis.required_env) if e.resource},
+                    "notes": analysis.notes[:6],
+                }
+                project["decision"] = decision
                 values, run_targets = _resolve_env(analysis, source_dir, decision)
-                overrides = _env_overrides(analysis.required_env, values)
+                overrides = _apply_resources(app_name, project, _env_overrides(analysis.required_env, values))
                 for t in run_targets:  # targets=[] (CloudMorph picks): the job learns its targets only now
                     job.targets.setdefault(t, {"success": None, "url": None})
                 project["targets"] = run_targets
@@ -1039,11 +1100,27 @@ def create_app() -> FastAPI:
                     live={**project.get("live", {}), **live},
                     updated_at=time.time(),
                 )
+                if retire and job.state == "completed":
+                    await _retire(project, job, retire)
                 _save_projects()
                 _publish(job, None)
 
         asyncio.create_task(worker())
         return deployment_id
+
+    async def _retire(project: dict, job: Job, targets: list[str]) -> None:
+        """After a move: take the old place down (its database is kept, like POST /projects/{name}/stop)."""
+        for target in targets:
+            handles = (project.get("live") or {}).pop(target, None)
+            (project.get("urls") or {}).pop(target, None)
+            if not handles:
+                continue
+            try:
+                done = await asyncio.to_thread(deployer.teardown, target, handles)
+                line = f"move: {target} 내림 ({', '.join(done) or '이미 내려가 있었어요'})"
+            except Exception as exc:  # noqa: BLE001 — the new place is up; report and keep going
+                line = f"move: {target}을(를) 내리지 못했어요 ({type(exc).__name__}: {exc})"
+            _publish(job, PipelineEvent(type="log", payload={"line": line}))
 
     app.state.launch = _launch  # tests swap this for a fake
 
@@ -1108,6 +1185,88 @@ def create_app() -> FastAPI:
         finally:
             lock.release()
         return {"name": name, "stopped": stopped, "failed": failed}
+
+    def _redeploy(project: dict, intro: str, trigger: str, targets: list[str], retire=None) -> str:
+        return app.state.launch(
+            project["source"],
+            targets,
+            name=project["name"],
+            ref=project.get("ref"),
+            intro=[intro],
+            trigger=trigger,
+            retire=retire,
+        )
+
+    def _idle_project(name: str) -> dict:
+        project = _projects.get(name)
+        if project is None:
+            raise HTTPException(status_code=404, detail="unknown project")
+        if project.get("last_status") == "running" or ((lock := _app_locks.get(name)) and lock.locked()):
+            raise HTTPException(status_code=409, detail="a deployment of this app is in progress")
+        return project
+
+    @app.post("/projects/{name}/resources")
+    async def attach_resource(name: str, body: ResourceRequest) -> dict:
+        """Drag & drop: attach a database (new or the user's own URL) or detach it, then redeploy the app
+        where it runs now so the change takes effect. Returns the redeploy's deployment_id."""
+        project = _idle_project(name)
+        stores = (project.get("analysis") or {}).get("stores") or {}
+        var = stores.get(body.kind) or STORE_ENV[body.kind]
+        warning = None
+        if (
+            body.mode != "none"
+            and body.kind not in stores
+            and not (body.kind == "postgres" and "DATABASE_URL" in stores.values())
+        ):
+            warning = f"이 앱 코드에서 {var}를 읽는 곳을 찾지 못했어요. 연결해도 앱이 쓰지 않을 수 있어요."
+        if body.mode == "new" and body.kind != "postgres":
+            raise HTTPException(
+                status_code=422,
+                detail="새로 만들 수 있는 건 PostgreSQL이에요. 다른 DB는 주소로 연결해 주세요.",
+            )
+        if body.mode == "url":
+            if not body.url or "://" not in body.url:
+                raise HTTPException(
+                    status_code=422,
+                    detail="접속 주소를 넣어 주세요 (예: postgresql://user:pass@host:5432/db)",
+                )
+            _resource_secrets.setdefault(name, {})[var] = body.url
+            try:
+                saved = env_store.load(name, _source_identity(project["source"]))
+                env_store.save(name, _source_identity(project["source"]), {**saved, var: body.url})
+            except env_store.EnvStoreError:
+                pass  # memory still has it for this server's lifetime
+        project.setdefault("resources", {})[body.kind] = {"mode": body.mode, "var": var}
+        _save_projects()
+        targets = list(project.get("live") or {}) or list(project.get("targets") or [])
+        if not targets:
+            return {
+                "name": name,
+                "resources": project["resources"],
+                "deployment_id": None,
+                "warning": warning,
+            }
+        what = {"new": "새로 만들어 연결", "url": "주소로 연결", "none": "연결 끊기"}[body.mode]
+        deployment_id = _redeploy(project, f"resources: {body.kind} {what} → 다시 배포", "resources", targets)
+        return {
+            "name": name,
+            "resources": project["resources"],
+            "deployment_id": deployment_id,
+            "warning": warning,
+        }
+
+    @app.post("/projects/{name}/move")
+    async def move_project(name: str, body: MoveRequest) -> dict:
+        """Local <-> cloud in one step: deploy the same app (same name, saved values) to `to`, and once it is
+        up take the old place down. Its database data does not move with it."""
+        project = _idle_project(name)
+        old = [t for t in (project.get("live") or {}) if t != body.to]
+        if body.to in (project.get("live") or {}) and not old:
+            raise HTTPException(status_code=409, detail=f"이미 {body.to}에서 돌아가고 있어요")
+        deployment_id = _redeploy(
+            project, f"move: {', '.join(old) or '-'} → {body.to}", "move", [body.to], old
+        )
+        return {"name": name, "to": body.to, "retire": old, "deployment_id": deployment_id}
 
     @app.post("/projects/{name}/drill")
     async def drill(name: str, body: DrillRequest) -> dict:

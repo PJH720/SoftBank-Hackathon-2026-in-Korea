@@ -1337,3 +1337,114 @@ def test_push_deploy_with_no_targets_takes_the_safe_pick(m, tmp_path, monkeypatc
 
     asyncio.run(scenario())
     assert deployed == ["local"]  # nobody to ask: the analyzer's (safe) target, not the decision's
+
+
+# ---------- dashboard: drag & drop resources, move local <-> cloud ----------
+
+
+def test_resources_become_deployer_options(m):
+    project = {"analysis": {"stores": {"postgres": "DATABASE_URL"}}}
+    m._resource_secrets["gb"] = {"DATABASE_URL": "postgresql://me:pw@db.example:5432/gb"}
+    saved = {"env": {"DATABASE_URL": "postgresql://old", "SECRET_KEY": "k"}}
+    project["resources"] = {"postgres": {"mode": "url"}}
+    assert m._apply_resources("gb", project, dict(saved))["env"]["DATABASE_URL"].endswith(
+        "db.example:5432/gb"
+    )
+    project["resources"] = {"postgres": {"mode": "new"}}
+    new = m._apply_resources("gb", project, dict(saved))
+    assert new["database"] == "postgres" and new["env"] == {"SECRET_KEY": "k"}  # the deployer makes one
+    project["resources"] = {"postgres": {"mode": "none"}}
+    off = m._apply_resources("gb", project, {"env": {"DATABASE_URL": "postgresql://old"}})
+    assert off == {"database": None}  # nothing injected, nothing provisioned
+
+
+def _dashboard(m, monkeypatch, project):
+    m._projects[project["name"]] = project
+    launched = []
+
+    def fake_launch(source, targets, **kw):
+        launched.append((source, targets, kw))
+        return "dep-1"
+
+    monkeypatch.setattr(m.app.state, "launch", fake_launch)
+    monkeypatch.setattr(m, "_save_projects", lambda: None)
+    routes = {(r.path, tuple(r.methods)): r.endpoint for r in m.app.routes if hasattr(r, "endpoint")}
+    return launched, lambda path: next(e for (p, _), e in routes.items() if p == path)
+
+
+def test_drag_and_drop_postgres_redeploys_where_the_app_runs(m, monkeypatch):
+    project = {
+        "name": "gb",
+        "source": "https://github.com/o/gb",
+        "ref": None,
+        "last_status": "completed",
+        "live": {"local": {"container_name": "c"}},
+        "analysis": {"stores": {"postgres": "DATABASE_URL"}},
+    }
+    launched, route = _dashboard(m, monkeypatch, project)
+    attach = route("/projects/{name}/resources")
+    out = asyncio.run(attach("gb", m.ResourceRequest(kind="postgres", mode="new")))
+    assert out["deployment_id"] == "dep-1" and out["warning"] is None
+    assert project["resources"] == {"postgres": {"mode": "new", "var": "DATABASE_URL"}}
+    ((source, targets, kw),) = launched
+    assert source == project["source"] and targets == ["local"] and kw["trigger"] == "resources"
+    with pytest.raises(HTTPException) as bad:
+        asyncio.run(attach("gb", m.ResourceRequest(kind="postgres", mode="url", url="not a url")))
+    assert bad.value.status_code == 422
+    out = asyncio.run(attach("gb", m.ResourceRequest(kind="redis", mode="url", url="redis://cache:6379/0")))
+    assert "REDIS_URL를 읽는 곳을 찾지 못했어요" in out["warning"]  # honest: this app never reads it
+    assert "redis://cache" not in json.dumps(project)  # the URL is a secret: memory / Secret Manager only
+    project["last_status"] = "running"
+    with pytest.raises(HTTPException) as busy:
+        asyncio.run(attach("gb", m.ResourceRequest(kind="postgres", mode="none")))
+    assert busy.value.status_code == 409
+
+
+def test_move_deploys_to_the_new_place_and_retires_the_old_one(m, monkeypatch):
+    project = {
+        "name": "gb",
+        "source": "/src",
+        "ref": None,
+        "last_status": "completed",
+        "live": {"local": {"container_name": "c"}},
+    }
+    launched, route = _dashboard(m, monkeypatch, project)
+    move = route("/projects/{name}/move")
+    out = asyncio.run(move("gb", m.MoveRequest(to="cloudrun")))
+    assert out == {"name": "gb", "to": "cloudrun", "retire": ["local"], "deployment_id": "dep-1"}
+    ((_, targets, kw),) = launched
+    assert targets == ["cloudrun"] and kw["retire"] == ["local"] and kw["trigger"] == "move"
+    with pytest.raises(HTTPException) as same:
+        asyncio.run(move("gb", m.MoveRequest(to="local")))  # it already runs there and nowhere else
+    assert same.value.status_code == 409
+
+
+def test_move_takes_the_old_place_down_only_after_the_new_one_is_up(m, tmp_path, monkeypatch):
+    analysis = AnalysisResult(target="local", language="python", dockerfile="FROM scratch\n")
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, None)
+    torn = []
+    monkeypatch.setattr(
+        m.deployer, "teardown", lambda target, handles: torn.append((target, handles)) or ["gone"]
+    )
+    m._projects["gb"] = {
+        "name": "gb",
+        "source": str(source),
+        "ref": None,
+        "history": [],
+        "last_status": "completed",
+        "live": {"local": {"container_name": "old"}},
+        "urls": {"local": "http://127.0.0.1:1"},
+    }
+
+    async def scenario():
+        deployment_id = m.app.state.launch(
+            str(source), ["cloudrun"], name="gb", trigger="move", retire=["local"]
+        )
+        await _until(lambda: m._jobs[deployment_id].completed)
+        return deployment_id
+
+    deployment_id = asyncio.run(scenario())
+    assert deployed == ["cloudrun"] and torn == [("local", {"container_name": "old"})]
+    assert list(m._projects["gb"]["live"]) == ["cloudrun"] and "local" not in m._projects["gb"]["urls"]
+    lines = [d["payload"].get("line", "") for e, d in _events(routes, deployment_id) if e == "log"]
+    assert any(line.startswith("move: local 내림") for line in lines)

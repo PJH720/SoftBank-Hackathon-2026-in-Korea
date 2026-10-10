@@ -25,7 +25,8 @@ export function emptyRun(id = null, meta = {}) {
     targetState: Object.fromEntries(targets.map((t) => [t, freshTarget()])),
     logs: [],
     patches: [],
-    envRequest: null, // { items, timeoutSec } while the backend waits for POST /deploy/{id}/env
+    envRequest: null, // { items, timeoutSec, chooseTarget? } while the backend waits for POST /deploy/{id}/env
+    decision: null, // clef-flash's 1-second pick: { service, target, label, explain, probabilities, ms, prep_ms, engine, why }
     seen: new Set(),
     error: null,
     question: null, // healer fixed the source: { question_id, ask, pr_url, pr_error, rationale, diff, choice, reason }
@@ -68,7 +69,10 @@ export function applyEvent(prev, type, p, raw) {
   switch (type) {
     case 'log': {
       const line = p.line || ''
-      if (p.kind === 'question') {
+      if (p.kind === 'decision') {
+        run.decision = p
+        push(run, { ts, kind: 'analyze', stage: 'analyze', text: `${(p.ms / 1000).toFixed(2)}초 만에 판단했어요 · ${p.label} (${p.engine})` })
+      } else if (p.kind === 'question') {
         run.question = { ...p, choice: null, reason: null }
         const ask = p.ask ? '반영하기 전에 물어볼게요' : '아무도 보고 있지 않아 PR로만 제안해요'
         push(run, { ts, kind: 'heal', stage: 'heal', target: run.currentTarget, text: `AI가 코드를 고쳤어요 · ${ask} — ${p.rationale}` })
@@ -91,6 +95,10 @@ export function applyEvent(prev, type, p, raw) {
         push(run, { ts, kind: 'push', stage: 'queue', text: `대기 · 같은 앱의 이전 배포가 끝나면 시작합니다 (${line.slice(7)})` })
       } else if (line.startsWith('cancel: ')) {
         push(run, { ts, kind: 'error', stage: 'cancel', text: '중단 요청 · 진행 중인 빌드를 끊고 다음 단계에서 멈춥니다' })
+      } else if (line.startsWith('target: ')) {
+        push(run, { ts, kind: 'push', stage: 'analyze', text: `올릴 곳 · ${line.slice(8)}` })
+      } else if (/^(move|resources|guard): /.test(line)) {
+        push(run, { ts, kind: 'push', stage: 'trigger', text: line })
       } else if (line.startsWith('github push')) {
         run.trigger = 'github-push'
         push(run, { ts, kind: 'push', stage: 'trigger', text: line })
@@ -111,7 +119,7 @@ export function applyEvent(prev, type, p, raw) {
       } else if (stage === 'heal') {
         const t = p.target || run.currentTarget
         ensure(run, t)
-        run.targetState[t] = { ...run.targetState[t], phase: 'healing' }
+        run.targetState[t] = { ...run.targetState[t], phase: 'healing', stderr: p.stderr || '' }
         const first = (p.stderr || '').split('\n').find((l) => l.startsWith('[deployer]')) || ''
         push(run, { ts, kind: 'error', stage: 'deploy', target: t, text: `배포 실패 → 자가치유 에이전트로 전달 ${first.replace('[deployer] ', '· ')}`, detail: p.stderr })
       } else if (stage === 'redeploy') {
@@ -123,7 +131,7 @@ export function applyEvent(prev, type, p, raw) {
     }
     case 'input_required': {
       const items = p.items || []
-      run.envRequest = { items, timeoutSec: p.timeout_sec }
+      run.envRequest = { items, timeoutSec: p.timeout_sec, chooseTarget: p.choose_target || null }
       push(run, { ts, kind: 'push', stage: 'analyze', text: `배포에 필요한 값 ${new Set(items.map((i) => i.name)).size}개를 기다리는 중 · ${[...new Set(items.map((i) => i.name))].join(', ')}` })
       break
     }

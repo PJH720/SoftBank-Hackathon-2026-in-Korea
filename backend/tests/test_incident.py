@@ -202,7 +202,7 @@ def test_decider_prefers_jev_then_local_clef(monkeypatch):
     assert incident.decider().name == "Jev"
     monkeypatch.delenv("TYPESAFE_API_KEY")
     monkeypatch.setattr(systemone, "ready", lambda ep, ttl=30.0: True)
-    assert incident.decider().name == "clef-flash (local)"
+    assert incident.decider().name == "clef-flash (로컬)"
     monkeypatch.setattr(systemone, "ready", lambda ep, ttl=30.0: False)
     assert incident.decider() is None
 

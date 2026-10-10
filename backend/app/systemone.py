@@ -80,7 +80,7 @@ class Answers:
 
 @dataclass(frozen=True)
 class Endpoint:
-    name: str  # what people see: "clef-flash (local)", "Jev"
+    name: str  # what people see: "clef-flash (로컬)", "Jev"
     base_url: str
     model: str
     api_key: str | None = None
@@ -140,7 +140,7 @@ def clef() -> Endpoint | None:
     base = os.environ.get("CLEF_BASE_URL")
     if not base:
         return None
-    return Endpoint("clef-flash (local)", base, os.environ.get("CLEF_MODEL") or "clef-flash", local=True)
+    return Endpoint("clef-flash (로컬)", base, os.environ.get("CLEF_MODEL") or "clef-flash", local=True)
 
 
 def jev() -> Endpoint | None:
