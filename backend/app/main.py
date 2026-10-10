@@ -50,7 +50,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from app import analyzer, deployer, env_store, fixpr, healer, webhooks
+from app import analyzer, deployer, env_store, fixpr, healer, incident, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
 from app.schemas import AnalysisResult, DeployRequest, DeployTarget, EnvInput, EnvRequirement, PipelineEvent
@@ -101,7 +101,7 @@ _LOCAL_SOURCE_DENY_ROOTS = tuple(
 _logger = logging.getLogger(__name__)
 # API token guard: every path under these prefixes needs CLOUDMORPH_API_TOKEN. /health and the
 # GitHub webhook (HMAC-verified on its own) stay open.
-PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects")
+PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects", "/incidents")
 # "testclient" is Starlette TestClient's client host; ASGI servers only ever report IPs here.
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 _PROXY_HEADERS = ("cf-connecting-ip", "x-forwarded-for", "forwarded")
@@ -432,6 +432,12 @@ class AnswerRequest(BaseModel):
     choice: Literal["stop", "continue"]
 
 
+class DrillRequest(BaseModel):
+    """POST /projects/{name}/drill body."""
+
+    kind: Literal["crash", "db_down", "outage"]
+
+
 PR_MERGE_HINT = (
     "Merge it, then deploy again (if the repo's GitHub webhook points here, the merge redeploys by itself)."
 )
@@ -458,7 +464,7 @@ def source_fix_confirm(
                     pr_error = f"{type(exc).__name__}: {exc}"
             question_id = uuid.uuid4().hex[:12]
             answers: SimpleQueue[str] = SimpleQueue()
-            ask = trigger != "github-push"
+            ask = trigger not in ("github-push", "guard")  # nobody is watching these deployments
             if ask:
                 job.questions[question_id] = answers
             emit(
@@ -634,6 +640,59 @@ def create_app() -> FastAPI:
             fleetmod.start_background_watcher(
                 float(os.getenv("CLOUDMORPH_FLEET_INTERVAL", "10")), emit=fleet_events.append
             )
+
+    # --- incident response: Jev judges, the guard fixes (app/incident.py) -------------------------
+    def _job_status(deployment_id: str) -> dict | None:
+        job = _jobs.get(deployment_id)
+        return {"completed": job.completed, "targets": dict(job.targets)} if job else None
+
+    def _can_failover(project: dict, target: str) -> str | None:
+        """Where an app can move when its platform is down: the cloud <-> this machine."""
+        if target in ("local", "node") and os.getenv("GCP_PROJECT_ID"):
+            return "cloudrun"
+        if target == "local" and nodepool.load_registry().nodes:
+            return "node"
+        if target in ("cloudrun", "node") and shutil.which("docker"):
+            return "local"
+        return None
+
+    guard_loop: dict = {}
+
+    def _failover(project: dict, target: str) -> str:
+        """Called from the guard thread: start a normal deployment of the same app on `target`."""
+
+        async def launch() -> str:
+            return app.state.launch(
+                project["source"],
+                [target],
+                name=project["name"],
+                ref=project.get("ref"),
+                intro=[f"guard: {project['name']} -> {target} (incident response)"],
+                trigger="guard",
+            )
+
+        return asyncio.run_coroutine_threadsafe(launch(), guard_loop["loop"]).result(timeout=30)
+
+    guard = incident.Guard(
+        projects=lambda: list(_projects.values()),
+        busy=lambda name: bool((lock := _app_locks.get(name)) and lock.locked()),
+        failover=_failover,
+        job=_job_status,
+        can_failover=_can_failover,
+    )
+    app.state.guard = guard
+
+    @app.on_event("startup")
+    async def start_guard() -> None:
+        # On by default: every live app is watched. CLOUDMORPH_GUARD=0 turns it off (tests, read-only servers).
+        guard_loop["loop"] = asyncio.get_running_loop()
+        if os.getenv("CLOUDMORPH_GUARD", "1") != "0":
+            guard.start()
+
+    @app.get("/incidents")
+    async def incidents() -> dict:
+        """What the guard sees (health per app and target) and what it did (incident timelines)."""
+        return await asyncio.to_thread(guard.snapshot)
 
     @app.get("/fleet")
     async def fleet_status() -> dict:
@@ -1029,6 +1088,22 @@ def create_app() -> FastAPI:
         finally:
             lock.release()
         return {"name": name, "stopped": stopped, "failed": failed}
+
+    @app.post("/projects/{name}/drill")
+    async def drill(name: str, body: DrillRequest) -> dict:
+        """Disaster drill: break a live app on purpose and let the guard notice and recover it.
+        crash = kill the container · db_down = stop its database · outage = pretend its platform is down."""
+        project = _projects.get(name)
+        if project is None:
+            raise HTTPException(status_code=404, detail="unknown project")
+        if project.get("last_status") == "running":
+            raise HTTPException(status_code=409, detail="a deployment of this app is in progress")
+        try:
+            return await asyncio.to_thread(guard.drill, project, body.kind)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.post("/webhook/github")
     async def github_webhook(request: Request) -> dict:

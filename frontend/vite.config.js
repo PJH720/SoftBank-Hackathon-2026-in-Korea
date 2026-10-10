@@ -23,6 +23,7 @@ export default defineConfig({
       '/health': route,
       '/fleet': route,
       '/projects': route,
+      '/incidents': route,
       '/webhook': { target: backend, changeOrigin: true }, // GitHub push webhook: signed, never gets our token
     },
   },

@@ -19,6 +19,8 @@ SoftBank Hackathon 2026 in Korea · Term 2 · Team Gold
             → Live Public URL + AI 수정 전/후 리포트 (SSE → dashboard)
 ```
 
+빠른 분석(로컬 clef-flash, 1초 안에 서비스 판단): [`docs/analyzer.md`](docs/analyzer.md) · 장애 대응(Jev): [`docs/incident.md`](docs/incident.md)
+
 인터페이스 계약: [`docs/interfaces.md`](docs/interfaces.md) · 요구사항 명세: [`docs/requirements.md`](docs/requirements.md) · 소스: [`backend/app/schemas.py`](backend/app/schemas.py)
 
 ## Repository layout
