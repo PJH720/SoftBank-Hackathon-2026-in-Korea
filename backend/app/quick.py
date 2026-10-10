@@ -143,12 +143,6 @@ HINTS = {
         I,
     ),
 }
-# Secrets in evidence lines are masked before they reach the model, events or notes
-SECRET_VALUE = re.compile(
-    r"((?:password|passwd|secret|api_?key|token)\s*[:=]\s*['\"])([^'\"]{3,})(['\"])|"
-    r"(://[^\s'\"@/:]*:)([^\s'\"@]+)(@)|(sk-|AKIA|ghp_)[A-Za-z0-9]{8,}",
-    I,
-)
 SUSPICIOUS = re.compile(
     r"(?:curl|wget)[^|\n]{0,200}\|\s*(?:ba|z)?sh\b|base64\s+(?:-d|--decode)|b64decode\(|\batob\(|\beval\s*\(|"
     r"new Function\(|child_process|shell\s*=\s*True|os\.system\(|169\.254\.169\.254|metadata\.google\.internal|"
@@ -264,6 +258,7 @@ CODE_EXT = {
 CONFIG_EXT = {".properties", ".yml", ".yaml", ".toml", ".cfg", ".ini", ".json", ".prisma"}
 CONFIG_NAMES = {"Dockerfile", "Procfile", "Makefile", ".env.example", ".env.sample", ".env.template"}
 MAX_HITS = 6
+MAX_SCAN_FILES = 3000  # text files read by scan(); a monorepo should not stall the preprocessing
 MAX_ENV_QUESTIONS = 24
 NO_KEEP = 0.2  # a "no" this sure drops its candidate lines (they were pattern noise, not risks to consent to)
 YES = 0.5
@@ -271,6 +266,10 @@ YES = 0.5
 
 class Unsupported(ValueError):
     """The fast path cannot build this repo (no template for the language and no Dockerfile)."""
+
+
+class ModelDown(ValueError):
+    """clef-flash stopped answering mid-analysis (analyzer.analyze falls back to the Claude inspectors)."""
 
 
 @dataclass
@@ -284,7 +283,7 @@ class Hit:
         return f"{self.path}:{self.line}"
 
     def brief(self, n: int = 90) -> str:
-        return f"{self.ref} {mask(self.text)[:n]}"
+        return f"{self.ref} {systemone.redact(self.text)[:n]}"
 
 
 @dataclass
@@ -345,17 +344,6 @@ class Decision:
         }
 
 
-def mask(text: str) -> str:
-    def repl(m: re.Match) -> str:
-        if m.group(1):
-            return f"{m.group(1)}***{m.group(3)}"
-        if m.group(4):
-            return f"{m.group(4)}***{m.group(6)}"
-        return (m.group(7) or "") + "***"
-
-    return SECRET_VALUE.sub(repl, text)
-
-
 # ---------- scan (전처리) ----------
 
 
@@ -410,12 +398,13 @@ def scan(root: Path) -> Scan:
     for p in az._walk(root):
         rel = _rel(root, p)
         s.files.append(rel)
-        if (
+        readable = (
             p.suffix in CODE_EXT
             or p.suffix in CONFIG_EXT
             or p.name in CONFIG_NAMES
             or p.name.startswith("requirements")
-        ):
+        )
+        if readable and len(texts) < MAX_SCAN_FILES:
             texts[rel] = az.read_text(p).splitlines()
     s.signals = {n: [] for n in SIGNALS}
     for rel, lines in texts.items():
@@ -887,7 +876,7 @@ def _evidence(hits: list[Hit]) -> list[az.Evidence]:
 
 
 def _env_question(name: str, hits: list[Hit]) -> dict:
-    code = " | ".join(mask(h.text)[:100] for h in hits[:2])
+    code = " | ".join(systemone.redact(h.text)[:100] for h in hits[:2])
     return systemone.choice(
         f"What kind of value does the app read from {name}? Code: {code}",
         {k: v[0] for k, v in ENV_KINDS.items()},
@@ -909,27 +898,13 @@ def _roles(kind: str, names: list[str]) -> list[az.EnvRole]:
     return roles
 
 
-def make_inspector(s: Scan, ep: systemone.Endpoint, errors: list[str]):
-    """inspect(name) -> the same report models the Claude inspectors return. The first call asks
-    clef-flash once for everything; the analyzer's threads then read the shared answers."""
-    lock, done = threading.Lock(), {}
-
-    def batch() -> dict:
-        with lock:
-            if not done:
-                done.update(_ask_all(s, ep, errors))
-            return done
-
-    def inspect(name: str):
-        report = batch().get(name)
-        if isinstance(report, Exception):
-            raise report
-        return report
-
-    return inspect
+def make_inspector(reports: dict):
+    """inspect(name) -> the same report models the Claude inspectors return, from answers asked up front."""
+    return reports.__getitem__
 
 
-def _ask_all(s: Scan, ep: systemone.Endpoint, errors: list[str]) -> dict:
+def _ask_all(s: Scan, ep: systemone.Endpoint) -> dict:
+    """Every inspector's report from one batched call (+ one for suspicious lines). Raises SystemOneError."""
     reports: dict = {}
     questions: dict = {}
     for n, hits in s.signals.items():
@@ -944,14 +919,7 @@ def _ask_all(s: Scan, ep: systemone.Endpoint, errors: list[str]) -> dict:
         questions["start"] = systemone.choice(
             "Which command starts this app's web server?", {c: None for c, _ in s.starts[:8]}
         )
-    answers = None
-    if questions:
-        state = decision_state(s)
-        try:
-            answers = ep.ask(state, questions, timeout=60)
-        except systemone.SystemOneError as e:
-            fail = RuntimeError(f"clef-flash: {e}")
-            return {n: fail for n in az.INSPECTORS}
+    answers = ep.ask(decision_state(s), questions, timeout=60) if questions else None
     # signals: no candidate line -> "no" (that is the trade for speed; ANALYZER_MODE=full reads everything)
     for n in SIGNALS:
         hits = s.signals[n]
@@ -1050,19 +1018,16 @@ def _install_hooks(s: Scan) -> list[Hit]:
 
 def _malicious(s: Scan, ep: systemone.Endpoint):
     """One yes/no per suspicious line (tuned 5/5 on labeled lines; one question over all lines missed a
-    lone postinstall hook). A failed check stops the analysis: analyze_with treats it as a failed inspector."""
+    lone postinstall hook). If clef-flash cannot answer, nothing is built: analyze() raises ModelDown."""
     lines = list({h.ref: h for h in [*_install_hooks(s), *s.suspicious]}.values())[:MAX_SUSPICIOUS]
     if not lines:
         return az.RisksReport(items=[])
     questions = {f"m{i}": systemone.noul(MALICIOUS_Q + h.brief(220)) for i, h in enumerate(lines)}
-    try:
-        a = ep.ask(
-            "Code from an unknown repository that will be built and run on our servers.",
-            questions,
-            timeout=30,
-        )
-    except systemone.SystemOneError as e:
-        return RuntimeError(f"clef-flash: {e}")
+    a = ep.ask(
+        "Code from an unknown repository that will be built and run on our servers.",
+        questions,
+        timeout=30,
+    )
     found = [(h, a.noul(f"m{i}")) for i, h in enumerate(lines) if a.noul(f"m{i}") >= YES]
     return az.RisksReport(
         items=[
@@ -1132,16 +1097,22 @@ def analyze(src_dir: str) -> AnalysisResult:
             "clef-flash가 켜져 있지 않아요 (scripts/clef-up.sh로 켜고 CLEF_BASE_URL을 넣어 주세요)"
         )
     root = Path(src_dir).resolve()
-    s, d = _cached(root, ep, need_decision=True)
+    try:
+        s, d = _cached(root, ep, need_decision=True)
+    except systemone.SystemOneError as e:
+        raise ModelDown(f"clef-flash가 답하지 않아요: {e}") from e
     if s.dockerfile is None and s.language not in az.BASE and not s.static_output:
         raise Unsupported(f"빠른 분석은 아직 {s.language or '이 언어'}용 Dockerfile을 만들지 못해요")
     if s.dockerfile is None and not s.static_output and not s.starts:
         raise Unsupported("시작 명령을 찾지 못했어요")
-    errors: list[str] = []
+    try:
+        reports = _ask_all(s, ep)
+    except systemone.SystemOneError as e:
+        raise ModelDown(f"clef-flash가 답하지 않아요: {e}") from e
     targets = {**az.TARGETS, 1: "function"} if s.function else az.TARGETS
     result = az.analyze_with(
         str(root),
-        make_inspector(s, ep, errors),
+        make_inspector(reports),
         make_template_writer(),
         make_judge(ep),
         prefer=d.prefer() if d else None,

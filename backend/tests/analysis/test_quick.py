@@ -242,3 +242,36 @@ def test_live_clef_decides_within_a_second(monkeypatch, tmp_path, app, service):
     print(f"\n{app}: {d['service']} {d['ms']}ms (전처리 {d['prep_ms']}ms, {d['tokens']} tokens)")
     assert d["service"] == service
     assert d["ms"] < 1000  # 판단 1초 예산 (전처리 제외)
+
+
+def test_a_dead_model_mid_analysis_falls_back_to_claude(api, use, monkeypatch):
+    def dies_after_the_decision(key, q):
+        if key == "service":
+            return "serverless_container"
+        raise systemone.SystemOneError("connection refused")
+
+    use(dies_after_the_decision)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(quick.ModelDown, match="clef-flash가 답하지 않아요"):
+        analyzer.analyze(str(api))  # no key: say so, build nothing
+
+    class ClaudePath(Exception):
+        pass
+
+    def claude(repo):
+        raise ClaudePath
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setattr(analyzer, "load_model", claude)
+    with pytest.raises(ClaudePath):
+        analyzer.analyze(str(api))
+
+
+def test_redact_keeps_code_readable_and_hides_values():
+    from app.systemone import redact
+
+    assert redact('DB = "postgres://admin:hunter2pass@db.prod/x"') == 'DB = "postgres://admin:***@db.prod/x"'
+    assert redact("password=hunter2 user=x") == "password=*** user=x"
+    assert redact("Authorization: Bearer abcdefghijk") == "Authorization: Bearer ***"
+    code = 'client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])'
+    assert redact(code) == code

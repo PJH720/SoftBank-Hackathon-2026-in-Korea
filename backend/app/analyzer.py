@@ -53,10 +53,10 @@ def analyze(src_dir: str) -> AnalysisResult:
         if mode == "fast" or quick.ready():
             try:
                 return quick.analyze(src_dir)
-            except quick.Unsupported:
+            except (quick.Unsupported, quick.ModelDown):
                 if mode == "fast" or not os.environ.get("ANTHROPIC_API_KEY"):
                     raise
-                # 빠른 분석이 못 만드는 저장소(템플릿 없는 언어 등)는 Claude 검사관이 본다
+                # 빠른 분석이 못 만드는 저장소(템플릿 없는 언어 등)나 clef-flash가 멈춘 때는 Claude 검사관이 본다
     model = load_model(src_dir)
     if not model:
         raise ValueError("ANTHROPIC_API_KEY가 없어 분석할 수 없습니다 (analyzer는 AI 검사관으로 판정합니다)")

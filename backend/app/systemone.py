@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -32,6 +33,22 @@ from dataclasses import dataclass
 
 # Ollama rejects bodies over 64 KiB without images; stay under it with room for the questions.
 MAX_BODY_BYTES = 60_000
+
+# Secrets in code lines and logs are masked before they reach a model (Jev is a hosted service), events or
+# notes. Code that only *reads* a secret (api_key=os.environ[...]) is left readable.
+_SECRET = re.compile(
+    r"(?P<k>(?:password|passwd|secret|api_?key|token)\s*[:=]\s*['\"]?)"
+    r"(?!(?:os|process|env|getenv|config|settings|self|System|ENV|import)\b)[^'\"\s,;&)]{3,}"
+    r"|(?P<u>://[^\s'\"@/:]*:)[^\s'\"@]+(?=@)"
+    r"|(?P<b>Bearer\s+)[A-Za-z0-9._~+/=-]{8,}"
+    r"|(?P<p>\b(?:sk-|AKIA|ghp_|gho_|xox[bp]-))[A-Za-z0-9-]{8,}",
+    re.IGNORECASE,
+)
+
+
+def redact(text: str) -> str:
+    """'postgres://app:hunter2@db' -> 'postgres://app:***@db', 'password="x1y2"' -> 'password="***"'."""
+    return _SECRET.sub(lambda m: (m["k"] or m["u"] or m["b"] or m["p"]) + "***", text)
 
 
 class SystemOneError(RuntimeError):
