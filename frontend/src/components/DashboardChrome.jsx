@@ -1,5 +1,5 @@
 import React from 'react';
-import { Boxes, Cloud, ExternalLink, Maximize, Minimize, Play, Rocket, Settings2, Square, Terminal } from 'lucide-react';
+import { Boxes, Cloud, ExternalLink, LayoutGrid, Maximize, Minimize, Play, Rocket, Settings2, Sparkles, Square, Terminal } from 'lucide-react';
 import { TARGET_META, stepStatus } from '../lib/run';
 import { activeStepLabel, liveEndpoints, pendingInput, recentKeyLogs } from '../lib/dashboard';
 import { fmtDur, fmtTime } from '../lib/style';
@@ -7,29 +7,46 @@ import { Dot } from './ui';
 
 const STEPS = { analyze: '분석', deploy: '배포', heal: '자가치유', live: '공개 URL' };
 const PHASES = { pending: '대기', deploying: '배포 중', healing: '치유 중', done: '완료', failed: '실패', cancelled: '중단' };
+const SCENE_TABS = [['journey', '배포 여정', Rocket], ['apps', '앱 관리', LayoutGrid], ['fleet', '노드 풀', Boxes]];
+const ROVING_KEYS = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
 
-export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, onFullscreen }) {
+function rovingIndex(key, index, count) {
+  if (key === 'Home') return 0;
+  if (key === 'End') return count - 1;
+  const step = key === 'ArrowRight' ? 1 : -1;
+  return (index + step + count) % count;
+}
+
+export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, onFullscreen, demoMode, onToggleDemo }) {
   return (
     <header className="dashboard-header">
       <div className="dashboard-brand"><Cloud size={25} /><h1>CloudMorph</h1></div>
-      <div className="scene-tabs" role="tablist" aria-label="3D 장면">
-        {[['journey', '배포 여정', Rocket], ['fleet', '노드 풀', Boxes]].map(([id, label, Icon]) => (
+      <div className="scene-tabs" role="tablist" aria-label="화면 전환">
+        {SCENE_TABS.map(([id, label, Icon], index) => (
           <button key={id} id={`scene-tab-${id}`} role="tab" aria-selected={scene === id} aria-controls="scene-view" tabIndex={scene === id ? 0 : -1}
             onClick={() => onScene(id)} onKeyDown={(e) => {
-              if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
-                e.preventDefault();
-                const next = e.key === 'Home' ? 'journey' : e.key === 'End' ? 'fleet' : scene === 'journey' ? 'fleet' : 'journey';
-                onScene(next); document.getElementById(`scene-tab-${next}`)?.focus();
-              }
+              if (!ROVING_KEYS.includes(e.key)) return;
+              e.preventDefault();
+              const [next] = SCENE_TABS[rovingIndex(e.key, index, SCENE_TABS.length)];
+              onScene(next); document.getElementById(`scene-tab-${next}`)?.focus();
             }}><Icon size={15} />{label}</button>
         ))}
       </div>
       <div className="header-actions">
+        <button
+          type="button"
+          className={`dashboard-button ${demoMode ? 'primary' : ''}`}
+          onClick={onToggleDemo}
+          title={demoMode ? '시각 검증(데모) 모드 끄기' : '시각 검증(데모) 모드 켜기'}
+        >
+          <Sparkles size={14} aria-hidden="true" />
+          <span>{demoMode ? '검증 모드 ON' : '시각 검증 모드'}</span>
+        </button>
         <span className="connection-status" title={`백엔드 ${healthy ? '연결됨' : healthy === false ? '끊김' : '확인 중'}`}>
           <Dot tone={healthy ? 'emerald' : healthy === false ? 'rose' : 'slate'} /><span>백엔드 {healthy ? '연결됨' : healthy === false ? '끊김' : '확인 중'}</span>
         </span>
         <button className="dashboard-button primary" onClick={() => onPanel('deploy')}><Play size={14} />새 배포</button>
-        <button className="dashboard-button" aria-label="상세·관리" onClick={() => onPanel('details')}><Settings2 size={15} /><span>상세·관리</span></button>
+        <button className="dashboard-button" aria-label="배포 상세" onClick={() => onPanel('details')}><Settings2 size={15} /><span>배포 상세</span></button>
         <button className="dashboard-button icon-button" aria-label={fullscreen ? '전체화면 종료' : '전체화면'} onClick={onFullscreen} disabled={!document.fullscreenEnabled}>
           {fullscreen ? <Minimize size={16} /> : <Maximize size={16} />}
         </button>
@@ -38,7 +55,7 @@ export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, 
   );
 }
 
-export function RunHUD({ run, now, notice, onPanel, onCancel, cancelling, celebrate }) {
+export function RunHUD({ run, now, notice, onPanel, onCancel, cancelling, celebrate, onShowApp }) {
   const steps = stepStatus(run);
   const pending = pendingInput(run);
   const elapsed = run.status === 'idle' ? null : Math.max(0, (run.finishedAt || now) - run.startedAt);
@@ -51,6 +68,7 @@ export function RunHUD({ run, now, notice, onPanel, onCancel, cancelling, celebr
         <div className="run-actions">
           {elapsed != null && <span className="elapsed">{fmtDur(elapsed)}</span>}
           {pending && <button className="dashboard-button attention" onClick={() => onPanel('details')}>입력 필요</button>}
+          {onShowApp && <button className="dashboard-button" onClick={onShowApp}><LayoutGrid size={13} />앱 관리에서 보기</button>}
           {run.status === 'running' && run.id && <button className="dashboard-button danger" disabled={cancelling} onClick={onCancel}><Square size={12} />{cancelling ? '중단 중…' : '중단'}</button>}
         </div>
       </div>
