@@ -575,8 +575,12 @@ def _apply_resources(name: str, project: dict, overrides: dict) -> dict:
     for kind, setting in resources.items():
         var = stores.get(kind) or STORE_ENV[kind]
         mode = setting.get("mode")
-        if mode == "url" and (url := _resource_secrets.get(name, {}).get(var)):
-            env[var] = url
+        if mode == "url":
+            if url := _resource_secrets.get(name, {}).get(var) or env.get(var):
+                env[var] = url
+            elif kind == "postgres":
+                # the user's own address is gone (restart without Secret Manager): never quietly swap in a new DB
+                overrides["database"] = None
         elif mode == "new":
             env.pop(var, None)  # the deployer makes one and injects DATABASE_URL
             if kind == "postgres":

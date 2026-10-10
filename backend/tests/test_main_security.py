@@ -1356,6 +1356,9 @@ def test_resources_become_deployer_options(m):
     project["resources"] = {"postgres": {"mode": "none"}}
     off = m._apply_resources("gb", project, {"env": {"DATABASE_URL": "postgresql://old"}})
     assert off == {"database": None}  # nothing injected, nothing provisioned
+    m._resource_secrets.clear()  # the user's own URL was lost (restart, no Secret Manager)
+    project["resources"] = {"postgres": {"mode": "url"}}
+    assert m._apply_resources("gb", project, {}) == {"database": None}  # not a fresh DB in its place
 
 
 def _dashboard(m, monkeypatch, project):
