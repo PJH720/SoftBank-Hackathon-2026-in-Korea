@@ -72,6 +72,17 @@ def ok():
     return Probe("gb", "local", True, http=200, ms=12, container="running", db="running")
 
 
+def test_logs_sent_to_jev_are_redacted(world, monkeypatch):
+    monkeypatch.setattr(
+        incident, "docker_logs", lambda name, tail=12: ["connect postgres://app:s3cr3tpw@db:5432/app failed"]
+    )
+    crashed = Probe("gb", "local", False, container="exited", exit_code=1, db="running")
+    world["probes"] = [crashed, crashed, ok()]
+    guard([project()]).tick()
+    state, _ = world["jev"].states[0]
+    assert "s3cr3tpw" not in state and "app:***@db" in state
+
+
 def test_stopped_container_is_restarted_after_one_jev_call(world):
     crashed = Probe("gb", "local", False, container="exited", exit_code=137, db="running")
     world["probes"] = [crashed, crashed, ok()]

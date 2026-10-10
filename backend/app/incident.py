@@ -260,11 +260,12 @@ def judge(p: Probe, logs: list[str], tried: list[str], allowed: list[str], conte
     # every input token costs ~2 ms on the local model: symptoms that are set, the last few log lines
     symptoms = {k: v for k, v in asdict(p).items() if v is not None and k not in ("app", "ok", "at", "url")}
     if "body" in symptoms:
-        symptoms["body"] = symptoms["body"][:120]
+        symptoms["body"] = systemone.redact(symptoms["body"])[:120]
     state = {
         "target": p.target,
         "symptoms": symptoms,
-        "recent_logs": [line[:120] for line in logs[-5:]],
+        # Jev is a hosted service: app logs can carry connection strings and tokens, so mask them first
+        "recent_logs": [systemone.redact(line)[:120] for line in logs[-5:]],
         "already_tried": tried,
         **context,
     }
@@ -355,14 +356,15 @@ class Guard:
     def tick(self) -> None:
         """One round: probe every live target; open an incident for anything that stays wrong."""
         seen = set()
-        for project in self.projects():
+        for project in list(self.projects()):
             name = project.get("name")
             if not name:
                 continue
             if project.get("last_status") == "running" or self.busy(name):  # a deploy is replacing it
                 seen.update((name, t) for t in (project.get("live") or {}))
                 continue
-            for target, handles in (project.get("live") or {}).items():
+            # copies: main.py's event loop may move or stop the app while this thread looks at it
+            for target, handles in list((project.get("live") or {}).items()):
                 key = (name, target)
                 seen.add(key)
                 p = self._probe(project, target, handles or {})
@@ -482,9 +484,9 @@ class Guard:
 
     def _fresh(self, project: dict, target: str, handles: dict) -> tuple[dict, dict]:
         """The project as main.py has it now: a redeploy replaces the container (new handles)."""
-        for p in self.projects():
+        for p in list(self.projects()):
             if p.get("name") == project.get("name"):
-                return p, (p.get("live") or {}).get(target) or handles
+                return p, dict((p.get("live") or {}).get(target) or handles)
         return project, handles
 
     def _recovered(self, project: dict, target: str, handles: dict) -> bool:
