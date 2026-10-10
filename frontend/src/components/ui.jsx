@@ -5,11 +5,11 @@ import { TONE } from '../lib/style';
 
 export function Card({ title, icon: Icon, right, children, className = '', bodyClass = '' }) {
   return (
-    <section className={`rounded-2xl border border-white/5 bg-slate-900/60 shadow-xl shadow-black/20 backdrop-blur ${className}`}>
+    <section className={`rounded-[18px] border border-[rgba(150,160,215,0.18)] bg-[#12152a] shadow-lg shadow-black/30 backdrop-blur-sm ${className}`}>
       {(title || right) && (
-        <header className="flex items-center justify-between gap-3 border-b border-white/5 px-5 py-3">
-          <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-200">
-            {Icon && <Icon className="h-4 w-4 text-slate-400" />} {title}
+        <header className="flex items-center justify-between gap-3 border-b border-[rgba(150,160,215,0.14)] px-5 py-3.5 bg-white/[0.015]">
+          <h2 className="flex items-center gap-2 text-[14px] font-semibold text-slate-100 font-['Gowun_Dodum','Pretendard_Variable',sans-serif]">
+            {Icon && <Icon className="h-4 w-4 text-[#FFE27A]" />} {title}
           </h2>
           <div className="flex items-center gap-2">{right}</div>
         </header>

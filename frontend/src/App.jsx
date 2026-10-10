@@ -7,7 +7,7 @@ import LogConsole from './components/LogConsole';
 import { AnalysisCard, Endpoints, PatchList, QuestionCard } from './components/ResultPanels';
 import AppsBoard from './components/AppsBoard';
 import { DashboardHeader, RunHUD, ActivityDock } from './components/DashboardChrome';
-import DetailsDrawer from './components/DetailsDrawer';
+import DetailsModal from './components/DetailsModal';
 import { pendingInput } from './lib/dashboard';
 import SceneBoundary from './components/3d/SceneBoundary';
 import { shouldCelebrate } from './lib/victory';
@@ -503,11 +503,11 @@ export default function App() {
           <ActivityDock run={run} project={currentProject} onPanel={setPanel} />
         </main>
       </div>
-      <DetailsDrawer logsRequest={logsRequest} panel={panel} onPanel={setPanel} onClose={() => setPanel(null)}>
-        <div className="drawer-section" hidden={panel !== 'deploy'}>
+      <DetailsModal logsRequest={logsRequest} panel={panel} onPanel={setPanel} onClose={() => setPanel(null)}>
+        <div className="modal-section" id="modal-section-deploy" role="region" aria-labelledby="modal-menu-deploy" hidden={panel !== 'deploy'}>
           <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={starting || runRunning || !!redeploying || stopping.has(form.name.trim())} fleetAvailable={!!fleet} />
         </div>
-        <div className="drawer-section" hidden={panel !== 'details'}>
+        <div className="modal-section" id="modal-section-details" role="region" aria-labelledby="modal-menu-details" hidden={panel !== 'details'}>
           {run.envRequest && <EnvRequestCard key={`env-${run.id}`} request={run.envRequest} onSubmit={(values) => submitEnv(run.id, values)} />}
           <QuestionCard key={`question-${run.id}`} question={run.question} onAnswer={(qid, choice) => answerQuestion(run.id, qid, choice)} />
           <AnalysisCard run={run} />
@@ -515,14 +515,14 @@ export default function App() {
           <PatchList patches={run.patches} />
           <div data-deployment-logs><LogConsole logs={run.logs} running={run.status === 'running'} height={320} active={panel === 'details'} /></div>
         </div>
-        <div className="drawer-section settings-section" hidden={panel !== 'settings'}>
+        <div className="modal-section settings-section" id="modal-section-settings" role="region" aria-labelledby="modal-menu-settings" hidden={panel !== 'settings'}>
           <h3>API 토큰</h3>
           <p>인증이 필요한 서버에 연결할 때 설정하세요.</p>
           <label htmlFor="api-token">API 토큰</label>
           <input id="api-token" type="password" autoComplete="off" value={token} onChange={(e) => saveToken(e.target.value)} placeholder="API 토큰 입력" />
           <p>{token ? '토큰이 설정되어 있습니다.' : '토큰이 설정되지 않았습니다.'}</p>
         </div>
-      </DetailsDrawer>
+      </DetailsModal>
     </div>
   );
 }

@@ -88,10 +88,10 @@ export async function setupOps(page, { projects, fleet, lookup = 200 } = {}) {
 }
 
 export async function openAppsTab(page) {
-  const backdrop = page.locator('.drawer-backdrop');
-  if (await backdrop.isVisible()) {
+  const modal = page.locator('dialog.details-modal');
+  if (await modal.isVisible()) {
     await page.keyboard.press('Escape');
-    await expect(backdrop).toBeHidden();
+    await expect(modal).toBeHidden();
   }
   await page.getByRole('tab', { name: '앱 관리' }).click();
   await expect(page.getByRole('heading', { name: '앱 관리', level: 2 })).toBeVisible();
