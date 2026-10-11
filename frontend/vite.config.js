@@ -23,8 +23,8 @@ export default defineConfig({
       '/health': route,
       '/fleet': route,
       '/projects': route,
-      '/agent': route, // on-premises agent: status, script, long-poll (docs/onprem-agent.md)
       '/auth': { target: backend, changeOrigin: true }, // sign-up/login: open routes, never gets our token
+      '/agent': route, // on-premises agent: status, script, long-poll (docs/onprem-agent.md)
       '/webhook': { target: backend, changeOrigin: true }, // GitHub push webhook: signed, never gets our token
     },
   },
