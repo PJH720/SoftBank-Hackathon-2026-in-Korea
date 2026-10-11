@@ -143,14 +143,23 @@ def probe(node: Node) -> Metrics:
 
 
 def select_node(
-    reg: Registry, *, arch: str | None = None, exclude: set[str] = frozenset()
+    reg: Registry,
+    *,
+    arch: str | None = None,
+    exclude: set[str] = frozenset(),
+    spread_from: set[str] = frozenset(),
 ) -> tuple[Node, list[Metrics]]:
-    """Probe every eligible node and return the least loaded one (plus all measurements, for the UI)."""
+    """Probe every eligible node and return the least loaded one (plus all measurements, for the UI).
+    `spread_from`: providers the app already runs on. A reachable node at another provider wins over a
+    less loaded one at the same provider, so replicas spread across clouds and one cloud's outage
+    leaves the others serving."""
     candidates = [n for n in reg.nodes if n.name not in exclude and (arch is None or n.arch == arch)]
     if not candidates:
         raise RuntimeError("no eligible node in the pool")
     metrics = [probe(n) for n in candidates]
-    best = min(zip(candidates, metrics, strict=True), key=lambda pair: pair[1].score)
+    pairs = list(zip(candidates, metrics, strict=True))
+    fresh = [p for p in pairs if p[1].ok and p[0].provider not in spread_from]
+    best = min(fresh or pairs, key=lambda pair: pair[1].score)
     if not best[1].ok:
         raise RuntimeError("no reachable node: " + "; ".join(f"{m.node}: {m.error}" for m in metrics))
     return best[0], metrics
@@ -213,7 +222,19 @@ def free_port_on(node: Node) -> int:
     raise RuntimeError(f"no free port on {node.name} in {lo}-{hi}")
 
 
-NETWORK = "cloudmorph"  # app <-> sidecar (postgres) traffic stays on this docker network
+NETWORK = "cloudmorph"  # legacy shared network; every deploy now gets its own (app_network)
+
+
+def app_network(app: str) -> str:
+    """Docker network of one app: the app and its sidecars only. Docker does not route between bridge
+    networks, so another app on the same host cannot reach this app's database even with its password.
+    The router reaches apps through their published ports, not through these networks."""
+    return f"cm-{app}"
+
+
+def _network_sh(network: str) -> str:
+    q = shlex.quote(network)
+    return f"docker network inspect {q} >/dev/null 2>&1 || docker network create {q} >/dev/null; "
 
 
 def run_container(
@@ -225,17 +246,19 @@ def run_container(
     env: dict[str, str] | None = None,
     *,
     limits: list[str] | None = None,
+    network: str = NETWORK,
 ) -> str:
-    """`limits`: docker run flags such as ["--cpus", "1", "--memory", "512m"] (deployer.Size.docker_flags)."""
+    """`limits`: docker run flags such as ["--cpus", "1", "--memory", "512m"] (deployer.Size.docker_flags).
+    `network`: the app's own network (app_network) so it shares a network with its sidecars only."""
     env_flags = " ".join(
         f"-e {shlex.quote(f'{k}={v}')}" for k, v in {**(env or {}), "PORT": str(container_port)}.items()
     )
     env_flags += "".join(f" {shlex.quote(flag)}" for flag in limits or [])
     cmd = (
-        f"docker network inspect {NETWORK} >/dev/null 2>&1 || docker network create {NETWORK} >/dev/null; "
+        f"{_network_sh(network)}"
         f"docker rm -f {shlex.quote(name)} >/dev/null 2>&1; "
-        f"docker run -d --restart unless-stopped --name {shlex.quote(name)} --network {NETWORK} {env_flags} "
-        f"-p {host_port}:{container_port} {shlex.quote(image)}"
+        f"docker run -d --restart unless-stopped --name {shlex.quote(name)} --network {shlex.quote(network)} "
+        f"{env_flags} -p {host_port}:{container_port} {shlex.quote(image)}"
     )
     cp = ssh(node, cmd, timeout=60)
     if (
@@ -252,7 +275,7 @@ class SidecarRefused(RuntimeError):
 
 @dataclass(frozen=True)
 class Sidecar:
-    """A database container next to the app on the cloudmorph network (local and node targets).
+    """A database container next to the app on the app's own network (local and node targets).
     The password is random per sidecar and lives in the container's own env (`secret_env`), so a redeploy
     reads it back from `docker inspect` instead of storing it anywhere else."""
 
@@ -317,9 +340,10 @@ SIDECARS = {
 def sidecar_script(sc: Sidecar, app: str, password: str) -> str:
     """sh that starts (or reuses) the sidecar and prints the password it runs with."""
     name, volume, q = f"{app}-{sc.suffix}", f"{app}-{sc.volume}", shlex.quote
+    net = app_network(app)
     run = " ".join(
         [
-            f"docker run -d --restart unless-stopped --name {q(name)} --network {NETWORK}",
+            f"docker run -d --restart unless-stopped --name {q(name)} --network {q(net)}",
             f"-e {q(f'{sc.secret_env}={password}')}",
             *(f"-e {q(e)}" for e in sc.env),
             f"-v {q(f'{volume}:{sc.data}')} {q(sc.image)}",
@@ -332,9 +356,12 @@ def sidecar_script(sc: Sidecar, app: str, password: str) -> str:
         else f"if docker volume inspect {q(volume)} >/dev/null 2>&1; then echo {q(orphan_volume_message(sc, app))} >&2; exit 3; fi; "
     )
     reset = f'[ -n "$fresh" ] && docker exec {q(name)} sh -c {q(sc.reset)} >/dev/null; ' if sc.reset else ""
+    # A sidecar made before per-app networks sits on the shared one: join it to the app's network too
+    # (connect fails harmlessly when it is already there).
     return (
-        f"docker network inspect {NETWORK} >/dev/null 2>&1 || docker network create {NETWORK} >/dev/null; "
+        f"{_network_sh(net)}"
         f"fresh=; if docker inspect {q(name)} >/dev/null 2>&1; then docker start {q(name)} >/dev/null; "
+        f"docker network connect {q(net)} {q(name)} >/dev/null 2>&1 || true; "
         f"else {orphan}{run} >/dev/null && fresh=1; fi; "
         f"ok=; for i in $(seq 1 {sc.ready_timeout}); do docker exec {q(name)} sh -c {q(sc.ready)} && ok=1 && break; sleep 1; done; "
         f'[ -n "$ok" ] || {{ echo {q(f"{sc.engine} sidecar {name} did not become ready")} >&2; exit 1; }}; '
@@ -351,7 +378,7 @@ def orphan_volume_message(sc: Sidecar, app: str) -> str:
 
 
 def ensure_sidecar(node: Node, app: str, engine: str, *, scheme: str | None = None) -> str:
-    """Start (or reuse) the `engine` sidecar on the node's cloudmorph network; return its URL.
+    """Start (or reuse) the `engine` sidecar on the app's network on the node; return its URL.
     Data lives in a named volume, so redeploys of the app keep their rows."""
     import secrets
 
@@ -393,11 +420,14 @@ def drop_sidecar(node: Node, container: str, volume: str, dump: str | None, dest
     )
 
 
-def run_once(node: Node, image: str, argv: list[str], env: dict[str, str]) -> tuple[int, str]:
-    """`docker run --rm` on the node's cloudmorph network (migrations); (returncode, output)."""
+def run_once(
+    node: Node, image: str, argv: list[str], env: dict[str, str], *, network: str = NETWORK
+) -> tuple[int, str]:
+    """`docker run --rm` on the app's network (migrations); (returncode, output)."""
     env_flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in env.items())
     cmd = (
-        f"docker run --rm --network {NETWORK} {env_flags} --entrypoint {shlex.quote(argv[0])} "
+        f"{_network_sh(network)}"
+        f"docker run --rm --network {shlex.quote(network)} {env_flags} --entrypoint {shlex.quote(argv[0])} "
         f"{shlex.quote(image)} {' '.join(shlex.quote(a) for a in argv[1:])} 2>&1"
     )
     cp = ssh(node, cmd, timeout=600)
@@ -407,6 +437,31 @@ def run_once(node: Node, image: str, argv: list[str], env: dict[str, str]) -> tu
 def container_oom_killed(node: Node, name: str) -> bool:
     cp = ssh(node, f"docker inspect -f '{{{{.State.OOMKilled}}}}' {shlex.quote(name)}", timeout=20)
     return cp.returncode == 0 and cp.stdout.decode().strip() == "true"
+
+
+_ENV_SPLIT = "--cloudmorph-image-env--"
+
+
+def container_env(node: Node, name: str) -> dict[str, str]:
+    """The env a running container was started with, minus what its image already sets (PATH, ...).
+    Scale-out reads it back from the primary replica, so API keys and DATABASE_URL reach every replica
+    without CloudMorph keeping a copy of them anywhere."""
+    q = shlex.quote(name)
+    fmt = "'{{range .Config.Env}}{{println .}}{{end}}'"
+    cp = ssh(
+        node,
+        f"docker inspect -f {fmt} {q} && echo {_ENV_SPLIT} && "
+        f"docker image inspect -f {fmt} $(docker inspect -f '{{{{.Image}}}}' {q})",
+        timeout=20,
+    )
+    if cp.returncode != 0:
+        raise RuntimeError(
+            f"cannot read env of {name} on {node.name}: {cp.stderr.decode(errors='replace')[-300:]}"
+        )
+    started, _, image = cp.stdout.decode(errors="replace").partition(_ENV_SPLIT)
+    baked = {line for line in image.splitlines() if line}
+    pairs = (line.split("=", 1) for line in started.splitlines() if "=" in line and line not in baked)
+    return {k: v for k, v in pairs if k != "PORT"}
 
 
 def container_status(node: Node, name: str) -> tuple[str, int]:
@@ -452,6 +507,12 @@ def container_cpu_usage_usec(node: Node, name: str) -> int | None:
 
 def remove_container(node: Node, name: str) -> bool:
     return ssh(node, f"docker rm -f {shlex.quote(name)}", timeout=30).returncode == 0
+
+
+def remove_network(node: Node, network: str) -> bool:
+    """Drop an app's network once nothing is attached (Docker refuses while a sidecar still is, which is
+    what keeps a kept database reachable). Docker's default pools allow only ~30 bridge networks per host."""
+    return ssh(node, f"docker network rm {shlex.quote(network)}", timeout=30).returncode == 0
 
 
 def metrics_dict(ms: list[Metrics]) -> list[dict]:

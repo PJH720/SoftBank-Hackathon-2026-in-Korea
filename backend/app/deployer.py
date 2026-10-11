@@ -611,7 +611,7 @@ def db_identifier(app: str, owner: str | None) -> str:
 
 
 def ensure_local_sidecar(app: str, engine: str, r: Runner, *, scheme: str | None = None) -> str:
-    """`engine` sidecar `<app>-<suffix>` on the local docker network (nodes.SIDECARS); returns its URL.
+    """`engine` sidecar `<app>-<suffix>` on the app's local docker network (nodes.SIDECARS); returns its URL.
     Same script as the node target, run here. Not via Runner: the script carries the password."""
     sc = nodepool.SIDECARS[engine]
     t0 = time.time()
@@ -724,8 +724,10 @@ def _migration_failed(argv: list[str], output: str, where: str) -> StepError:
     )
 
 
-def migrate_local(image: str, argv: list[str], env: dict, r: Runner) -> None:
-    cmd = ["docker", "run", "--rm", "--network", nodepool.NETWORK]
+def migrate_local(
+    image: str, argv: list[str], env: dict, r: Runner, *, network: str = nodepool.NETWORK
+) -> None:
+    cmd = ["docker", "run", "--rm", "--network", network]
     for k in env:
         cmd += ["-e", k]
     cmd += ["--entrypoint", argv[0], image, *argv[1:]]  # the image's ENTRYPOINT would wrap the command
@@ -1510,6 +1512,8 @@ def cleanup_local(handles: dict, *, drop_database: bool = False) -> list[str]:
             done.append(f"removed container {cname}")
     if drop_database:  # after the app is gone, so the dump is consistent
         done += drop_local_sidecars(handles)
+    if network := handles.get("network"):  # refused (and kept) while a sidecar is still attached
+        subprocess.run(["docker", "network", "rm", network], capture_output=True, check=False)
     return done
 
 
@@ -1534,7 +1538,9 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         build_image(src_dir, image, None, cfg, r)
 
         out.stage = "deploy"
-        r.run("docker network", ["docker", "network", "create", nodepool.NETWORK], check=False)
+        network = nodepool.app_network(name)  # this app and its sidecars only
+        out.handles["network"] = network
+        r.run("docker network", ["docker", "network", "create", network], check=False)
         env = dict(cfg.env)
         _attach_sidecars(
             src_dir,
@@ -1545,7 +1551,7 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
             lambda engine, scheme: ensure_local_sidecar(name, engine, r, scheme=scheme),
         )
         if argv := migration_for(src_dir, cfg, r, has_database="DATABASE_URL" in env):
-            migrate_local(image, argv, env, r)
+            migrate_local(image, argv, env, r, network=network)
         run_cmd = [
             "docker",
             "run",
@@ -1553,7 +1559,7 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
             "--name",
             cname,
             "--network",
-            nodepool.NETWORK,
+            network,
             "-e",
             f"PORT={cfg.container_port}",
         ]
@@ -1983,6 +1989,7 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         host=node.host,
         image=image,
         container_name=cname,
+        network=nodepool.app_network(name),
         candidates=nodepool.metrics_dict(metrics),
     )
 
@@ -2020,7 +2027,7 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
             lambda engine, scheme: nodepool.ensure_sidecar(node, name, engine, scheme=scheme),
         )
         if argv := migration_for(src_dir, cfg, r, has_database="DATABASE_URL" in env):
-            rc, output = nodepool.run_once(node, image, argv, env)
+            rc, output = nodepool.run_once(node, image, argv, env, network=nodepool.app_network(name))
             r.steps.append(Step("migrate (remote)", f"ssh {node.name} {' '.join(argv)}", rc, 0.0, "", ""))
             if rc != 0:
                 raise _migration_failed(argv, output, f"on {node.name} (rc={rc})")
@@ -2028,7 +2035,14 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         out.handles["size"] = size.as_dict()
         host_port = nodepool.free_port_on(node)
         cid = nodepool.run_container(
-            node, image, cname, host_port, cfg.container_port, env, limits=size.docker_flags()
+            node,
+            image,
+            cname,
+            host_port,
+            cfg.container_port,
+            env,
+            limits=size.docker_flags(),
+            network=nodepool.app_network(name),
         )
     except nodepool.SidecarRefused as e:
         raise StepError("deploy", "user_action_required", str(e)) from None
@@ -2080,7 +2094,9 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
                 name,
                 image,
                 cfg.container_port,
-                fleet.Replica(node=node.name, container=cname, host=node.host, port=host_port),
+                fleet.Replica(
+                    node=node.name, container=cname, host=node.host, port=host_port, provider=node.provider
+                ),
                 str(src_dir),
                 stateful=bool(out.handles.get("database") or out.handles.get("cache")),
                 limits=size.docker_flags(),
@@ -2391,6 +2407,8 @@ def teardown(target: str, handles: dict, *, drop_database: bool = False) -> list
                 nodepool.drop_sidecar(node, container, volume, _DUMPS.get(engine), dest)
                 done += [f"backed up {container} to {dest}"] if dest else []
                 done.append(f"removed {engine} {container} and volume {volume} on {handles['node']}")
+        if handles.get("network") and handles.get("node"):
+            nodepool.remove_network(nodepool.load_registry().get(handles["node"]), handles["network"])
         return done
     raise ValueError(f"unknown target: {target}")
 

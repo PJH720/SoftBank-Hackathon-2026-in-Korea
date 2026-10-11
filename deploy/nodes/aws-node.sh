@@ -24,5 +24,6 @@ IID=$(aws ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --key-name
   --user-data "$USERDATA" --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=20,VolumeType=gp3}' \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=project,Value=cloudmorph}]" --query 'Instances[0].InstanceId' --output text)
 aws ec2 wait instance-running --instance-ids "$IID"
-aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[0].Instances[0].[InstanceId,InstanceType,PublicIpAddress]' --output text
-echo "arch=$ARCH  (use this in nodes.json)"
+IP=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+echo "$IID $TYPE $IP  arch=$ARCH  (use this in nodes.json)"
+echo "once docker is up (~1 min): deploy/nodes/harden-node.sh ubuntu@$IP"

@@ -331,6 +331,23 @@ def _is_sensitive_source_path(parts: tuple[str, ...]) -> bool:
     )
 
 
+SAMPLE_APPS = REPO_ROOT / "sample-apps"
+
+
+def _source_allowed(source: str, user: accounts.User) -> bool:
+    """Paths on the server are the operator's: a user may name a Git URL or one of the bundled sample apps,
+    never an arbitrary directory (another user's checkout, the server's own config, ...)."""
+    if user.admin or source.startswith("https://"):
+        return True
+    path = Path(source)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    try:
+        return SAMPLE_APPS.resolve() in path.resolve(strict=True).parents
+    except OSError:
+        return False
+
+
 def _validate_local_source(path: Path) -> Path:
     if path.is_symlink():
         raise OSError(errno.ELOOP, "Local source root must not be a symlink", str(path))
@@ -968,6 +985,7 @@ def create_app() -> FastAPI:
         """Nodes (with live load), apps, replicas and recent scale events — for the dashboard."""
         reg = nodepool.load_registry()
         state = fleetmod.load_state()
+        user = _user(request)
         metrics = await asyncio.to_thread(
             lambda: nodepool.metrics_dict([nodepool.probe(n) for n in reg.nodes])
         )
@@ -985,15 +1003,22 @@ def create_app() -> FastAPI:
                     "url": f"http://{a.hostname}",
                     "image": a.image,
                     "replicas": [
-                        {"node": r.node, "upstream": r.upstream, "cpu": r.last_cpu} for r in a.replicas
+                        {
+                            "node": r.node,
+                            "provider": fleetmod.provider_of(reg, r),
+                            "upstream": r.upstream,
+                            "cpu": r.last_cpu,
+                        }
+                        for r in a.replicas
                     ],
                     "events": a.events[-10:],
                 }
                 for a in state.apps.values()
                 # nodes are shared infrastructure; apps on them are private to their owner
-                if _user(request).owns(_projects.get(a.name, {}))
+                if user.owns(_projects.get(a.name, {}))
             ],
-            "watch": list(fleet_events)[-20:],
+            # the watcher's rows name apps too: same rule
+            "watch": [e for e in fleet_events if user.owns(_projects.get(e.get("app", ""), {}))][-20:],
         }
 
     @app.post("/fleet/{app_name}/scale/{n}")
@@ -1351,6 +1376,11 @@ def create_app() -> FastAPI:
 
     @app.post("/deploy")
     async def start_deploy(req: DeployRequest, request: Request) -> dict[str, str]:
+        if not _source_allowed(req.source, _user(request)):
+            raise HTTPException(
+                status_code=403,
+                detail="only an https Git URL or a bundled sample app (sample-apps/...) can be deployed",
+            )
         return {
             "deployment_id": app.state.launch(
                 req.source,
