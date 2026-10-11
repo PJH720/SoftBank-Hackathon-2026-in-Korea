@@ -1,4 +1,5 @@
-"""Fast analyzer (owner: 이요환): the local clef-flash picks the service in under a second.
+"""Fast analyzer (owner: 이요환): Jev (hosted) or the local clef-flash picks the service in under a second.
+Both speak the same System One API (app/systemone.py); Jev wins when TYPESAFE_API_KEY is set.
 
     scan (전처리, no model)  ->  decide (1 call, < 1 s)  ->  inspect (1-2 calls)  ->  analyzer.analyze_with
 
@@ -855,14 +856,23 @@ def _cached(root: Path, ep: systemone.Endpoint | None, need_decision: bool) -> t
     return s, d
 
 
+def endpoint() -> systemone.Endpoint | None:
+    """Jev when TYPESAFE_API_KEY is set, else the local clef-flash when it is up (same API), else None."""
+    ep = systemone.jev()
+    if ep is not None:
+        return ep
+    ep = systemone.clef()
+    return ep if systemone.ready(ep) else None
+
+
 def ready() -> bool:
-    return systemone.ready(systemone.clef())
+    return endpoint() is not None
 
 
 def decision_for(src_dir: str) -> dict | None:
-    """The service clef-flash picks for `src_dir` (payload for the dashboard), or None without clef-flash."""
-    ep = systemone.clef()
-    if not systemone.ready(ep):
+    """The service Jev or clef-flash picks for `src_dir` (payload for the dashboard), or None without either."""
+    ep = endpoint()
+    if ep is None:
         return None
     _, d = _cached(Path(src_dir), ep, need_decision=True)
     return d.payload() if d else None
@@ -930,7 +940,7 @@ def _ask_all(s: Scan, ep: systemone.Endpoint) -> dict:
         keep = hits if p >= NO_KEEP else []
         reports[n] = az.SignalReport(
             value="yes" if p >= YES else "no",
-            reason=f"clef-flash 판단 {p:.0%} ({hits[0].ref})",
+            reason=f"{ep.name} 판단 {p:.0%} ({hits[0].ref})",
             evidence=_evidence(keep),
             tools=[t for t in az.APT if any(re.search(t, h.text, I) for h in hits)]
             if n == "system_packages"
@@ -1033,7 +1043,7 @@ def _malicious(s: Scan, ep: systemone.Endpoint):
         items=[
             az.Risk(
                 title="앱 기능과 상관없는 위험한 코드",
-                reason=f"clef-flash 판단 {p:.0%}",
+                reason=f"{ep.name} 판단 {p:.0%}",
                 evidence=_evidence([h]),
             )
             for h, p in found
@@ -1063,7 +1073,7 @@ def make_judge(ep: systemone.Endpoint):
         flagged = [(int(n), text) for n, text in rows if n.isdigit() and DOCKERFILE_SUSPICIOUS.search(text)]
         if not flagged:
             return az.DockerfileVerdict(findings=[])
-        shown = " | ".join(f"line {n}: {t[:160]}" for n, t in flagged[:8])
+        shown = " | ".join(f"line {n}: {systemone.redact(t)[:160]}" for n, t in flagged[:8])
         a = ep.ask(
             "A Dockerfile from an unknown repository, about to be built on our servers.",
             {
@@ -1082,7 +1092,7 @@ def make_judge(ep: systemone.Endpoint):
         n = int(a.choice("line")[0])
         text = dict(flagged)[n]
         return az.DockerfileVerdict(
-            findings=[az.DockerfileFinding(line=n, text=text, why=f"clef-flash 판단 {a.noul('harmful'):.0%}")]
+            findings=[az.DockerfileFinding(line=n, text=text, why=f"{ep.name} 판단 {a.noul('harmful'):.0%}")]
         )
 
     return judge
@@ -1091,16 +1101,17 @@ def make_judge(ep: systemone.Endpoint):
 def analyze(src_dir: str) -> AnalysisResult:
     """Same contract as analyzer.analyze, in a few seconds. Raises Unsupported when the fast path cannot
     build this repo (analyzer.analyze then falls back to the Claude inspectors if there is a key)."""
-    ep = systemone.clef()
-    if not systemone.ready(ep):
+    ep = endpoint()
+    if ep is None:
         raise ValueError(
-            "clef-flash가 켜져 있지 않아요 (scripts/clef-up.sh로 켜고 CLEF_BASE_URL을 넣어 주세요)"
+            "판단 모델이 없어요 (TYPESAFE_API_KEY로 Jev를 쓰거나, scripts/clef-up.sh로 clef-flash를 켜고 "
+            "CLEF_BASE_URL을 넣어 주세요)"
         )
     root = Path(src_dir).resolve()
     try:
         s, d = _cached(root, ep, need_decision=True)
     except systemone.SystemOneError as e:
-        raise ModelDown(f"clef-flash가 답하지 않아요: {e}") from e
+        raise ModelDown(f"{ep.name}가 답하지 않아요: {e}") from e
     if s.dockerfile is None and s.language not in az.BASE and not s.static_output:
         raise Unsupported(f"빠른 분석은 아직 {s.language or '이 언어'}용 Dockerfile을 만들지 못해요")
     if s.dockerfile is None and not s.static_output and not s.starts:
@@ -1108,7 +1119,7 @@ def analyze(src_dir: str) -> AnalysisResult:
     try:
         reports = _ask_all(s, ep)
     except systemone.SystemOneError as e:
-        raise ModelDown(f"clef-flash가 답하지 않아요: {e}") from e
+        raise ModelDown(f"{ep.name}가 답하지 않아요: {e}") from e
     targets = {**az.TARGETS, 1: "function"} if s.function else az.TARGETS
     result = az.analyze_with(
         str(root),
@@ -1122,7 +1133,7 @@ def analyze(src_dir: str) -> AnalysisResult:
         label = SERVICES[d.service][1]
         result.notes.insert(
             0,
-            f"clef-flash가 {d.ms / 1000:.2f}초 만에 판단했어요: {label} (확률 {d.probabilities[d.service]:.0%}). "
+            f"{d.engine}가 {d.ms / 1000:.2f}초 만에 판단했어요: {label} (확률 {d.probabilities[d.service]:.0%}). "
             f"코드를 읽는 전처리는 {d.prep_ms:.0f}ms 걸렸어요.",
         )
     return result

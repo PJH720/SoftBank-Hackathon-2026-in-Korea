@@ -5,7 +5,7 @@ import { PLACES, SERVICE_NAME, seconds } from './copy';
 
 const ORDER = ['serverless_container', 'vm', 'static_site', 'serverless_function'];
 
-/** clef-flash's 1-second pick, shown as soon as it arrives (before the rest of the analysis). */
+/** Jev's or clef-flash's 1-second pick, shown as soon as it arrives (before the rest of the analysis). */
 export default function DecisionCard({ decision, finalTarget }) {
   if (!decision) return null;
   const place = PLACES[decision.target] || PLACES.cloudrun;
@@ -51,7 +51,7 @@ export default function DecisionCard({ decision, finalTarget }) {
       )}
 
       <p className="mt-4 flex flex-wrap items-center gap-x-1 text-[11px] text-slate-500">
-        <Gauge className="h-3.5 w-3.5" /> 판단: <Explain term="clef-flash">{decision.engine}</Explain>
+        <Gauge className="h-3.5 w-3.5" /> 판단: <Explain term={decision.engine === 'Jev' ? 'Jev' : 'clef-flash'}>{decision.engine}</Explain>
         <span>· 코드 읽기(전처리) {decision.prep_ms}ms는 따로예요 · 입력 {decision.tokens}토큰 · 추천 위치 {place.name}</span>
       </p>
     </section>

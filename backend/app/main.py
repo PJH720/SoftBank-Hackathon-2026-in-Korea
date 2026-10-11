@@ -1047,7 +1047,7 @@ def create_app() -> FastAPI:
         def _run_locked() -> None:
             with prepare_source(source, ref) as source_dir:
                 emit(PipelineEvent(type="stage", stage="analyze"))
-                # clef-flash picks the service in under a second; the dashboard shows it before the analysis ends
+                # Jev or clef-flash picks the service in under a second; the dashboard shows it before the analysis ends
                 if decision := analyzer.quick_decision(source_dir):
                     emit(PipelineEvent(type="log", stage="analyze", payload={"kind": "decision", **decision}))
                 analysis = analyzer.analyze(source_dir)
