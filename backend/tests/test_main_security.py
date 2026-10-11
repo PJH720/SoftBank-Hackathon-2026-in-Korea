@@ -888,7 +888,7 @@ def _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy):
 
 def _events(routes, deployment_id):
     async def collect():
-        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id, ADMIN)
         return [(e["event"], json.loads(e["data"])) async for e in response.body_iterator]
 
     return asyncio.run(collect())
@@ -926,7 +926,11 @@ def test_cancel_kills_the_build_and_skips_the_remaining_targets(m, tmp_path, mon
             await asyncio.sleep(0.001)
         with pytest.raises(m.HTTPException) as late:
             await routes["/deploy/{deployment_id}/cancel"](deployment_id, ADMIN)
-        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id), late.value.status_code
+        return (
+            deployment_id,
+            await routes["/deploy/{deployment_id}"](deployment_id, ADMIN),
+            late.value.status_code,
+        )
 
     deployment_id, status, late = asyncio.run(scenario())
     assert calls == ["local"]  # cloudrun never started
@@ -966,7 +970,7 @@ def test_cancel_stops_the_healer_before_its_next_redeploy(m, tmp_path, monkeypat
         )["deployment_id"]
         while not m._jobs[deployment_id].completed:
             await asyncio.sleep(0.001)
-        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id)
+        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
 
     deployment_id, status = asyncio.run(scenario())
     assert len(calls) == 2
@@ -1014,8 +1018,8 @@ def test_ask_env_waits_for_values_and_heal_redeploys_with_them(m, tmp_path, monk
             await routes["/deploy/{deployment_id}/env"](deployment_id, answer, ADMIN)
         assert again.value.status_code == 409
         await _until(lambda: job.completed)
-        status = await routes["/deploy/{deployment_id}"](deployment_id)
-        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        status = await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id, ADMIN)
         return status, [event async for event in response.body_iterator]
 
     status, events = asyncio.run(scenario())
@@ -1065,7 +1069,7 @@ def test_named_app_keeps_its_values_across_redeploys_and_push(m, tmp_path, monke
             await _until(lambda: job.state == "waiting_input")
             await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(values=answer), ADMIN)
         await _until(lambda: job.completed)
-        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id, ADMIN)
         events = [event async for event in response.body_iterator]
         return [
             [i["name"] for i in json.loads(e["data"])["payload"]["items"]]
@@ -1151,7 +1155,7 @@ def test_ask_env_gives_up_when_nobody_answers(m, tmp_path, monkeypatch):
         request = DeployRequest(source=str(source), targets=["local"], ask_env=True)
         deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
         await _until(lambda: m._jobs[deployment_id].completed)
-        return await routes["/deploy/{deployment_id}"](deployment_id)
+        return await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
 
     status = asyncio.run(scenario())
     assert status["status"] == "failed" and status["error"].startswith("TimeoutError")
@@ -1176,7 +1180,7 @@ def test_without_ask_env_nothing_is_asked_or_injected(m, tmp_path, monkeypatch):
                 deployment_id, EnvInput(values={"API_KEY": "x"}), ADMIN
             )
         assert not_waiting.value.status_code == 409
-        return await routes["/deploy/{deployment_id}"](deployment_id)
+        return await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
 
     assert asyncio.run(scenario())["status"] == "completed"
     assert calls == [{}]
@@ -1202,7 +1206,7 @@ def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
         deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
         job = m._jobs[deployment_id]
         await _until(lambda: job.state == "waiting_input")
-        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id, ADMIN)
         async for event in response.body_iterator:
             if event["event"] == "input_required":
                 job.env_ready.set()  # let the worker finish
