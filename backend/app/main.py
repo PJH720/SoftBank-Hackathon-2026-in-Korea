@@ -1496,9 +1496,11 @@ def create_app() -> FastAPI:
         return {"ok": True, "deployment_id": deployment_id, "name": project["name"], "sha": info.sha}
 
     @app.post("/projects/{name}/stop")
-    async def stop_project(name: str, request: Request) -> dict:
-        """Take down every target this app is serving (container + tunnel, Cloud Run service, node replicas)."""
+    async def stop_project(name: str, request: Request, drop_database: bool = False) -> dict:
+        """Take down every target this app is serving (container + tunnel, Cloud Run service, node replicas).
+        `?drop_database=true` also deletes its databases, each after a backup (deployer.teardown)."""
         project = _own_project(request, name)
+        options = {"drop_database": True} if drop_database else {}
         lock = _app_locks.setdefault(name, threading.Lock())
         if not lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="a deployment of this app is in progress")
@@ -1508,7 +1510,7 @@ def create_app() -> FastAPI:
             serving = project.get("live") or {}
             for target, handles in serving.items():
                 try:
-                    stopped[target] = await asyncio.to_thread(deployer.teardown, target, handles)
+                    stopped[target] = await asyncio.to_thread(deployer.teardown, target, handles, **options)
                 except Exception as exc:  # noqa: BLE001 — report per target, keep the others going
                     failed[target] = f"{type(exc).__name__}: {exc}"
             project["live"] = {t: h for t, h in serving.items() if t in failed}

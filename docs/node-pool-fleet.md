@@ -83,6 +83,9 @@ Cloud SQL의 DB·계정 이름은 앱 이름과 소스(`main._source_identity`)�
 - MySQL URL 스킴은 코드에 적힌 것을 따른다(`mysql+pymysql://` 등, 없으면 `mysql://`). Redis는 앱이 `REDIS_URL`을 읽을 때만 붙는다(`DEPLOYER_CACHE=0`이면 끔).
 - cloudrun에서 MySQL 앱은 `user_action_required`로 멈춘다(MySQL 서버의 `DATABASE_URL`을 주거나 local/node로 배포). Redis는 경고만 남긴다(Memorystore는 VPC 커넥터가 필요하다).
 - Cloud SQL 비밀번호는 Secret Manager에도 보관한다. 다른 머신에서 배포하거나 리비전 env에서 읽을 수 없어도(마운트된 secret) 비밀번호를 바꾸지 않는다. 런타임 서비스 계정에 `roles/secretmanager.secretAccessor`를 붙이지 못하면 예전처럼 env 변수로 넣는다(`DEPLOYER_DB_SECRET=0`이면 항상 env 변수).
+- 인스턴스가 없으면 기본은 `user_action_required`로 멈춘다. `CLOUDSQL_AUTOCREATE=1`이면 `POSTGRES_16`, `ENTERPRISE`, `db-f1-micro`(`CLOUDSQL_TIER`)로 만든다(약 10분, 있는 동안 과금).
+- 마이그레이션: DB가 붙은 앱에 `alembic.ini`, Django `manage.py`, `prisma/migrations`가 있으면 새 이미지로 한 번 실행한 뒤 앱을 띄운다(`DEPLOYER_MIGRATE=0`이면 끔). local/node는 `docker run --rm --entrypoint <도구>`, cloudrun은 Cloud Run job `<서비스>-migrate`(`--execute-now --wait`, 서비스와 같은 DB·서비스 계정). 실패하면 새 버전을 띄우지 않고(cloudrun은 트래픽도 그대로) 출력이 `runtime_error`로 남는다.
+- 삭제: `POST /projects/{name}/stop?drop_database=true`(또는 `teardown(..., drop_database=True)`, `cleanup`)는 앱을 내린 뒤 DB를 덤프하고 지운다. 사이드카는 `backend/.cloudmorph/backups/<컨테이너>-<시각>.sql`(0600, node는 이 머신으로 가져옴)에 덤프한 뒤 컨테이너와 볼륨을 지운다. Cloud SQL은 `CLOUDSQL_BACKUP_BUCKET`으로 `gcloud sql export`한 뒤 DB·계정·secret을 지운다. 버킷이 없거나 덤프가 실패하면 아무것도 지우지 않는다. Redis는 캐시로 보고 덤프 없이 지운다.
 - env 값은 명령줄에 쓰지 않는다: local은 `docker run -e NAME`(값은 docker 프로세스 env), cloudrun/function은 0600 임시 파일 `--env-vars-file`. env가 없으면 `--clear-env-vars`로 이전 리비전의 값을 지운다.
 
 실측(sample-apps/guestbook): local 9.7초, cloudrun 44초(앱별 DB·계정 생성 포함), node 20초. 세 곳 모두 글 쓰기 → 읽기 확인, local은 재배포 후 데이터 유지 확인.

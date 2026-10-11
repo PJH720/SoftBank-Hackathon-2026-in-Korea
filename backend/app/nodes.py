@@ -371,6 +371,39 @@ def ensure_postgres(node: Node, app: str) -> str:
     return ensure_sidecar(node, app, "postgres", scheme="postgresql")
 
 
+def drop_sidecar(node: Node, container: str, volume: str, dump: str | None, dest: Path | None) -> None:
+    """Dump the sidecar's database to `dest` on this machine (when `dump` is given), then remove the
+    container and its volume. A failed dump raises before anything is removed."""
+    q = shlex.quote
+    if dump and dest is not None:
+        cp = ssh(
+            node,
+            f"docker start {q(container)} >/dev/null && docker exec {q(container)} sh -c {q(dump)}",
+            timeout=900,
+        )
+        if cp.returncode != 0:
+            raise RuntimeError(
+                f"not dropping {container} on {node.name}: backup failed: {cp.stderr.decode(errors='replace')[-300:]}"
+            )
+        dest.write_bytes(cp.stdout)
+    ssh(
+        node,
+        f"docker rm -f {q(container)} >/dev/null 2>&1; docker volume rm {q(volume)} >/dev/null 2>&1",
+        timeout=60,
+    )
+
+
+def run_once(node: Node, image: str, argv: list[str], env: dict[str, str]) -> tuple[int, str]:
+    """`docker run --rm` on the node's cloudmorph network (migrations); (returncode, output)."""
+    env_flags = " ".join(f"-e {shlex.quote(f'{k}={v}')}" for k, v in env.items())
+    cmd = (
+        f"docker run --rm --network {NETWORK} {env_flags} --entrypoint {shlex.quote(argv[0])} "
+        f"{shlex.quote(image)} {' '.join(shlex.quote(a) for a in argv[1:])} 2>&1"
+    )
+    cp = ssh(node, cmd, timeout=600)
+    return cp.returncode, cp.stdout.decode(errors="replace")
+
+
 def container_oom_killed(node: Node, name: str) -> bool:
     cp = ssh(node, f"docker inspect -f '{{{{.State.OOMKilled}}}}' {shlex.quote(name)}", timeout=20)
     return cp.returncode == 0 and cp.stdout.decode().strip() == "true"

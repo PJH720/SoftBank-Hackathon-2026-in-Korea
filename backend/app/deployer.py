@@ -163,6 +163,10 @@ class Config:
     # Runtime identity of user apps on cloudrun/function. Untrusted code can read its token from the
     # metadata server, so on a shared server this must be an account with no roles beyond cloudsql.client.
     app_service_account: str | None = None
+    # create the instance when it is missing (~10 min, billed while it exists)
+    cloudsql_autocreate: bool = False
+    cloudsql_tier: str = "db-f1-micro"
+    migrate: bool = True  # run the app's schema migrations (alembic, Django, prisma) before it starts
     cache: bool = True  # Redis sidecar (local/node) for an app that reads REDIS_URL
     db_secret: bool = True  # cloudrun: keep DATABASE_URL in Secret Manager and mount it (env var fallback)
     db_owner: str | None = None  # where the code comes from (main._source_identity): isolates shared DB names
@@ -196,9 +200,12 @@ class Config:
             verify_timeout=int(env.get("DEPLOYER_VERIFY_TIMEOUT", "60")),
             database=env.get("DEPLOYER_DATABASE", "auto") or None,
             cache=env.get("DEPLOYER_CACHE", "1") not in ("0", "false", "no", ""),
+            migrate=env.get("DEPLOYER_MIGRATE", "1") not in ("0", "false", "no", ""),
             db_secret=env.get("DEPLOYER_DB_SECRET", "1") not in ("0", "false", "no", ""),
             cloudsql_instance=env.get("CLOUDSQL_INSTANCE", "cloudmorph-pg"),
             app_service_account=env.get("DEPLOYER_APP_SERVICE_ACCOUNT") or None,
+            cloudsql_autocreate=env.get("CLOUDSQL_AUTOCREATE", "0") in ("1", "true", "yes"),
+            cloudsql_tier=env.get("CLOUDSQL_TIER", "db-f1-micro"),
             cpu=env.get("DEPLOYER_CPU") or None,
             memory=env.get("DEPLOYER_MEMORY") or None,
             min_instances=_int_env("DEPLOYER_MIN_INSTANCES"),
@@ -678,6 +685,101 @@ def url_scheme(src_dir: Path, engine: str) -> str:
     return {"postgres": "postgresql"}.get(engine, engine)
 
 
+# --------------------------------------------------------------------------- #
+# schema migrations: run once with the new image against the app's database, before the app starts
+# --------------------------------------------------------------------------- #
+def detect_migration(src_dir: Path) -> tuple[list[str], str] | None:
+    """(command, evidence) of the app's migration tool. Re-running them is a no-op once applied."""
+    if (src_dir / "alembic.ini").is_file():
+        return ["alembic", "upgrade", "head"], "alembic.ini"
+    manage = src_dir / "manage.py"
+    if manage.is_file() and "django.core.management" in manage.read_text(errors="ignore"):
+        return ["python", "manage.py", "migrate", "--noinput"], "manage.py (Django)"
+    if (src_dir / "prisma" / "schema.prisma").is_file() and (src_dir / "prisma" / "migrations").is_dir():
+        return ["npx", "prisma", "migrate", "deploy"], "prisma/migrations"
+    return None
+
+
+def migration_for(src_dir: Path, cfg: Config, r: Runner, *, has_database: bool) -> list[str] | None:
+    if not (cfg.migrate and has_database):
+        return None
+    found = detect_migration(src_dir)
+    if found:
+        r.steps.append(Step("migration", f"{' '.join(found[0])} ({found[1]})", 0, 0.0, "", ""))
+    return found[0] if found else None
+
+
+def _migration_failed(argv: list[str], output: str, where: str) -> StepError:
+    return StepError(
+        "deploy",
+        "runtime_error",
+        f"migration `{' '.join(argv)}` failed {where}; the new version was not started",
+        app_logs=output[-TAIL:],
+    )
+
+
+def migrate_local(image: str, argv: list[str], env: dict, r: Runner) -> None:
+    cmd = ["docker", "run", "--rm", "--network", nodepool.NETWORK]
+    for k in env:
+        cmd += ["-e", k]
+    cmd += ["--entrypoint", argv[0], image, *argv[1:]]  # the image's ENTRYPOINT would wrap the command
+    cp = r.run(
+        "migrate", cmd, timeout=600, check=False, stage="deploy", env={k: str(v) for k, v in env.items()}
+    )
+    if cp.returncode != 0:
+        raise _migration_failed(argv, cp.stdout + cp.stderr, f"(rc={cp.returncode})")
+
+
+def migrate_cloudrun(
+    service: str,
+    image: str,
+    argv: list[str],
+    cfg: Config,
+    r: Runner,
+    *,
+    conn: str | None,
+    db_secret: str | None,
+    env: dict,
+) -> None:
+    """A Cloud Run job `<service>-migrate` with the new image: same database, same identity as the service.
+    Runs before the new revision exists, so a failed migration leaves traffic where it was."""
+    job = f"{service}-migrate"[:63]
+    cmd = [
+        "gcloud",
+        "run",
+        "jobs",
+        "deploy",
+        job,
+        "--image",
+        image,
+        "--command",
+        argv[0],
+        "--args",
+        ",".join(argv[1:]),
+        "--max-retries",
+        "0",
+        "--task-timeout",
+        "600s",
+        "--region",
+        cfg.region,
+        "--project",
+        str(cfg.project),
+        "--execute-now",
+        "--wait",
+        "--quiet",
+    ]
+    if conn:
+        cmd += ["--set-cloudsql-instances", conn]
+    if account := _runtime_service_account(service, cfg):
+        cmd += ["--service-account", account]
+    cmd += [f"--set-secrets=DATABASE_URL={db_secret}:latest"] if db_secret else ["--clear-secrets"]
+    with env_vars_file(env) as env_file:
+        flags = ["--env-vars-file", env_file] if env_file else []
+        cp = r.run("migrate (cloud run job)", cmd + flags, timeout=900, check=False, stage="deploy")
+    if cp.returncode != 0:
+        raise _migration_failed(argv, cp.stderr + cp.stdout, f"in job {job}; traffic untouched")
+
+
 SIDECAR_TARGETS = {"local", "node"}
 
 
@@ -718,6 +820,32 @@ def owner_label(cfg: Config) -> str | None:
     return hashlib.sha256(cfg.db_owner.encode()).hexdigest()[:8] if cfg.db_owner else None
 
 
+_NOT_FOUND = re.compile(r"\b404\b|does not exist|not found", re.IGNORECASE)
+
+
+def create_cloudsql_instance(cfg: Config, r: Runner) -> None:
+    """The shared Postgres instance, smallest tier (ENTERPRISE edition is what allows db-f1-micro)."""
+    r.run(
+        "cloudsql create instance",
+        [
+            "gcloud",
+            "sql",
+            "instances",
+            "create",
+            cfg.cloudsql_instance,
+            "--database-version=POSTGRES_16",
+            "--edition=ENTERPRISE",
+            f"--tier={cfg.cloudsql_tier}",
+            f"--region={cfg.region}",
+            "--project",
+            str(cfg.project),
+            "--quiet",
+        ],
+        timeout=1800,
+        stage="deploy",
+    )
+
+
 def ensure_cloudsql_database(
     app: str, cfg: Config, r: Runner, serving_url: str | None = None, *, adopt_legacy: bool = False
 ) -> tuple[str, str]:
@@ -726,26 +854,29 @@ def ensure_cloudsql_database(
     `adopt_legacy`: the live service is this owner's (or predates owners), so a database it already uses
     under the pre-owner name stays its database instead of the app starting over empty."""
     inst, proj = cfg.cloudsql_instance, str(cfg.project)
-    cp = r.run(
-        "cloudsql instance",
-        [
-            "gcloud",
-            "sql",
-            "instances",
-            "describe",
-            inst,
-            "--project",
-            proj,
-            "--format=value(state,connectionName)",
-        ],
-        check=False,
-        stage="deploy",
-    )
+    describe = [
+        "gcloud",
+        "sql",
+        "instances",
+        "describe",
+        inst,
+        "--project",
+        proj,
+        "--format=value(state,connectionName)",
+    ]
+    cp = r.run("cloudsql instance", describe, check=False, stage="deploy")
+    missing = cp.returncode != 0 and _NOT_FOUND.search(cp.stderr)
+    if missing and cfg.cloudsql_autocreate:
+        create_cloudsql_instance(cfg, r)
+        cp = r.run("cloudsql instance", describe, check=False, stage="deploy")
     if cp.returncode != 0 or not cp.stdout.strip():
+        hint = (
+            "create it, set CLOUDSQL_INSTANCE, or CLOUDSQL_AUTOCREATE=1"
+            if missing
+            else cp.stderr.strip()[-300:]
+        )
         raise StepError(
-            "deploy",
-            "user_action_required",
-            f"Cloud SQL instance '{inst}' not found in {proj} (create it or set CLOUDSQL_INSTANCE)",
+            "deploy", "user_action_required", f"Cloud SQL instance '{inst}' unavailable in {proj}: {hint}"
         )
     state, conn = cp.stdout.split()
     if state != "RUNNABLE":
@@ -1236,14 +1367,126 @@ def tunnel_registered(log_path: Path, wait: int = 30) -> bool:
     return False
 
 
-def cleanup_local(handles: dict, *, drop_database: bool = False) -> list[str]:
-    """Stop the container and tunnel of a previous local deploy (idempotent). The Postgres sidecar survives
-    redeploys (healer retries must keep the data); pass drop_database=True from an explicit cleanup."""
+# --------------------------------------------------------------------------- #
+# dropping a database: dump first, never delete data without a copy
+# --------------------------------------------------------------------------- #
+BACKUP_DIR = Path(__file__).resolve().parents[1] / ".cloudmorph" / "backups"
+# run inside the sidecar (its env has the password); Redis is a cache here, so it is not dumped
+_DUMPS = {
+    "postgres": "pg_dump -U app app",
+    "mysql": 'mysqldump -uapp -p"$MYSQL_PASSWORD" --no-tablespaces app',
+}
+
+
+def sidecars_of(handles: dict) -> list[tuple[str, str, str]]:
+    """(engine, container, volume) of the sidecars a deploy attached."""
+    found = []
+    for key, engine in (
+        ("db_container", handles.get("database") or "postgres"),
+        ("cache_container", "redis"),
+    ):
+        if container := handles.get(key):
+            sc = nodepool.SIDECARS.get(engine, nodepool.SIDECARS["postgres"])
+            found.append((sc.engine, container, f"{container.removesuffix('-' + sc.suffix)}-{sc.volume}"))
+    return found
+
+
+def backup_path(container: str, ext: str = "sql") -> Path:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    dest = BACKUP_DIR / f"{container}-{time.strftime('%Y%m%d-%H%M%S')}.{ext}"
+    dest.touch(mode=0o600)  # the app's data: readable by this user only
+    return dest
+
+
+def drop_local_sidecars(handles: dict) -> list[str]:
+    """Dump each database sidecar to BACKUP_DIR, then remove the container *and* its volume.
+    Raises (and keeps everything) when a dump fails, or when a volume outlived its container."""
     done: list[str] = []
-    if drop_database and (db := handles.get("db_container")):
-        cp = subprocess.run(["docker", "rm", "-f", db], capture_output=True, text=True, check=False)
+    for engine, container, volume in sidecars_of(handles):
+        exists = (
+            subprocess.run(["docker", "inspect", container], capture_output=True, check=False).returncode == 0
+        )
+        has_volume = (
+            subprocess.run(
+                ["docker", "volume", "inspect", volume], capture_output=True, check=False
+            ).returncode
+            == 0
+        )
+        if not exists:
+            if has_volume:
+                raise RuntimeError(
+                    f"not dropping {volume}: its container {container} is gone, so it cannot be dumped"
+                )
+            continue
+        if engine in _DUMPS:
+            subprocess.run(["docker", "start", container], capture_output=True, check=False)
+            dest = backup_path(container)
+            with dest.open("wb") as f:
+                cp = subprocess.run(
+                    ["docker", "exec", container, "sh", "-c", _DUMPS[engine]],
+                    stdout=f,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+            if cp.returncode != 0:
+                dest.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"not dropping {container}: backup failed: {cp.stderr.decode(errors='replace')[-300:]}"
+                )
+            done.append(f"backed up {container} to {dest}")
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True, check=False)
+        subprocess.run(["docker", "volume", "rm", volume], capture_output=True, check=False)
+        done.append(f"removed {engine} {container} and volume {volume}")
+    return done
+
+
+def drop_cloudsql_database(handles: dict, cfg: Config) -> list[str]:
+    """Export the app's Cloud SQL database to CLOUDSQL_BACKUP_BUCKET, then delete it, its user and secret.
+    Without a bucket nothing is deleted (managed data has no other copy CloudMorph could point to)."""
+    dbname, conn = handles.get("cloudsql_database"), handles.get("cloudsql_connection")
+    if not (dbname and conn):
+        return []
+    bucket = os.environ.get("CLOUDSQL_BACKUP_BUCKET", "").strip().removeprefix("gs://").rstrip("/")
+    if not bucket:
+        raise RuntimeError(
+            f"not dropping Cloud SQL database {dbname} without a backup: set CLOUDSQL_BACKUP_BUCKET "
+            "(a bucket the instance's service account can write to)"
+        )
+    inst, proj = conn.rsplit(":", 1)[-1], str(cfg.project)
+    dest = f"gs://{bucket}/{dbname}-{time.strftime('%Y%m%d-%H%M%S')}.sql"
+    steps = [
+        (
+            ["gcloud", "sql", "export", "sql", inst, dest, f"--database={dbname}"],
+            f"backed up {dbname} to {dest}",
+        ),
+        (
+            ["gcloud", "sql", "databases", "delete", dbname, "--instance", inst],
+            f"deleted Cloud SQL database {dbname}",
+        ),
+        (
+            ["gcloud", "sql", "users", "delete", dbname, "--instance", inst],
+            f"deleted Cloud SQL user {dbname}",
+        ),
+        (["gcloud", "secrets", "delete", db_secret_id(dbname)], f"deleted secret {db_secret_id(dbname)}"),
+    ]
+    done: list[str] = []
+    for i, (cmd, what) in enumerate(steps):
+        cp = subprocess.run(
+            [*cmd, "--project", proj, "--quiet"], capture_output=True, text=True, check=False, timeout=900
+        )
         if cp.returncode == 0:
-            done.append(f"removed database {db}")
+            done.append(what)
+        elif i == 0 or not _NOT_FOUND.search(
+            cp.stderr
+        ):  # the export must succeed; later steps may be done already
+            raise RuntimeError(f"{' '.join(cmd[:4])} failed: {cp.stderr.strip()[-300:]}")
+    return done
+
+
+def cleanup_local(handles: dict, *, drop_database: bool = False) -> list[str]:
+    """Stop the container and tunnel of a previous local deploy (idempotent). Sidecars survive redeploys
+    (healer retries must keep the data); drop_database=True dumps and removes them (explicit cleanup)."""
+    done: list[str] = []
     pid = handles.get("tunnel_pid")
     if pid:
         try:
@@ -1256,6 +1499,8 @@ def cleanup_local(handles: dict, *, drop_database: bool = False) -> list[str]:
         cp = subprocess.run(["docker", "rm", "-f", cname], capture_output=True, text=True, check=False)
         if cp.returncode == 0:
             done.append(f"removed container {cname}")
+    if drop_database:  # after the app is gone, so the dump is consistent
+        done += drop_local_sidecars(handles)
     return done
 
 
@@ -1290,6 +1535,8 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
             env,
             lambda engine, scheme: ensure_local_sidecar(name, engine, r, scheme=scheme),
         )
+        if argv := migration_for(src_dir, cfg, r, has_database="DATABASE_URL" in env):
+            migrate_local(image, argv, env, r)
         run_cmd = [
             "docker",
             "run",
@@ -1549,6 +1796,8 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         conn, db_url = ensure_cloudsql_database(name, cfg, r, serving_url, adopt_legacy=mine)
         cmd += ["--add-cloudsql-instances", conn]
         out.handles.update(database="cloudsql", cloudsql_connection=conn)
+        if m := _SOCKET_DB.search(db_url):
+            out.handles["cloudsql_database"] = m.group(1)
         if db_secret := mount_db_secret(service, db_url, cfg, r):
             out.handles["db_secret"] = db_secret
         else:
@@ -1557,6 +1806,18 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         out.warnings.append(
             "the app reads REDIS_URL, but cloudrun has no Redis sidecar; give REDIS_URL of a Redis server "
             "(Memorystore, Upstash ...) or deploy to local/node"
+        )
+    has_db = bool(db_secret) or "DATABASE_URL" in env
+    if argv := migration_for(src_dir, cfg, r, has_database=has_db):
+        migrate_cloudrun(
+            service,
+            image,
+            argv,
+            cfg,
+            r,
+            conn=out.handles.get("cloudsql_connection"),
+            db_secret=db_secret,
+            env=env,
         )
     # DATABASE_URL is either a mounted secret or a literal; switching kinds needs the other one cleared
     cmd += [f"--set-secrets=DATABASE_URL={db_secret}:latest"] if db_secret else ["--clear-secrets"]
@@ -1749,6 +2010,11 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
             env,
             lambda engine, scheme: nodepool.ensure_sidecar(node, name, engine, scheme=scheme),
         )
+        if argv := migration_for(src_dir, cfg, r, has_database="DATABASE_URL" in env):
+            rc, output = nodepool.run_once(node, image, argv, env)
+            r.steps.append(Step("migrate (remote)", f"ssh {node.name} {' '.join(argv)}", rc, 0.0, "", ""))
+            if rc != 0:
+                raise _migration_failed(argv, output, f"on {node.name} (rc={rc})")
         size = size_for(src_dir, cfg, r)
         out.handles["size"] = size.as_dict()
         host_port = nodepool.free_port_on(node)
@@ -2079,10 +2345,11 @@ def last_handles(src_dir: str | os.PathLike) -> dict:
     return _read_handles(Path(src_dir).resolve())
 
 
-def teardown(target: str, handles: dict) -> list[str]:
-    """Take down what a successful deploy left serving (idempotent). Databases are kept: data survives a stop."""
+def teardown(target: str, handles: dict, *, drop_database: bool = False) -> list[str]:
+    """Take down what a successful deploy left serving (idempotent). Databases are kept: data survives a stop.
+    drop_database=True also deletes the app's databases, each only after a backup succeeded."""
     if target == "local":
-        return cleanup_local(handles)
+        return cleanup_local(handles, drop_database=drop_database)
     if target == "cloudrun":
         cfg = Config.from_env()
         cfg.project, cfg.region = handles.get("project") or cfg.project, handles.get("region") or cfg.region
@@ -2090,11 +2357,10 @@ def teardown(target: str, handles: dict) -> list[str]:
         cp = subprocess.run(
             _gcr(cfg, "services", "delete", service), capture_output=True, text=True, check=False, timeout=300
         )
-        if cp.returncode == 0:
-            return [f"deleted Cloud Run service {service}"]
-        if "could not be found" in cp.stderr or "NOT_FOUND" in cp.stderr:
-            return []
-        raise RuntimeError(f"gcloud run services delete {service} failed: {cp.stderr.strip()[-500:]}")
+        if cp.returncode != 0 and not ("could not be found" in cp.stderr or "NOT_FOUND" in cp.stderr):
+            raise RuntimeError(f"gcloud run services delete {service} failed: {cp.stderr.strip()[-500:]}")
+        done = [f"deleted Cloud Run service {service}"] if cp.returncode == 0 else []
+        return done + (drop_cloudsql_database(handles, cfg) if drop_database else [])
     if target == "node":
         from app import fleet
 
@@ -2103,12 +2369,20 @@ def teardown(target: str, handles: dict) -> list[str]:
             (a for a in fleet.load_state().apps.values() if any(r.container == cname for r in a.replicas)),
             None,
         )
+        done: list[str] = []
         if app is not None:  # routed: drop the hostname and every scaled-out replica with it
             fleet.remove(app.name)
-            return [f"removed {app.name} from the fleet ({len(app.replicas)} replicas)"]
-        if cname and nodepool.remove_container(nodepool.load_registry().get(handles["node"]), cname):
-            return [f"removed container {cname} on {handles['node']}"]
-        return []
+            done.append(f"removed {app.name} from the fleet ({len(app.replicas)} replicas)")
+        elif cname and nodepool.remove_container(nodepool.load_registry().get(handles["node"]), cname):
+            done.append(f"removed container {cname} on {handles['node']}")
+        if drop_database and (sidecars := sidecars_of(handles)):
+            node = nodepool.load_registry().get(handles["node"])
+            for engine, container, volume in sidecars:
+                dest = backup_path(f"{handles['node']}-{container}") if engine in _DUMPS else None
+                nodepool.drop_sidecar(node, container, volume, _DUMPS.get(engine), dest)
+                done += [f"backed up {container} to {dest}"] if dest else []
+                done.append(f"removed {engine} {container} and volume {volume} on {handles['node']}")
+        return done
     raise ValueError(f"unknown target: {target}")
 
 
