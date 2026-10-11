@@ -65,6 +65,7 @@ export async function setupOps(page, { projects, fleet, lookup = 200 } = {}) {
   });
   // Predicates on the exact pathname, so Vite module requests (/src/...) never hit a mock.
   await page.route(path('/health'), (route) => route.fulfill({ json: { status: 'ok' } }));
+  await page.route(path('/projects/me'), (route) => route.fulfill({ json: { user: 'admin', admin: true } }));
   await page.route(path('/projects'), (route) => route.fulfill({ json: { projects: projectList } }));
   await page.route(path('/fleet'), (route) => (fleetBody ? route.fulfill({ json: fleetBody }) : route.fulfill({ status: 503, json: { detail: 'node pool unavailable' } })));
   await page.route(path('/deploy'), (route) => {

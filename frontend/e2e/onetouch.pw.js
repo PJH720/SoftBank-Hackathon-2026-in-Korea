@@ -28,6 +28,7 @@ async function setup(page) {
     };
   });
   await page.route(path('/health'), (route) => route.fulfill({ json: { status: 'ok' } }));
+  await page.route(path('/projects/me'), (route) => route.fulfill({ json: { user: 'admin', admin: true } }));
   await page.route(path('/projects'), (route) => route.fulfill({ json: { projects: [GB] } }));
   await page.route(path('/incidents'), (route) => route.fulfill({ json: {
     guard: { running: true, interval: 3, engine: 'Jev', jev: true },

@@ -29,6 +29,7 @@ async function setup(page, { noGPU = false, fleetAvailable = true } = {}) {
     };
   }, { noGPU });
   await page.route('**/health', (route) => route.fulfill({ json: { status: 'ok' } }));
+  await page.route('**/projects/me', (route) => route.fulfill({ json: { user: 'admin', admin: true } }));
   await page.route('**/fleet', (route) => route.fulfill({ status: fleetAvailable ? 200 : 503, json: { nodes: [], apps: [], events: [] } }));
   await page.route('**/projects', (route) => route.fulfill({ json: { projects: [] } }));
   await page.route('**/deploy', (route) => route.fulfill({ json: { deployment_id: 'test-run' } }));
