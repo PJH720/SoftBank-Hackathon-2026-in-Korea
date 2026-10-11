@@ -44,6 +44,38 @@
 .ops-chip[data-tone="slate"] { color: #cbd5e1; }
 .ops-chip[data-zero] { border-color: var(--ops-line); background: transparent; color: var(--ops-muted); }
 
+.traffic-shadow-panel {
+  margin-top: 24px;
+  padding: 18px;
+  border: 1px solid var(--ops-line-strong);
+  border-radius: var(--ops-radius);
+  background: linear-gradient(145deg, rgba(18, 21, 42, 0.96), rgba(14, 17, 34, 0.92));
+}
+.traffic-shadow-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.traffic-shadow-header h3 { color: var(--ops-text); font-size: 16px; font-weight: 700; }
+.traffic-shadow-header p, .traffic-shadow-footnote { margin-top: 4px; color: var(--ops-muted); font-size: 11px; line-height: 1.6; }
+.traffic-shadow-observation { padding: 5px 9px; border: 1px solid rgba(61, 189, 106, 0.35); border-radius: 999px; color: #82e2a1; font-size: 10px; }
+.traffic-shadow-message { margin-top: 14px; color: var(--ops-soft); font-size: 12px; }
+.traffic-shadow-message[data-tone="warning"] { color: #ffc768; }
+.traffic-shadow-message[data-tone="error"] { color: #ff8a8e; }
+.traffic-shadow-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(330px, 100%), 1fr)); gap: 12px; margin-top: 16px; }
+.traffic-shadow-card { min-width: 0; padding: 14px; border: 1px solid var(--ops-line); border-radius: 14px; background: rgba(7, 10, 24, 0.48); }
+.traffic-shadow-card[data-tone="warning"] { border-color: rgba(245, 166, 35, 0.4); }
+.traffic-shadow-card[data-tone="uncertain"], .traffic-shadow-card[data-tone="insufficient"] { border-color: rgba(142, 197, 255, 0.32); }
+.traffic-shadow-card-head { display: flex; justify-content: space-between; gap: 10px; }
+.traffic-shadow-card-head h4 { overflow-wrap: anywhere; color: var(--ops-text); font-size: 13px; }
+.traffic-shadow-card-head p { margin-top: 3px; color: var(--ops-muted); font-size: 10px; }
+.traffic-shadow-status { align-self: flex-start; color: var(--ops-soft); font-size: 10px; text-align: right; }
+.traffic-shadow-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 14px 0; }
+.traffic-shadow-metrics dt { color: var(--ops-muted); font-size: 10px; }
+.traffic-shadow-metrics dd { margin: 3px 0 0; color: var(--ops-text); font: 600 12px ui-monospace, monospace; }
+.traffic-shadow-decisions { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; color: var(--ops-soft); font-size: 10px; }
+.traffic-shadow-decisions strong[data-match="yes"] { color: #82e2a1; }
+.traffic-shadow-decisions strong[data-match="no"] { color: #ffc768; }
+.traffic-shadow-decisions strong[data-match="unknown"] { color: #a9d2ff; }
+.traffic-shadow-rationale { margin-top: 10px; color: var(--ops-soft); font-size: 11px; line-height: 1.6; }
+.traffic-shadow-footnote { margin-top: 14px; }
+
 .ops-switch { display: inline-flex; align-items: center; gap: 7px; color: var(--ops-soft); font-size: 11px; cursor: pointer; white-space: nowrap; }
 .ops-switch input {
   appearance: none;

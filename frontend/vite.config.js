@@ -22,6 +22,7 @@ export default defineConfig({
       '/deploy': route,
       '/health': route,
       '/fleet': route,
+      '/traffic': route,
       '/projects': route,
       '/incidents': route,
       '/admin': route, // admin console API (the backend refuses non-admin tokens)

@@ -129,6 +129,11 @@ def init_router(reg: Registry) -> str:
     rt = reg.router
     if rt is None:
         raise RuntimeError("nodes.json has no router")
+    nodepool.ssh_text(
+        rt,
+        'mkdir -p "$HOME/caddy/access-logs" && chmod 700 "$HOME/caddy/access-logs"',
+        timeout=20,
+    )
     cp = nodepool.ssh(
         rt, "mkdir -p ~/caddy && cat > ~/caddy/init.json", timeout=20, stdin=json.dumps(INIT_CONFIG).encode()
     )
@@ -153,9 +158,11 @@ def init_router(reg: Registry) -> str:
 def render_caddy_config(reg: Registry, state: State) -> dict:
     rt = reg.router
     routes = []
+    access_log_hosts = {}
     for app in state.apps.values():
         if not app.replicas:
             continue
+        access_log_hosts[app.hostname] = "traffic_access"
         proxy = {
             "handler": "reverse_proxy",
             "upstreams": [{"dial": r.upstream} for r in app.replicas],
@@ -192,7 +199,34 @@ def render_caddy_config(reg: Registry, state: State) -> dict:
     )
     return {
         "admin": {"listen": "0.0.0.0:2019"},
-        "apps": {"http": {"servers": {"public": {"listen": [f":{rt.public_port}"], "routes": routes}}}},
+        "logging": {
+            "logs": {
+                "traffic_access": {
+                    "writer": {
+                        "output": "file",
+                        "filename": "/etc/caddy/access-logs/access.json",
+                        "mode": "0644",
+                        "dir_mode": "0700",
+                        "roll_size_mb": 10,
+                        "roll_keep": 3,
+                        "roll_keep_days": 1,
+                    },
+                    "encoder": {"format": "json"},
+                    "include": ["http.log.access"],
+                }
+            }
+        },
+        "apps": {
+            "http": {
+                "servers": {
+                    "public": {
+                        "listen": [f":{rt.public_port}"],
+                        "logs": {"logger_names": access_log_hosts},
+                        "routes": routes,
+                    }
+                }
+            }
+        },
     }
 
 
@@ -442,13 +476,24 @@ def tick(emit=None) -> list[dict]:
     summary = []
     for app in list(state.apps.values()):
         samples = sample(app, reg)
+        replica_count_before_action = len(samples)
         cpus = [c for _, c in samples if c is not None]
         hottest = max(cpus) if cpus else None
         # second signal: the node itself is saturated (1-min load per core), even if this container's share is modest
-        node_hot = any(
-            (m := nodepool.probe(reg.get(r.node))).ok and m.load1 / max(m.cpus, 1) >= NODE_LOAD_HOT
-            for r, _ in samples
-        )
+        node_load_per_core = []
+        node_hot = False
+        node_load_probe_complete = True
+        for index, (replica, _) in enumerate(samples):
+            metrics = nodepool.probe(reg.get(replica.node))
+            if metrics.ok:
+                load_per_core = metrics.load1 / max(metrics.cpus, 1)
+                node_load_per_core.append(round(load_per_core, 4))
+                if load_per_core >= NODE_LOAD_HOT:
+                    node_hot = True
+                    node_load_probe_complete = node_load_probe_complete and index == len(samples) - 1
+                    break
+            else:
+                node_load_probe_complete = False
         action = None
         if (hottest is not None and hottest >= CPU_HOT) or node_hot:
             app.hot_streak += 1
@@ -478,8 +523,12 @@ def tick(emit=None) -> list[dict]:
                 {"node": r.node, "provider": provider_of(reg, r), "upstream": r.upstream, "cpu": r.last_cpu}
                 for r in app.replicas
             ],
+            "replica_count_before_action": replica_count_before_action,
+            "sampled_cpu_percentages": [cpu for _, cpu in samples],
             "hot_streak": app.hot_streak,
             "node_hot": node_hot,
+            "node_load_per_core": node_load_per_core,
+            "node_load_probe_complete": node_load_probe_complete,
             "action": action,
         }
         summary.append(row)
