@@ -103,7 +103,7 @@ code, pre, .font-mono { font-family: var(--mono); }
 .modal-tabs button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; flex: 1; padding: 9px 12px; border: 1.5px solid transparent; border-radius: 999px; font: inherit; font-size: 12.5px; font-weight: 500; background: transparent; color: #a3a7bd; white-space: nowrap; cursor: pointer; transition: all 140ms ease; }
 .modal-tabs button:hover { background: rgba(255, 255, 255, 0.05); color: #ededf5; }
 .modal-tabs button[aria-current] { background: rgba(255, 226, 122, 0.14); border-color: rgba(255, 226, 122, 0.45); color: var(--gold); font-weight: 600; box-shadow: 0 0 12px rgba(255, 226, 122, 0.1); }
-.modal-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 20px 28px 28px; }
+.modal-body { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 20px 28px 28px; }
 .modal-section { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 .modal-section section { min-width: 0; border-radius: 18px; background: var(--surface); border: 1.5px solid var(--line); box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25); }
 .modal-body pre { max-width: 100%; }
