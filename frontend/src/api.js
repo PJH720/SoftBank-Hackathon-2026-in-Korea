@@ -1,5 +1,5 @@
-// Thin client for the CloudMorph backend. Same-origin: the Vite dev server (and the demo tunnel)
 // proxy /deploy, /health, /fleet, /traffic, /projects, /auth and /webhook to FastAPI, so no base URL and no CORS.
+import { normalizeLlmConfig } from './lib/llmConfig'
 const TOKEN_KEY = 'cloudmorph.apiToken'
 
 export const getToken = () => localStorage.getItem(TOKEN_KEY) || ''
@@ -73,9 +73,10 @@ export const moveProject = (name, to) => post(`/projects/${encodeURIComponent(na
 /** Answer input_required with values and, when asked, where to deploy. */
 export const submitAnswers = (id, values, targets) => post(`/deploy/${id}/env`, targets ? { values, targets } : { values })
 
-export async function startDeploy({ source, targets, name, ref }) {
+export async function startDeploy({ source, targets, name, ref, llm_config }) {
   // ask_env: pause after analysis and ask for the values the code needs (EnvRequestCard answers)
-  const body = { source, targets, ask_env: true, ...(name ? { name } : {}), ...(ref ? { ref } : {}) }
+  const llmConfig = normalizeLlmConfig(llm_config)
+  const body = { source, targets, ask_env: true, ...(name ? { name } : {}), ...(ref ? { ref } : {}), ...(llmConfig ? { llm_config: llmConfig } : {}) }
   const res = await fetch('/deploy', { method: 'POST', headers: headers(), body: JSON.stringify(body) })
   if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)
   return (await res.json()).deployment_id

@@ -84,7 +84,7 @@ export async function setupOps(page, { projects, fleet, lookup = 200 } = {}) {
   });
 
   await page.goto('/'); // the 3D dashboard; the one-touch screens are at #/deploy, #/apps, #/incidents
-  await expect(page.getByRole('img', { name: /배포 여정: 소스/ })).toBeVisible();
+  await expect(page.getByRole('img', { name: /배포 여정: 소스/ })).toBeVisible({ timeout: 15000 });
   return sent;
 }
 

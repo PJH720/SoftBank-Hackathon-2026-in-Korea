@@ -18,9 +18,10 @@ function rovingIndex(key, index, count) {
   return (index + step + count) % count;
 }
 
-export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, onFullscreen, demoMode, onToggleDemo, user, admin, onLogout }) {
+export function DashboardHeader({ background, scene, onScene, healthy, onPanel, fullscreen, onFullscreen, demoMode, onToggleDemo, user, admin, onLogout }) {
   return (
     <header className="dashboard-header">
+      {background}
       <div className="dashboard-brand"><Cloud size={25} /><h1>CloudMorph</h1></div>
       <div className="scene-tabs" role="tablist" aria-label="화면 전환">
         {SCENE_TABS.map(([id, label, Icon], index) => (

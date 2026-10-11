@@ -73,6 +73,7 @@ from app.schemas import (
     DeployTarget,
     EnvInput,
     EnvRequirement,
+    LlmConfig,
     PipelineEvent,
 )
 from app.storage import write_json
@@ -832,6 +833,7 @@ def run_pipeline(
     confirm: healer.ConfirmFn | None = None,
     overrides: dict | None = None,
     dockerfile_is_source: bool = False,
+    llm_config: LlmConfig | None = None,
 ) -> bool:
     """Run one target synchronously; healer owns all retry attempts.
     deploy_fn defaults to deployer.deploy; the "agent" target passes one that runs on the user's machine.
@@ -840,7 +842,8 @@ def run_pipeline(
     `overrides` (deployer options such as env/build_secrets) apply to the healer's redeploys too."""
     if analysis is None:  # Preserve backward compatibility for direct calls.
         emit(PipelineEvent(type="stage", stage="analyze"))
-        analysis = analyzer.analyze(source)
+        model_name = llm_config.model if llm_config and llm_config.provider == "anthropic" else None
+        analysis = analyzer.analyze(source, model_name=model_name) if model_name else analyzer.analyze(source)
 
     if deploy_fn is None:
         deploy_fn = functools.partial(deployer.deploy, **overrides) if overrides else deployer.deploy
@@ -869,6 +872,7 @@ def run_pipeline(
         emit=emit,
         confirm_fn=confirm,
         dockerfile_is_source=dockerfile_is_source,
+        **({"llm_config": llm_config} if llm_config is not None else {}),
     )
     payload = report.model_dump(mode="json")
     emit(PipelineEvent(type="done" if report.success else "error", payload=payload))
@@ -1308,6 +1312,7 @@ def create_app() -> FastAPI:
         owner: str = accounts.ADMIN,
         ask_env: bool = False,
         retire: list[str] | None = None,
+        llm_config: LlmConfig | None = None,
     ) -> str:
         """Create a job and run analyze -> deploy -> heal for every target in a worker thread.
         Shared by POST /deploy (user click) and the GitHub webhooks (push).
@@ -1422,7 +1427,12 @@ def create_app() -> FastAPI:
                 # Jev or clef-flash picks the service in under a second; the dashboard shows it before the analysis ends
                 if decision := analyzer.quick_decision(source_dir):
                     emit(PipelineEvent(type="log", stage="analyze", payload={"kind": "decision", **decision}))
-                analysis = analyzer.analyze(source_dir)
+                model_name = llm_config.model if llm_config and llm_config.provider == "anthropic" else None
+                analysis = (
+                    analyzer.analyze(source_dir, model_name=model_name)
+                    if model_name
+                    else analyzer.analyze(source_dir)
+                )
                 emit(
                     PipelineEvent(
                         type="log",
@@ -1476,6 +1486,7 @@ def create_app() -> FastAPI:
                                     deploy_fn=_deploy_fn(target),
                                     confirm=confirm,
                                     dockerfile_is_source=own_dockerfile,
+                                    **({"llm_config": llm_config} if llm_config is not None else {}),
                                 )
                                 and target != "agent"
                             ):  # the agent's container is on the user's PC
@@ -1681,6 +1692,7 @@ def create_app() -> FastAPI:
                 ref=req.ref,
                 owner=_user(request).name,
                 ask_env=req.ask_env,
+                **({"llm_config": req.llm_config} if req.llm_config is not None else {}),
             )
         }
 
