@@ -60,6 +60,18 @@ uv run python -m app.fleet status
 앱이 `DATABASE_URL`을 읽거나 Postgres 드라이버를 쓰면(`detect_database`) deployer가 타깃에 맞는 DB를 만들어 주입한다.
 SQLite 경로를 하드코딩한 앱은 대상이 아니다(읽지도 않는 URL을 넣는 것은 눈속임이므로). 그런 앱은 analyzer/healer가 코드를 고칠 영역.
 
+엔진은 드라이버·URL 스킴·ORM provider 설정으로 정한다(`scan_database`, 판단 근거는 배포 로그의 `database` 단계에 남는다).
+
+- Postgres 근거(`psycopg`, `asyncpg`, npm `pg`, `postgresql://`, prisma `provider = "postgresql"` …)가 있으면 Postgres, 없고 MySQL 근거(`pymysql`, `mysql2`, `mysql://` …)가 있으면 MySQL이다.
+- ORM만 있는 경우(`sqlalchemy`, `prisma`)는 근거가 아니다. 엔진을 알 수 없기 때문이다.
+- `DATABASE_URL`만 읽는 앱은 Postgres를 받는다. 다만 SQLite로 fallback하거나(`sqlite:///`), 의존성 파일(`requirements.txt`, `package.json` …)에 드라이버가 없으면 DB를 만들지 않는다. 드라이버 없이 URL만 넣으면 앱이 시작하다 죽는다.
+- lock 파일과 `node_modules`, `.venv`는 보지 않는다.
+
+Cloud SQL의 DB·계정 이름은 앱 이름과 소스(`main._source_identity`)의 해시로 만든다(`db_identifier`: `<앱>_<해시 8자>`, 최대 32자).
+같은 이름으로 다른 저장소를 배포해도 서로의 데이터를 받지 않는다(env_store와 같은 규칙). 서비스에는 `cloudmorph-owner=<해시>` 라벨을 남긴다.
+이 규칙 이전에 만든 서비스(라벨 없음)나 같은 소유자의 서비스가 예전 이름(`<앱>`)의 DB로 서비스 중이면 그 DB를 계속 쓴다. 업그레이드해도 데이터가 끊기지 않는다.
+재배포 때는 서비스 중인 리비전의 비밀번호를 그대로 쓴다(PR #25). 검증 전에 비밀번호를 바꾸면 기존 리비전과 롤백 대상이 DB에 접속하지 못한다.
+
 | 타깃 | DB | 방법 | 데이터 보존 |
 |---|---|---|---|
 | local | `postgres:16-alpine` 사이드카 `<app>-db` | docker network `cloudmorph`, 볼륨 `<app>-dbdata` | 재배포(healer 재시도) 후에도 유지. `cleanup`에서만 삭제 |

@@ -35,6 +35,7 @@ CLI (manual testing):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -158,6 +159,7 @@ class Config:
     # Runtime identity of user apps on cloudrun/function. Untrusted code can read its token from the
     # metadata server, so on a shared server this must be an account with no roles beyond cloudsql.client.
     app_service_account: str | None = None
+    db_owner: str | None = None  # where the code comes from (main._source_identity): isolates shared DB names
 
     def runtime_account(self) -> str | None:
         sa = self.app_service_account
@@ -456,35 +458,114 @@ def preflight(target: str, src_dir: Path, cfg: Config, r: Runner) -> None:
 # --------------------------------------------------------------------------- #
 # database provisioning ("SQLite -> managed Postgres"): sidecar on local/node, Cloud SQL on cloudrun
 # --------------------------------------------------------------------------- #
-_DB_HINTS = re.compile(
-    r"DATABASE_URL|psycopg|asyncpg|sqlalchemy|pg8000|\bfrom pg\b|require\(['\"]pg['\"]\)|['\"]pg['\"]\s*:|prisma|pymysql|mysqlclient",
-    re.IGNORECASE,
-)
-_SCAN_EXT = {".py", ".js", ".ts", ".mjs", ".cjs", ".txt", ".toml", ".json", ".env", ".example"}
+# Evidence of the engine an app talks to: its driver, a URL scheme, an ORM provider setting.
+# (An ORM alone — sqlalchemy, prisma — says nothing about the engine, so it is not evidence.)
+_DB_EVIDENCE = {
+    "postgres": re.compile(
+        r"psycopg|asyncpg|pg8000|\bfrom pg\b|require\(['\"](?:pg|postgres)['\"]\)|from ['\"](?:pg|postgres)['\"]"
+        r"|['\"](?:pg|postgres|pg-promise)['\"]\s*:|\bpostgres(?:ql)?(?:\+\w+)?://|\[(?:postgres(?:ql)?|asyncpg)\]"
+        r"|provider\s*=\s*['\"]postgres(?:ql)?['\"]|\blib/pq\b|jackc/pgx|gem ['\"]pg['\"]",
+        re.IGNORECASE,
+    ),
+    "mysql": re.compile(
+        r"pymysql|mysqlclient|aiomysql|mysql-connector|\bmariadb\b|require\(['\"]mysql2?['\"]\)"
+        r"|from ['\"]mysql2?(?:/promise)?['\"]|['\"]mysql2?['\"]\s*:|\bmysql(?:\+\w+)?://|\[(?:mysql|pymysql)\]"
+        r"|provider\s*=\s*['\"]mysql['\"]|go-sql-driver/mysql|gem ['\"]mysql2['\"]",
+        re.IGNORECASE,
+    ),
+}
+_READS_DB_URL = re.compile(r"\bDATABASE_URL\b")
+_SQLITE = re.compile(r"sqlite(?:\+\w+)?:///|sqlite3?\.connect\(", re.IGNORECASE)
+# Dependency manifests: when one exists and lists no driver, the app cannot open a server database
+_MANIFESTS = {"requirements.txt", "pyproject.toml", "Pipfile", "package.json", "go.mod", "Gemfile"}
+_LOCKFILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock", "poetry.lock", "Pipfile.lock"}
+_SCAN_EXT = {
+    ".py",
+    ".js",
+    ".ts",
+    ".mjs",
+    ".cjs",
+    ".txt",
+    ".toml",
+    ".json",
+    ".env",
+    ".example",
+    ".prisma",
+    ".go",
+}
+_SCAN_SKIP = {".deployer", "node_modules", ".git", ".venv", "venv", "__pycache__"}
+
+
+def scan_database(src_dir: Path) -> tuple[str | None, str]:
+    """(engine, evidence) of the server database the app talks to: 'postgres', 'mysql' or None.
+
+    A driver or URL scheme decides the engine (Postgres first when both appear). An app that only reads
+    DATABASE_URL gets Postgres, unless it falls back to SQLite or its manifest lists no driver: a URL it
+    cannot open would just crash it. (An app that hard-codes a SQLite path gets nothing either.)"""
+    found: dict[str, str] = {}
+    reads_url = sqlite = manifest = None
+    for p in sorted(src_dir.rglob("*")):
+        if (
+            not p.is_file()
+            or _SCAN_SKIP.intersection(p.parts)
+            or p.name in _LOCKFILES
+            or (p.suffix not in _SCAN_EXT and p.name not in _MANIFESTS)
+        ):
+            continue
+        try:
+            text = p.read_text(errors="ignore")[:200_000]
+        except OSError:
+            continue
+        rel = p.relative_to(src_dir).as_posix()
+        if p.name in _MANIFESTS:
+            manifest = manifest or rel
+        for engine, rx in _DB_EVIDENCE.items():
+            if engine not in found and (m := rx.search(text)):
+                found[engine] = f"{rel}: {m.group(0)}"
+        if reads_url is None and _READS_DB_URL.search(text):
+            reads_url = rel
+        if sqlite is None and (m := _SQLITE.search(text)):
+            sqlite = f"{rel}: {m.group(0)}"
+    for engine in ("postgres", "mysql"):
+        if engine in found:
+            return engine, found[engine]
+    if reads_url is None:
+        return None, "no database driver or DATABASE_URL"
+    if sqlite:
+        return None, f"DATABASE_URL falls back to SQLite ({sqlite})"
+    if manifest:
+        return None, f"reads DATABASE_URL but {manifest} lists no database driver"
+    return "postgres", f"{reads_url}: DATABASE_URL"
 
 
 def detect_database(src_dir: Path) -> str | None:
-    """'postgres' when the app reads DATABASE_URL or ships a Postgres driver; else None.
-    (An app that hard-codes a SQLite path gets nothing: injecting a URL it never reads would be theatre.)"""
-    for p in src_dir.rglob("*"):
-        if (
-            p.is_file()
-            and p.suffix in _SCAN_EXT
-            and ".deployer" not in p.parts
-            and "node_modules" not in p.parts
-        ):
-            try:
-                if _DB_HINTS.search(p.read_text(errors="ignore")[:200_000]):
-                    return "postgres"
-            except OSError:
-                continue
-    return None
+    return scan_database(src_dir)[0]
 
 
 def wants_database(src_dir: Path, cfg: Config) -> str | None:
     if cfg.database == "auto":
         return detect_database(src_dir)
     return cfg.database or None
+
+
+def database_for(src_dir: Path, cfg: Config, r: Runner) -> str | None:
+    """wants_database(), with the reason recorded as a step so the deploy log says why a DB came (or not)."""
+    if cfg.database == "auto":
+        engine, why = scan_database(src_dir)
+    else:
+        engine, why = cfg.database or None, f"DEPLOYER_DATABASE={cfg.database or 'none'}"
+    r.steps.append(Step("database", f"{engine or 'none'} ({why})", 0, 0.0, "", ""))
+    return engine
+
+
+def db_identifier(app: str, owner: str | None) -> str:
+    """Database (and user) name of `app` on a shared server. With `owner` (where the code comes from, see
+    main._source_identity) a short hash keeps two sources that share an app name out of each other's data.
+    Lowercase [a-z0-9_]; the hashed form fits MySQL's 32-character user names."""
+    base = re.sub(r"[^a-z0-9_]", "_", app.lower()) or "app"
+    if not owner:
+        return base[:40]  # the name deploys used before owners existed
+    return f"{base[:23]}_{hashlib.sha256(owner.encode()).hexdigest()[:8]}"
 
 
 def ensure_local_postgres(app: str, r: Runner) -> str:
@@ -534,11 +615,25 @@ def ensure_local_postgres(app: str, r: Runner) -> str:
     raise StepError("deploy", "deploy_error", f"postgres sidecar {db} did not become ready")
 
 
+def _pg_socket_url(serving_url: str | None, name: str, conn: str) -> bool:
+    return (
+        bool(serving_url)
+        and serving_url.startswith(f"postgresql://{name}:")
+        and serving_url.endswith(f"@/{name}?host=/cloudsql/{conn}")
+    )
+
+
+def owner_label(cfg: Config) -> str | None:
+    return hashlib.sha256(cfg.db_owner.encode()).hexdigest()[:8] if cfg.db_owner else None
+
+
 def ensure_cloudsql_database(
-    app: str, cfg: Config, r: Runner, serving_url: str | None = None
+    app: str, cfg: Config, r: Runner, serving_url: str | None = None, *, adopt_legacy: bool = False
 ) -> tuple[str, str]:
     """Per-app database + user on the shared Cloud SQL instance. Returns (connection_name, DATABASE_URL).
-    `serving_url`: DATABASE_URL of the revision serving traffic; reused so its password stays valid."""
+    `serving_url`: DATABASE_URL of the revision serving traffic; reused so its password stays valid.
+    `adopt_legacy`: the live service is this owner's (or predates owners), so a database it already uses
+    under the pre-owner name stays its database instead of the app starting over empty."""
     inst, proj = cfg.cloudsql_instance, str(cfg.project)
     cp = r.run(
         "cloudsql instance",
@@ -566,7 +661,13 @@ def ensure_cloudsql_database(
         raise StepError(
             "deploy", "user_action_required", f"Cloud SQL instance '{inst}' is {state}, not RUNNABLE yet"
         )
-    dbname = user = re.sub(r"[^a-z0-9_]", "_", app.lower())[:40] or "app"
+    legacy = db_identifier(app, None)
+    if adopt_legacy and cfg.db_owner and _pg_socket_url(serving_url, legacy, conn):
+        r.steps.append(
+            Step("cloudsql reuse", f"keep database {legacy} of the serving revision", 0, 0.0, "", "")
+        )
+        return conn, str(serving_url)
+    dbname = user = db_identifier(app, cfg.db_owner)
     dbs = r.run(
         "cloudsql databases",
         ["gcloud", "sql", "databases", "list", "--instance", inst, "--project", proj, "--format=value(name)"],
@@ -598,13 +699,8 @@ def ensure_cloudsql_database(
     exists = user in users.stdout.split()
     # Resetting the password would cut off the live revision (and any rollback to it) before the
     # candidate has passed verify, so keep the one it already uses.
-    if (
-        exists
-        and serving_url
-        and serving_url.startswith(f"postgresql://{user}:")
-        and serving_url.endswith(f"@/{dbname}?host=/cloudsql/{conn}")
-    ):
-        return conn, serving_url
+    if exists and _pg_socket_url(serving_url, dbname, conn):
+        return conn, str(serving_url)
     verb = "set-password" if exists else "create"
     cp = subprocess.run(
         [
@@ -775,7 +871,9 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         out.stage = "deploy"
         r.run("docker network", ["docker", "network", "create", nodepool.NETWORK], check=False)
         env = dict(cfg.env)
-        if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
+        if (
+            "DATABASE_URL" not in env and database_for(src_dir, cfg, r) == "postgres"
+        ):  # the user's own DB wins
             env["DATABASE_URL"] = ensure_local_postgres(name, r)
             out.handles.update(database="postgres", db_container=f"{name}-db")
         run_cmd = [
@@ -888,6 +986,20 @@ def latest_revision(service: str, cfg: Config) -> str | None:
     return cp.stdout.strip() or None
 
 
+OWNER_LABEL = "cloudmorph-owner"
+
+
+def service_owner(service: str, cfg: Config) -> str | None:
+    """owner_label() a deploy left on `service`; None for a service deployed before owners existed."""
+    cp = subprocess.run(
+        _gcr(cfg, "services", "describe", service, f"--format=value(metadata.labels.{OWNER_LABEL})"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return (cp.stdout.strip() or None) if cp.returncode == 0 else ""
+
+
 def _revision_env(revision: str, key: str, cfg: Config) -> str | None:
     """Env var `key` of a Cloud Run revision. Not via Runner: the value may hold a password."""
     cp = subprocess.run(
@@ -989,12 +1101,16 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         cfg, "deploy", service, "--image", image, "--port", str(cfg.container_port), "--tag", CANDIDATE_TAG
     )
     env = dict(cfg.env)
-    if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
+    label = owner_label(cfg)
+    if "DATABASE_URL" not in env and database_for(src_dir, cfg, r) == "postgres":  # the user's own DB wins
         serving_url = _revision_env(prev, "DATABASE_URL", cfg) if prev else None
-        conn, db_url = ensure_cloudsql_database(name, cfg, r, serving_url)
+        mine = bool(prev) and service_owner(service, cfg) in (None, label)
+        conn, db_url = ensure_cloudsql_database(name, cfg, r, serving_url, adopt_legacy=mine)
         env["DATABASE_URL"] = db_url
         cmd += ["--add-cloudsql-instances", conn]
         out.handles.update(database="cloudsql", cloudsql_connection=conn)
+    if label:
+        cmd += ["--update-labels", f"{OWNER_LABEL}={label}"]
     if env:
         cmd += [
             "--set-env-vars",
@@ -1176,7 +1292,9 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     t0 = time.time()
     try:
         env = dict(cfg.env)
-        if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
+        if (
+            "DATABASE_URL" not in env and database_for(src_dir, cfg, r) == "postgres"
+        ):  # the user's own DB wins
             env["DATABASE_URL"] = nodepool.ensure_postgres(node, name)
             out.handles.update(database="postgres", db_container=f"{name}-db")
         host_port = nodepool.free_port_on(node)

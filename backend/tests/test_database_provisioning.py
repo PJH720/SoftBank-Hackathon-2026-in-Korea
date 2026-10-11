@@ -229,3 +229,134 @@ def test_stateful_app_redeploys_to_the_node_that_holds_its_database(monkeypatch,
     )
     assert deployer._pinned_node(reg, "web-node") is None
     del nodes, Metrics
+
+
+def test_mysql_apps_get_mysql_not_a_postgres_url(tmp_path):
+    """Regression: any MySQL driver used to count as Postgres, so MySQL apps were handed postgresql://."""
+    assert detect_database(_app(tmp_path / "a", **{"requirements.txt": "flask\nPyMySQL==1.1"})) == "mysql"
+    assert (
+        detect_database(_app(tmp_path / "b", **{"package.json": '{"dependencies": {"mysql2": "^3"}}'}))
+        == "mysql"
+    )
+    prisma = 'datasource db {\n  provider = "mysql"\n  url = env("DATABASE_URL")\n}'
+    assert detect_database(_app(tmp_path / "c", **{"schema.prisma": prisma})) == "mysql"
+    both = {"requirements.txt": "psycopg[binary]\npymysql"}
+    assert detect_database(_app(tmp_path / "d", **both)) == "postgres"  # Postgres first
+
+
+def test_an_orm_alone_or_a_sqlite_fallback_is_not_a_database(tmp_path):
+    """Regression: `sqlalchemy` alone used to provision Postgres for SQLite apps (no driver -> crash)."""
+    sqlite_fallback = 'import os\nURL = os.getenv("DATABASE_URL", "sqlite:///app.db")'
+    assert (
+        detect_database(_app(tmp_path / "a", **{"app.py": sqlite_fallback, "requirements.txt": "sqlalchemy"}))
+        is None
+    )
+    no_driver = {"app.py": "import os\nURL = os.environ['DATABASE_URL']", "requirements.txt": "sqlalchemy"}
+    engine, why = deployer.scan_database(_app(tmp_path / "b", **no_driver))
+    assert engine is None and "requirements.txt lists no database driver" in why
+    assert detect_database(_app(tmp_path / "c", **{"requirements.txt": "sqlalchemy\nprisma"})) is None
+
+
+def test_lockfiles_and_dependency_folders_are_not_evidence(tmp_path):
+    src = _app(tmp_path, **{"package-lock.json": '{"packages": {"node_modules/pg": {}}, "pg": "1"}'})
+    (src / "node_modules" / "pg").mkdir(parents=True)
+    (src / "node_modules" / "pg" / "index.js").write_text("require('pg')")
+    assert detect_database(src) is None
+
+
+def test_database_names_are_scoped_to_the_source():
+    a, b = (
+        deployer.db_identifier("Demo-App", "git:github.com/a/x"),
+        deployer.db_identifier("Demo-App", "git:github.com/b/x"),
+    )
+    assert a != b and a.startswith("demo_app_") and len(a) <= 32
+    assert deployer.db_identifier("Demo-App", "git:github.com/a/x") == a  # stable across deploys
+    assert deployer.db_identifier("Demo-App", None) == "demo_app"  # pre-owner name kept for direct calls
+    assert len(deployer.db_identifier("x" * 60 + "-cloudrun", "o")) == 32
+
+
+def _cloudsql_runner(dbs: str, users: str):
+    class R:
+        def __init__(self):
+            self.steps = []
+
+        def run(self, name, cmd, **kw):
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                {
+                    "cloudsql instance": "RUNNABLE p:r:inst\n",
+                    "cloudsql databases": dbs,
+                    "cloudsql users": users,
+                }.get(name, ""),
+                "",
+            )
+
+    return R()
+
+
+def test_cloudsql_uses_the_owner_scoped_name(monkeypatch):
+    direct: list[list[str]] = []
+    monkeypatch.setattr(
+        deployer.subprocess,
+        "run",
+        lambda cmd, **k: direct.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+    cfg = Config(project="p", db_owner="git:github.com/a/x")
+    name = deployer.db_identifier("gb-cloudrun", cfg.db_owner)
+    _, url = deployer.ensure_cloudsql_database(
+        "gb-cloudrun", cfg, _cloudsql_runner("gb_cloudrun\n", "gb_cloudrun\n")
+    )
+    assert url.startswith(f"postgresql://{name}:") and url.endswith(f"@/{name}?host=/cloudsql/p:r:inst")
+    assert direct[0][:5] == ["gcloud", "sql", "users", "create", name]  # never the legacy user
+
+
+def test_a_live_service_keeps_its_pre_owner_database(monkeypatch):
+    """Upgrade path: an app already serving from `<app>` keeps that data instead of starting empty."""
+    monkeypatch.setattr(
+        deployer.subprocess, "run", lambda cmd, **k: pytest.fail(f"must not touch users: {cmd}")
+    )
+    cfg = Config(project="p", db_owner="git:github.com/a/x")
+    serving = "postgresql://gb_cloudrun:pw@/gb_cloudrun?host=/cloudsql/p:r:inst"
+    runner = _cloudsql_runner("gb_cloudrun\n", "gb_cloudrun\n")
+    assert deployer.ensure_cloudsql_database("gb-cloudrun", cfg, runner, serving, adopt_legacy=True) == (
+        "p:r:inst",
+        serving,
+    )
+    # someone else's live service (labelled with another owner): its database is not handed over
+    monkeypatch.setattr(
+        deployer.subprocess, "run", lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, "", "")
+    )
+    _, url = deployer.ensure_cloudsql_database("gb-cloudrun", cfg, runner, serving, adopt_legacy=False)
+    assert url != serving and "gb_cloudrun_" in url
+
+
+def test_cloudrun_deploy_labels_the_owner_and_records_why_a_db_came(monkeypatch, tmp_path):
+    commands: list[list[str]] = []
+    for fn in ("build_image", "push_image"):
+        monkeypatch.setattr(deployer, fn, lambda *a, **k: None)
+    monkeypatch.setattr(deployer, "serving_revision", lambda *a, **k: None)
+    monkeypatch.setattr(deployer, "latest_revision", lambda *a, **k: "svc-00001-new")
+    monkeypatch.setattr(deployer, "tagged_url", lambda *a, **k: "https://candidate---svc.run.app")
+    monkeypatch.setattr(deployer, "wait_up", lambda *a, **k: (True, "HTTP 200"))
+    monkeypatch.setattr(
+        deployer,
+        "ensure_cloudsql_database",
+        lambda *a, **k: ("p:r:inst", "postgresql://u:p@/d?host=/cloudsql/x"),
+    )
+    monkeypatch.setattr(
+        deployer.Runner,
+        "run",
+        lambda self, name, cmd, **_: (
+            commands.append(cmd) or subprocess.CompletedProcess(cmd, 0, "https://svc", "")
+        ),
+    )
+    src = _app(tmp_path / "gb", **{"requirements.txt": "psycopg[binary]"})
+    cfg = Config(project="p", service="svc", tag="t", skip_preflight=True, db_owner="git:github.com/a/x")
+    r = deployer.Runner()
+    deployer.deploy_cloudrun(src, cfg, r, deployer.Outcome(target="cloudrun"))
+    deploy = next(c for c in commands if "deploy" in c)
+    assert f"{deployer.OWNER_LABEL}={deployer.owner_label(cfg)}" in deploy
+    assert any(
+        s.name == "database" and s.cmd.startswith("postgres (requirements.txt: psycopg") for s in r.steps
+    )

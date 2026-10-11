@@ -553,7 +553,7 @@ def test_two_jobs_names_api_status_and_sse(m, tmp_path, monkeypatch):
     )
     paths = []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **_options):
         paths.append(Path(directory))
         return DeployResult(success=True, target=target, exit_code=0, url="https://example.invalid")
 
@@ -623,7 +623,7 @@ def test_cloudrun_workspace_is_removed_after_heal_finishes(m, tmp_path, monkeypa
     )
     deploy_attempts = []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **_options):
         assert Path(directory).exists()
         assert (Path(directory) / "app.py").read_text() == "dummy"
         deploy_attempts.append(dockerfile)
@@ -697,7 +697,7 @@ def test_failed_deploy_heals_and_preserves_sse_contract(m, tmp_path, monkeypatch
     )
     deploy_attempts = []
 
-    def fake_deploy(directory, attempted_dockerfile, target):
+    def fake_deploy(directory, attempted_dockerfile, target, **_options):
         deploy_attempts.append(attempted_dockerfile)
         if len(deploy_attempts) == 1:
             return DeployResult(
@@ -773,7 +773,7 @@ def test_stop_takes_down_every_live_target_once(m, tmp_path, monkeypatch):
     monkeypatch.setattr(
         m.deployer,
         "deploy",
-        lambda directory, dockerfile, target: DeployResult(
+        lambda directory, dockerfile, target, **_options: DeployResult(
             success=True, target=target, exit_code=0, url=f"https://{target}.invalid"
         ),
     )
@@ -898,7 +898,7 @@ def test_cancel_kills_the_build_and_skips_the_remaining_targets(m, tmp_path, mon
     building, released = threading.Event(), threading.Event()
     calls, killed = [], []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **_options):
         calls.append(target)
         building.set()
         assert released.wait(5)
@@ -948,7 +948,7 @@ def test_cancel_kills_the_build_and_skips_the_remaining_targets(m, tmp_path, mon
 def test_cancel_stops_the_healer_before_its_next_redeploy(m, tmp_path, monkeypatch):
     calls = []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **_options):
         calls.append(target)
         if len(calls) == 2:  # healer's first redeploy is in flight when the user cancels
             next(iter(m._jobs.values())).cancel.set()
@@ -1183,7 +1183,7 @@ def test_without_ask_env_nothing_is_asked_or_injected(m, tmp_path, monkeypatch):
         return await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
 
     assert asyncio.run(scenario())["status"] == "completed"
-    assert calls == [{}]
+    assert calls == [{"db_owner": m._source_identity(str(source))}]  # no env values, only whose DB it is
 
 
 def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):

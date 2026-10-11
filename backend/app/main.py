@@ -1077,6 +1077,8 @@ def create_app() -> FastAPI:
                 for t in run_targets:  # targets=[] (CloudMorph picks): the job learns its targets only now
                     job.targets.setdefault(t, {"success": None, "url": None})
                 project["targets"] = run_targets
+                # a provisioned database belongs to the app *and* its source, like the saved env values
+                overrides["db_owner"] = _source_identity(source)
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
