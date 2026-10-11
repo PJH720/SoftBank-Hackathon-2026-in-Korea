@@ -73,6 +73,11 @@ AI 검사관 18개 (Claude, 동시에)  →  울타리 (코드)  →  타깃  �
   deployer는 이 중 지원하는 것을 고른다. 정적 사이트는 nginx 컨테이너로 감싸므로 `caas`, `iaas`다.
   `paas`나 `faas`가 있으면 `caas`도 반드시 있다 (`caas`를 지우는 규칙은 모두 `paas`·`faas`도 지운다).
   `faas`는 코드 제약만 본 것이라, 서버 앱을 함수로 감싸는 어댑터는 따로 필요할 수 있다.
+- `removed`: `service_models`에서 빠진 모델마다 걸린 규칙 하나씩 `{model, reason, ai, evidence, consent}`로 보낸다.
+  `ai`는 검사관이 그 코드를 어떻게 봤는지, `evidence`는 `경로:줄: 코드`다. 데이터 손실 계열이면 `consent`가 참이다.
+  대시보드(`ask_env`)는 이유가 모두 `consent`인 장소가 있으면 배포 전에 묻고, 장소 카드마다 이유와 근거를 보여 준다.
+  사용자가 그 장소를 고르면 위험에 동의한 것으로 본다. `consent`가 아닌 이유(GPU, OS …)가 하나라도 있으면 고를 수 없다.
+  CD·스크립트처럼 물어볼 사람이 없으면 지금처럼 안전한 `target`으로 간다.
 - Dockerfile: 저장소에 있으면 그대로 쓴다. 없으면 실행 방법으로 템플릿을 만들고, AI가 저장소를 읽고 그 초안을 고친다
   (예: GPU를 안 쓰는 torch는 CPU 휠, go.sum이 없으면 go mod tidy). 템플릿이 없는 언어(ruby, php …)는 AI가 처음부터 쓴다.
   AI가 쓴 것은 울타리(`FROM`, `ENV PORT=<port>`, `COPY` 대상이 저장소에 있는지, 템플릿에 `CMD`가 있으면 마지막 단계에 `CMD`/`ENTRYPOINT`가 있는지)를

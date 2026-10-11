@@ -777,6 +777,21 @@ def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> di
     return {k: v for k, v in options.items() if v} | {"stores": stores}
 
 
+# Where each service model runs, among the places the dashboard offers
+MODEL_PLACES = {"caas": ("cloudrun",), "faas": ("function",), "iaas": ("local", "node")}
+
+
+def _removed_by_place(analysis: AnalysisResult, places: list[str]) -> dict[str, list[dict]]:
+    """{place: why the analyzer took it off} for the offered places. A place whose reasons are all `consent`
+    (data-loss risks) can still be picked; picking it is the user's consent."""
+    removed: dict[str, list[dict]] = {}
+    for r in analysis.removed:
+        for place in MODEL_PLACES.get(r.model, ()):
+            if place in places:
+                removed.setdefault(place, []).append(r.model_dump())
+    return removed
+
+
 # Connection URLs the user typed for an app's resources. Kept in memory and, like env values, in env_store
 # (Secret Manager) when GCP is configured; never in projects.json or in events.
 _resource_secrets: dict[str, dict[str, str]] = {}
@@ -1515,11 +1530,17 @@ def create_app() -> FastAPI:
             kept per name *and* source: another repo deployed under the same name is asked afresh, never handed these.
 
             targets=[] (CloudMorph picks): the analyzer's target. The dashboard is asked when values are missing,
-            or when the 1-second decision wanted another place that a data-loss risk held back; the card offers the
-            places, and picking the held-back one is the user's consent to that risk. Otherwise nothing is asked
-            (one touch)."""
+            when the 1-second decision wanted another place, or when the analyzer took a place off only for
+            data-loss risks; the card offers the places with why each was taken off, and picking a held-back one is
+            the user's consent to that risk. Otherwise nothing is asked (one touch)."""
             run_targets = list(targets) or [analysis.target]
-            held_back = not targets and bool(decision) and decision.get("target") != analysis.target
+            held_back = not targets and (
+                (bool(decision) and decision.get("target") != analysis.target)
+                or any(
+                    all(r["consent"] for r in rs)
+                    for rs in _removed_by_place(analysis, _target_options(analysis, decision)).values()
+                )
+            )
             values: dict[str, str] = {}
             missing: list[EnvRequirement] = []
             source_id = _source_identity(source)
@@ -1556,7 +1577,7 @@ def create_app() -> FastAPI:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
             return values, run_targets
 
-        def _target_question(analysis: AnalysisResult, decision: dict | None, held_back: bool) -> dict:
+        def _target_options(analysis: AnalysisResult, decision: dict | None) -> list[str]:
             """Places the card offers when CloudMorph picks (targets=[]): the pick first."""
             options = [analysis.target]
             if decision:
@@ -1564,14 +1585,16 @@ def create_app() -> FastAPI:
             options += ["cloudrun", "local"]
             if nodepool.load_registry().nodes:
                 options.append("node")
-            job.target_options = list(dict.fromkeys(options))
-            risk_notes = ("서버리스 컨테이너로는 갈 수 없어", "동의를 받지 못해 위험으로 두었습니다")
+            return list(dict.fromkeys(options))
+
+        def _target_question(analysis: AnalysisResult, decision: dict | None, held_back: bool) -> dict:
+            job.target_options = _target_options(analysis, decision)
             return {
                 "recommended": analysis.target,
                 "options": job.target_options,
                 "decision": decision,
                 "held_back": held_back,
-                "risks": [n for n in analysis.notes if n.startswith(risk_notes)],
+                "removed": _removed_by_place(analysis, job.target_options),
             }
 
         def _ask_env(

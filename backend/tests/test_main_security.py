@@ -17,7 +17,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.accounts import LOCAL_ADMIN
-from app.schemas import AnalysisResult, DeployRequest, DeployResult, EnvInput, EnvRequirement
+from app.schemas import AnalysisResult, DeployRequest, DeployResult, EnvInput, EnvRequirement, Removal
 
 # handlers are called directly here, so pass the caller the auth middleware would have set
 ADMIN = SimpleNamespace(state=SimpleNamespace(user=LOCAL_ADMIN))
@@ -1344,9 +1344,62 @@ def test_held_back_pick_asks_and_choosing_it_is_consent(m, tmp_path, monkeypatch
     events = _events(routes, deployment_id)
     asked = next(d["payload"] for e, d in events if e == "input_required")
     assert asked["items"] == [] and asked["choose_target"]["options"] == ["local", "cloudrun"]
-    assert asked["choose_target"]["held_back"] is True and asked["choose_target"]["risks"] == [risk]
+    assert asked["choose_target"]["held_back"] is True
     lines = [d["payload"].get("line", "") for e, d in events if e == "log"]
     assert "target: cloudrun (위험을 알고 고름)" in lines
+
+
+SQLITE = Removal(
+    model="caas",
+    reason="SQLite 파일이 재시작·재배포 때 사라집니다",
+    ai="데모용 DB입니다",
+    evidence=["app.py:3: sqlite3.connect('app.db')"],
+    consent=True,
+)
+GPU = Removal(
+    model="caas", reason="GPU는 가상 서버에서만 쓸 수 있습니다", evidence=["app.py:1: import torch"]
+)
+
+
+def test_removed_place_is_asked_with_reasons_even_without_a_decision(m, tmp_path, monkeypatch):
+    analysis = AnalysisResult(
+        target="local", language="python", dockerfile="FROM scratch\n", removed=[SQLITE]
+    )
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, None)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=[], ask_env=True)
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        job = m._jobs[deployment_id]
+        await _until(lambda: job.state == "waiting_input")
+        await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(targets=["cloudrun"]), ADMIN)
+        await _until(lambda: job.completed)
+        return deployment_id
+
+    deployment_id = asyncio.run(scenario())
+    assert deployed == ["cloudrun"]
+    events = _events(routes, deployment_id)
+    asked = next(d["payload"] for e, d in events if e == "input_required")["choose_target"]
+    assert asked["held_back"] is True and asked["removed"] == {"cloudrun": [SQLITE.model_dump()]}
+    lines = [d["payload"].get("line", "") for e, d in events if e == "log"]
+    assert "target: cloudrun (위험을 알고 고름)" in lines
+
+
+def test_place_removed_for_a_hard_limit_is_not_asked(m, tmp_path, monkeypatch):
+    analysis = AnalysisResult(
+        target="local", language="python", dockerfile="FROM scratch\n", removed=[SQLITE, GPU]
+    )
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, None)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=[], ask_env=True)
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        await _until(lambda: m._jobs[deployment_id].completed)
+        return deployment_id
+
+    deployment_id = asyncio.run(scenario())
+    assert deployed == ["local"]  # 동의로 풀 수 있는 곳이 없으니 묻지 않는다 (원터치)
+    assert not any(e == "input_required" for e, _ in _events(routes, deployment_id))
 
 
 def test_push_deploy_with_no_targets_takes_the_safe_pick(m, tmp_path, monkeypatch):
