@@ -63,9 +63,24 @@ def test_caddy_config_round_robins_all_replicas_and_tags_upstream():
     proxy = routes[0]["handle"][0]
     assert [u["dial"] for u in proxy["upstreams"]] == ["10.0.0.2:8000", "10.0.0.3:8001"]
     assert proxy["load_balancing"]["selection_policy"]["policy"] == "round_robin"
-    assert "health_checks" not in proxy  # passive checks would blackhole a single hot upstream
+    # several replicas: one that refuses connections (its cloud is down) is skipped and the request retried
+    assert proxy["health_checks"]["passive"]["max_fails"] >= 2
     assert routes[-1]["handle"][0]["handler"] == "static_response"  # catch-all for unknown hosts
     json.dumps(cfg)  # must be serialisable for the admin API
+
+
+def test_caddy_config_single_replica_has_no_passive_checks():
+    app = fleet.App(
+        name="shop",
+        image="shop:v1",
+        container_port=8080,
+        hostname="shop.10.0.0.1.nip.io",
+        replicas=[fleet.Replica("a", "c1", "10.0.0.2", 8000)],
+    )
+    proxy = fleet.render_caddy_config(_reg(), fleet.State(apps={"shop": app}))["apps"]["http"]["servers"][
+        "public"
+    ]["routes"][0]["handle"][0]
+    assert "health_checks" not in proxy  # passive checks would blackhole a single hot upstream
 
 
 def test_tick_scales_out_after_hot_streak_and_blocks_when_pool_exhausted(monkeypatch, tmp_path):
