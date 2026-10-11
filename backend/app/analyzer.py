@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import string
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -32,7 +33,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.schemas import AnalysisResult, EnvRequirement
+from app.schemas import AnalysisResult, EnvRequirement, Removal
 
 DEFAULT_MODEL = "claude-haiku-5-5"
 # 고를 유형 순서와 그 타깃
@@ -128,10 +129,11 @@ def analyze_with(
         why = f"서버리스 컨테이너로는 갈 수 없어 local(Docker)에 배포합니다: {'; '.join(dict.fromkeys(removed[2]))}"
     else:
         why = f"{TYPES[t]} 유형으로 판단해 {targets[t]}에 배포합니다."
-    models = [m for n, m in SERVICE_MODELS.items() if n in candidates]
+    models = ["caas", "iaas"] if t == 5 else [m for n, m in SERVICE_MODELS.items() if n in candidates]
     return AnalysisResult(
         target=targets[t],
-        service_models=["caas", "iaas"] if t == 5 else models,
+        service_models=models,
+        removed=_removals(values, reports, models),
         language=app.language or "unknown",
         framework=app.framework,
         port=port,
@@ -163,8 +165,10 @@ def _required_env(reports: dict) -> list[EnvRequirement]:
             name=name,
             scope="runtime",
             secret=role in SECRET_ROLES,
-            reason=f"{r['kind']} 접속 정보 ({role})",
+            reason=f"{r['name'] or r['kind']} 접속 정보 ({role})",
             resource=r["kind"],
+            role=role,
+            template=r["url_template"] if role == "url" else None,
             evidence=evidence(name),
         )
         for r in items("resources")
@@ -194,6 +198,28 @@ def _required_env(reports: dict) -> list[EnvRequirement]:
         if e["required"] and e["name"] not in used
     ]
     return build + list(stores.values()) + runtime
+
+
+def _removals(values: dict, reports: dict, kept: list[str]) -> list[Removal]:
+    """service_models에서 빠진 모델마다 걸린 규칙 하나씩: 이유, AI가 코드를 본 판단, 근거 줄.
+    데이터 손실 계열(FATAL)은 사용자가 대시보드에서 그 모델의 장소를 고르면 동의한 것으로 보고 풀 수 있다."""
+    out = []
+    for n, model in SERVICE_MODELS.items():
+        if model in kept:
+            continue
+        for when, types, reason, signal in RULES:
+            if n in types and when(values):
+                r = reports[signal]
+                out.append(
+                    Removal(
+                        model=model,
+                        reason=reason,
+                        ai=r["reason"] if r else "검사관이 판정하지 못해 위험으로 두었습니다",
+                        evidence=[f"{h['evidence']}: {h['text']}" for h in r["hits"]] if r else [],
+                        consent=signal in FATAL,
+                    )
+                )
+    return out
 
 
 def _signals(reports: dict) -> tuple[dict, list[str]]:
@@ -266,8 +292,12 @@ def _notes(t: int, values: dict, reports: dict, app: App, root: Path, errors: li
         return (reports[name] or {}).get("items", [])
 
     notes = [
-        f"외부 저장소가 필요합니다: {r['kind']} ({', '.join(r['env'].values()) or '환경변수 못 찾음'}). "
-        "배포 전에 만들어 연결해야 합니다."
+        f"외부 저장소가 필요합니다: {r['name'] or r['kind']} ({', '.join(r['env'].values()) or '환경변수 못 찾음'}). "
+        + (
+            "CloudMorph가 만들 수 없는 종류라 접속 정보를 직접 넣어야 합니다."
+            if r["kind"] == "other"
+            else "접속 정보를 비워 두면 배포할 곳에서 만들 수 있을 때 만들어 붙입니다."
+        )
         for r in items("resources")
     ]
     used = {"PORT"} | {n for r in items("resources") for n in r["env"].values()}
@@ -341,38 +371,66 @@ FATAL = {
     "scheduler": "요청이 없으면 멈추는 환경에서는 주기 작업이 조용히 실행되지 않습니다",
 }
 
-# (발동 조건, 지울 유형, 이유)
+# (발동 조건, 지울 유형, 이유, 근거를 보여 줄 신호)
 RULES = [
     (
         lambda s: s["is_spa"] == "yes" and s["has_server"] != "yes",
         {1, 2, 3, 4},
         "서버 코드가 없어 정적 호스팅으로 충분합니다",
+        "is_spa",
     ),
-    (lambda s: s["has_server"] == "yes", {5}, "정적 호스팅은 서버 코드를 실행할 수 없습니다"),
-    (lambda s: s["long_running"] == "yes", {1}, "실행 시간 제한이 있고 상주 연결을 유지할 수 없습니다"),
+    (lambda s: s["has_server"] == "yes", {5}, "정적 호스팅은 서버 코드를 실행할 수 없습니다", "has_server"),
+    (
+        lambda s: s["long_running"] == "yes",
+        {1},
+        "실행 시간 제한이 있고 상주 연결을 유지할 수 없습니다",
+        "long_running",
+    ),
     (
         lambda s: s["scheduler"] == "yes",
         {1},
         "요청이 없으면 멈추는 환경이라 프로세스 안의 주기 작업이 돌지 않습니다",
+        "scheduler",
     ),
     (
         lambda s: s["memory_state"] == "yes",
         {1, 2, 3},
         "인스턴스가 여러 대로 늘면 메모리 상태가 갈라지고, 재시작하면 사라집니다",
+        "memory_state",
     ),
-    (lambda s: s["sqlite"] == "yes", {1, 2, 3}, "SQLite 파일이 재시작·재배포 때 사라집니다"),
-    (lambda s: s["file_write"] == "yes", {1, 2, 3}, "로컬 디스크에 쓴 파일이 재시작·재배포 때 사라집니다"),
-    (lambda s: s["gpu"] == "yes", {1, 2, 3, 5}, "GPU는 가상 서버에서만 쓸 수 있습니다"),
-    (lambda s: s["system_packages"] == "yes", {1, 3}, "OS 패키지를 설치할 수 없거나 까다롭습니다"),
-    (lambda s: s["os_windows"] == "yes", {1, 2, 3, 5}, "Windows 전용 코드는 리눅스 환경에서 돌지 않습니다"),
-    (lambda s: s["os_macos"] == "yes", {1, 2, 3, 4, 5}, "macOS 전용 코드는 클라우드에서 돌지 않습니다"),
+    (lambda s: s["sqlite"] == "yes", {1, 2, 3}, "SQLite 파일이 재시작·재배포 때 사라집니다", "sqlite"),
+    (
+        lambda s: s["file_write"] == "yes",
+        {1, 2, 3},
+        "로컬 디스크에 쓴 파일이 재시작·재배포 때 사라집니다",
+        "file_write",
+    ),
+    (lambda s: s["gpu"] == "yes", {1, 2, 3, 5}, "GPU는 가상 서버에서만 쓸 수 있습니다", "gpu"),
+    (
+        lambda s: s["system_packages"] == "yes",
+        {1, 3},
+        "OS 패키지를 설치할 수 없거나 까다롭습니다",
+        "system_packages",
+    ),
+    (
+        lambda s: s["os_windows"] == "yes",
+        {1, 2, 3, 5},
+        "Windows 전용 코드는 리눅스 환경에서 돌지 않습니다",
+        "os_windows",
+    ),
+    (
+        lambda s: s["os_macos"] == "yes",
+        {1, 2, 3, 4, 5},
+        "macOS 전용 코드는 클라우드에서 돌지 않습니다",
+        "os_macos",
+    ),
 ]
 
 
 def apply_rules(values: dict) -> tuple[list, dict]:
     """values: {신호: yes/no/unknown}. (남은 유형, {지운 유형: [이유]})"""
     removed = {}
-    for when, types, reason in RULES:
+    for when, types, reason, _ in RULES:
         if when(values):
             for t in sorted(types):
                 removed.setdefault(t, []).append(reason)
@@ -439,10 +497,17 @@ class EnvRole(BaseModel):
         "secret_key",
     ]
     name: str = Field(description="그 역할의 값을 받는 환경변수 이름")
+    template: str | None = Field(
+        default=None,
+        description="role이 url일 때만: 앱이 기대하는 URL 형식. 값 자리에 {host} {port} {user} {password} {database}만 쓴다 "
+        "(예: jdbc:postgresql://{host}:{port}/{database}, postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}). "
+        "그 종류의 흔한 URL(postgresql://…, mysql://…, redis://…, mongodb://…)을 그대로 받으면 null",
+    )
 
 
 class ResourceItem(BaseModel):
-    kind: Literal["postgres", "mysql", "redis", "s3"]
+    kind: Literal["postgres", "mysql", "redis", "mongodb", "s3", "other"]
+    name: str | None = Field(default=None, description="kind가 other일 때 저장소 이름 (kafka, rabbitmq …)")
     env: list[EnvRole]
     evidence: list[Evidence]
 
@@ -581,8 +646,10 @@ SPEC_INSPECTORS = {
     "resources": (
         "외부 저장소",
         (
-            "앱이 연결하는 외부 저장소(PostgreSQL, MySQL, Redis, S3 호환 저장소 — MinIO 포함)와, 접속 정보를 받는 환경변수 이름. "
+            "앱이 연결하는 외부 저장소(PostgreSQL, MySQL, Redis, MongoDB, S3 호환 저장소 — MinIO 포함)와, 접속 정보를 받는 환경변수 이름. "
+            "그 밖의 저장소·메시지 브로커(Kafka, RabbitMQ, Elasticsearch …)는 kind를 other로 하고 name에 이름을 쓴다. "
             "역할마다 코드·설정이 실제로 읽는 이름을 쓴다. URL 하나로 받으면 url, 나눠 받으면 host·port·user·password·database. "
+            "url은 코드가 그 값을 어떤 형식으로 쓰는지 보고, 흔한 형식이 아니면 template에 적는다 (JDBC, SQLAlchemy 드라이버 접두어 등). "
             "설정 파일에 자리표시자가 없어 프레임워크 규칙으로 덮어써야 하면 그 이름을 쓴다 (Spring: SPRING_DATASOURCE_URL, SPRING_R2DBC_URL …). "
             "의존성에만 있고 쓰지 않는 저장소와 SQLite는 뺀다."
         ),
@@ -763,6 +830,20 @@ def _hits(root: Path, items) -> list:
     return hits
 
 
+URL_FIELDS = {"host", "port", "user", "password", "database"}
+
+
+def url_template(template: str | None) -> str | None:
+    """AI가 적은 URL 형식은 정해진 자리표시자만 쓰고 {host}가 있어야 받는다. 아니면 None (그 종류의 흔한 URL)"""
+    try:
+        parts = list(string.Formatter().parse(template or ""))
+    except ValueError:
+        return None
+    fields = {f for _, f, _, _ in parts if f is not None}
+    plain = all(not spec and conv is None for _, f, spec, conv in parts if f is not None)
+    return template if plain and "host" in fields and fields <= URL_FIELDS else None
+
+
 def validate(name: str, report, root: Path, text: str) -> dict:
     """확인한 보고서 dict. 근거는 실제 줄로 바꾸고, 저장소에 없는 이름은 버린다."""
 
@@ -786,7 +867,14 @@ def validate(name: str, report, root: Path, text: str) -> dict:
     if name == "resources":
         return {
             "items": [
-                {"kind": r.kind, "env": {e.role: e.name for e in r.env if known(e.name)}}
+                {
+                    "kind": r.kind,
+                    "name": r.name if r.kind == "other" else None,
+                    "env": {e.role: e.name for e in r.env if known(e.name)},
+                    "url_template": next(
+                        (url_template(e.template) for e in r.env if e.role == "url" and known(e.name)), None
+                    ),
+                }
                 for r in report.items
             ]
         }

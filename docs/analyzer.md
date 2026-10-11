@@ -73,6 +73,11 @@ AI 검사관 18개 (Claude, 동시에)  →  울타리 (코드)  →  타깃  �
   deployer는 이 중 지원하는 것을 고른다. 정적 사이트는 nginx 컨테이너로 감싸므로 `caas`, `iaas`다.
   `paas`나 `faas`가 있으면 `caas`도 반드시 있다 (`caas`를 지우는 규칙은 모두 `paas`·`faas`도 지운다).
   `faas`는 코드 제약만 본 것이라, 서버 앱을 함수로 감싸는 어댑터는 따로 필요할 수 있다.
+- `removed`: `service_models`에서 빠진 모델마다 걸린 규칙 하나씩 `{model, reason, ai, evidence, consent}`로 보낸다.
+  `ai`는 검사관이 그 코드를 어떻게 봤는지, `evidence`는 `경로:줄: 코드`다. 데이터 손실 계열이면 `consent`가 참이다.
+  대시보드(`ask_env`)는 이유가 모두 `consent`인 장소가 있으면 배포 전에 묻고, 장소 카드마다 이유와 근거를 보여 준다.
+  사용자가 그 장소를 고르면 위험에 동의한 것으로 본다. `consent`가 아닌 이유(GPU, OS …)가 하나라도 있으면 고를 수 없다.
+  CD·스크립트처럼 물어볼 사람이 없으면 지금처럼 안전한 `target`으로 간다.
 - Dockerfile: 저장소에 있으면 그대로 쓴다. 없으면 실행 방법으로 템플릿을 만들고, AI가 저장소를 읽고 그 초안을 고친다
   (예: GPU를 안 쓰는 torch는 CPU 휠, go.sum이 없으면 go mod tidy). 템플릿이 없는 언어(ruby, php …)는 AI가 처음부터 쓴다.
   AI가 쓴 것은 울타리(`FROM`, `ENV PORT=<port>`, `COPY` 대상이 저장소에 있는지, 템플릿에 `CMD`가 있으면 마지막 단계에 `CMD`/`ENTRYPOINT`가 있는지)를
@@ -110,7 +115,8 @@ AI 검사관 18개 (Claude, 동시에)  →  울타리 (코드)  →  타깃  �
 ## 팀에 제안 (합의 필요)
 
 1. **`AnalysisResult` 넓히기**: analyzer는 이미 아래 정보를 만들지만 계약에 칸이 없어 `notes` 문장으로만 넘긴다.
-   - `resources`: 필요한 DB·Redis·버킷과 접속 환경변수 이름 (deployer가 Cloud SQL 등을 만들거나 연결할 때 필요)
+   - `resources`: 필요한 DB·Redis·버킷과 접속 환경변수 이름 — 10/10부터 `required_env`의 `resource`·`role`·`template`으로 넘기고,
+     deployer가 비어 있는 저장소를 만들어 역할대로 채운다 ([node-pool-fleet.md](node-pool-fleet.md#데이터베이스-프로비저닝-1010-추가--sqlite--관리형-postgres))
    - `env`: 사용자가 넣어야 할 환경변수 (무작위 값을 넣어도 되는지)
    - `risks`: 기타 위험 (예: 시작할 때 큰 모델 로드, 이미지에 없는 파일)
 2. **동의를 화면에서 받기**: SSE에 질문 이벤트를 두고 답을 받는 API(`POST /deploy/{id}/answer`)를 두면,

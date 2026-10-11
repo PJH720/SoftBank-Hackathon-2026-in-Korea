@@ -222,7 +222,22 @@ def test_redis_and_mysql_are_detected_with_the_scheme_the_code_uses(tmp_path):
     assert deployer.url_scheme(src, "postgres") == "postgresql"
 
 
-def test_sidecars_attach_database_and_redis_and_make_the_app_stateful(tmp_path):
+def _req(name, role, kind="postgres", template=None):
+    from app.schemas import EnvRequirement
+
+    return EnvRequirement(
+        name=name, scope="runtime", secret=False, resource=kind, role=role, template=template
+    )
+
+
+def _conn(kind, password="pw", app="shop"):
+    from app import nodes
+
+    sc = nodes.SIDECARS[kind]
+    return sc.conn(password, f"{app}-{sc.suffix}")
+
+
+def test_without_an_analysis_the_code_scan_guesses_database_and_redis(tmp_path):
     src = _app(
         tmp_path / "q-local",
         **{
@@ -230,22 +245,139 @@ def test_sidecars_attach_database_and_redis_and_make_the_app_stateful(tmp_path):
             "requirements.txt": "psycopg\nredis",
         },
     )
-    started: list[tuple[str, str]] = []
-    env: dict = {}
+    got = deployer.store_settings(src, Config(), Runner())
+    assert {k: [(e.name, e.role) for e in v] for k, v in got.items()} == {
+        "postgres": [("DATABASE_URL", "url")],
+        "redis": [("REDIS_URL", "url")],
+    }
+    # the analyzer's stores replace the guess, even when it found none
+    assert deployer.store_settings(src, Config(stores=[]), Runner()) == {}
+    # the user's own value wins
+    assert "postgres" not in deployer.store_settings(
+        src, Config(env={"DATABASE_URL": "postgresql://mine"}), Runner()
+    )
+
+
+def test_store_settings_respect_switches_and_dashboard_new(tmp_path):
+    redis, pg = [_req("REDIS_HOST", "host", "redis")], [_req("DB_URL", "url")]
+    assert deployer.store_settings(tmp_path, Config(stores=redis), Runner()) == {"redis": redis}
+    assert deployer.store_settings(tmp_path, Config(stores=redis, cache=False), Runner()) == {}
+    assert deployer.store_settings(tmp_path, Config(stores=pg, skip_stores=("postgres",)), Runner()) == {}
+    # dashboard "new Postgres" on an app whose analysis found no store: DATABASE_URL is made
+    made = deployer.store_settings(tmp_path, Config(stores=[], database="postgres"), Runner())
+    assert [(e.name, e.role) for e in made["postgres"]] == [("DATABASE_URL", "url")]
+
+
+def test_settings_are_filled_by_role_in_the_apps_own_names():
+    mysql = [
+        _req("DB_HOST", "host", "mysql"),
+        _req("DB_PORT", "port", "mysql"),
+        _req("DB_PASS", "password", "mysql"),
+        _req("SPRING_DATASOURCE_URL", "url", "mysql", "jdbc:mysql://{host}:{port}/{database}"),
+    ]
+    assert deployer.fill_store_env(mysql, _conn("mysql")) == {
+        "DB_HOST": "shop-mysql",
+        "DB_PORT": "3306",
+        "DB_PASS": "pw",
+        "SPRING_DATASOURCE_URL": "jdbc:mysql://shop-mysql:3306/app",
+    }
+    s3 = [
+        _req("S3_BUCKET", "bucket", "s3"),
+        _req("S3_KEY", "access_key", "s3"),
+        _req("S3_SECRET", "secret_key", "s3"),
+    ]
+    assert deployer.fill_store_env(s3, _conn("s3")) == {
+        "AWS_ENDPOINT_URL_S3": "http://shop-s3:8333",  # SDKs reach it even without an endpoint setting
+        "S3_BUCKET": "app",
+        "S3_KEY": "app",
+        "S3_SECRET": "pw",
+    }
+    mongo = deployer.fill_store_env([_req("MONGO_URL", "url", "mongodb")], _conn("mongodb"))
+    assert mongo == {"MONGO_URL": "mongodb://app:pw@shop-mongo:27017/app?authSource=admin"}
+    async_pg = "postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
+    assert deployer.fill_store_env([_req("DB", "url", template=async_pg)], _conn("postgres")) == {
+        "DB": "postgresql+asyncpg://app:pw@shop-db:5432/app"
+    }
+
+
+def test_cloudsql_socket_urls_follow_the_apps_form():
+    conn = deployer.cloudsql_conn("p:r:i", "postgresql://u:pw@/d?host=/cloudsql/p:r:i")
+    assert (conn["host"], conn["user"], conn["password"], conn["database"]) == (
+        "/cloudsql/p:r:i",
+        "u",
+        "pw",
+        "d",
+    )
+    asyncpg = "postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
+    assert deployer.render_url(asyncpg, conn) == "postgresql+asyncpg://u:pw@/d?host=/cloudsql/p:r:i"
+    assert deployer.render_url("jdbc:postgresql://{host}:{port}/{database}", conn) is None  # JDBC: no socket
+    assert deployer.render_url("x://{nope}", conn) is None
+
+
+def test_local_deploy_fills_each_store_into_the_apps_own_names(monkeypatch, tmp_path):
+    seen = []
+    for fn in ("build_image",):
+        monkeypatch.setattr(deployer, fn, lambda *a, **k: None)
+    monkeypatch.setattr(deployer, "cleanup_local", lambda handles, **kw: [])
+    monkeypatch.setattr(deployer, "wait_up", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(
+        deployer,
+        "ensure_local_sidecar",
+        lambda app, kind, r, scheme=None: seen.append(kind) or _conn(kind, app=app),
+    )
+    runs = []
+    monkeypatch.setattr(
+        Runner,
+        "run",
+        lambda self, name, cmd, **kw: (
+            runs.append((cmd, kw.get("env"))) or subprocess.CompletedProcess(cmd, 0, "cid", "")
+        ),
+    )
+    stores = [
+        _req("DB_HOST", "host", "mysql"),
+        _req("DB_PASS", "password", "mysql"),
+        _req("CACHE", "url", "redis"),
+    ]
     out = Outcome(target="local")
-    deployer._attach_sidecars(
-        src,
-        Config(),
+    deployer.deploy_local(
+        _app(tmp_path / "shop"), Config(tunnel=False, stores=stores, env={"API_KEY": "k"}), Runner(), out
+    )
+    assert seen == ["mysql", "redis"]
+    _, env = next((c, e) for c, e in runs if c[:2] == ["docker", "run"])
+    assert env == {
+        "API_KEY": "k",
+        "DB_HOST": "shop-mysql",
+        "DB_PASS": "pw",
+        "CACHE": "redis://:pw@shop-redis:6379/0",
+    }
+    assert [s["container"] for s in out.handles["sidecars"]] == ["shop-mysql", "shop-redis"]
+    assert out.handles["database"] == "mysql" and out.handles["cache_container"] == "shop-redis"
+
+
+def test_unmakeable_stores_are_left_to_the_user_with_a_warning(monkeypatch, tmp_path):
+    out = Outcome(target="local")
+    env: dict = {}
+    deployer._attach_stores(
+        tmp_path,
+        Config(stores=[_req("KAFKA", "url", "other")]),
         Runner(),
         out,
         env,
-        lambda engine, scheme: started.append((engine, scheme)) or f"{scheme}://x",
+        "local",
+        lambda k: pytest.fail("no"),
     )
-    assert started == [("postgres", "postgresql"), ("redis", "redis")]
-    assert env == {"DATABASE_URL": "postgresql://x", "REDIS_URL": "redis://x"}
-    assert out.handles["db_container"] == "q-local-db" and out.handles["cache_container"] == "q-local-redis"
-    # the user's own values win
-    env = {"DATABASE_URL": "postgresql://mine", "REDIS_URL": "redis://mine"}
-    deployer._attach_sidecars(
-        src, Config(), Runner(), Outcome(target="local"), env, lambda *a: pytest.fail("no")
+    assert env == {} and "KAFKA" in out.warnings[0]
+
+
+def test_cloudrun_fills_split_postgres_settings_from_cloud_sql(monkeypatch, tmp_path):
+    _, files, _ = _stub_cloudrun(monkeypatch, secret=None)
+    stores = [_req("PGHOST", "host"), _req("PGPASSWORD", "password"), _req("PGDATABASE", "database")]
+    deployer.deploy_cloudrun(
+        tmp_path,
+        Config(project="p", service="svc", tag="t", stores=stores),
+        Runner(),
+        Outcome(target="cloudrun"),
     )
+    import json
+
+    assert json.loads(files[0]) == {"PGHOST": "/cloudsql/p:r:inst", "PGPASSWORD": "pw", "PGDATABASE": "gb_x"}

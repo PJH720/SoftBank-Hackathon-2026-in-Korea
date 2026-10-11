@@ -752,10 +752,17 @@ def source_fix_confirm(
 
 
 def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> dict:
-    """deployer.deploy options for the user's values (blank ones are left out)."""
+    """deployer.deploy options for the user's values (blank ones are left out).
+    `stores`: settings of every external store the user left entirely blank, for the deployer to provision
+    and fill by role. One value given means their own server, so that store's other settings stay blank."""
     env: dict[str, str] = {}
     build_args: dict[str, str] = {}
     build_secrets: dict[str, str] = {}
+    by_kind: dict[str, list[EnvRequirement]] = {}
+    for item in required:
+        if item.resource and item.role:
+            by_kind.setdefault(item.resource, []).append(item)
+    stores = [e for items in by_kind.values() if not any(values.get(e.name) for e in items) for e in items]
     for item in required:
         value = values.get(item.name)
         if not value:
@@ -767,7 +774,23 @@ def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> di
         else:
             build_args[item.name] = value
     options = {"env": env, "build_args": build_args, "build_secrets": build_secrets}
-    return {k: v for k, v in options.items() if v}
+    # always set: with the analysis in hand the deployer fills what it found instead of guessing
+    return {k: v for k, v in options.items() if v} | {"stores": stores}
+
+
+# Where each service model runs, among the places the dashboard offers
+MODEL_PLACES = {"caas": ("cloudrun",), "faas": ("function",), "iaas": ("local", "node")}
+
+
+def _removed_by_place(analysis: AnalysisResult, places: list[str]) -> dict[str, list[dict]]:
+    """{place: why the analyzer took it off} for the offered places. A place whose reasons are all `consent`
+    (data-loss risks) can still be picked; picking it is the user's consent."""
+    removed: dict[str, list[dict]] = {}
+    for r in analysis.removed:
+        for place in MODEL_PLACES.get(r.model, ()):
+            if place in places:
+                removed.setdefault(place, []).append(r.model_dump())
+    return removed
 
 
 # Connection URLs the user typed for an app's resources. Kept in memory and, like env values, in env_store
@@ -799,24 +822,25 @@ def _apply_resources(name: str, project: dict, overrides: dict) -> dict:
         return overrides
     stores = (project.get("analysis") or {}).get("stores") or {}
     env = dict(overrides.get("env") or {})
+    skip = set(overrides.get("skip_stores") or ())
     for kind, setting in resources.items():
         var = stores.get(kind) or STORE_ENV[kind]
         mode = setting.get("mode")
-        # what turns the deployer's own provisioning off for this kind (a sidecar/Cloud SQL it would add)
-        off = {"cache": False} if kind == "redis" else {"database": None}
         if mode == "url":
             if url := _resource_secrets.get(name, {}).get(var) or env.get(var):
                 env[var] = url
-            else:
-                # the user's own address is gone (restart without Secret Manager): never quietly swap in a new DB
-                overrides.update(off)
+            # their own server, or its address is gone (restart without Secret Manager): either way the
+            # deployer must not make one of this kind (never quietly swap in a new, empty database)
+            skip.add(kind)
         elif mode == "new":
-            env.pop(var, None)  # the deployer makes one and injects DATABASE_URL
+            env.pop(var, None)  # the deployer makes one and fills it in
             if kind == "postgres":
                 overrides["database"] = "postgres"
         elif mode == "none":
             env.pop(var, None)
-            overrides.update(off)
+            skip.add(kind)
+    if skip:
+        overrides["skip_stores"] = tuple(sorted(skip))
     if env:
         overrides["env"] = env
     else:
@@ -1517,11 +1541,17 @@ def create_app() -> FastAPI:
             kept per name *and* source: another repo deployed under the same name is asked afresh, never handed these.
 
             targets=[] (CloudMorph picks): the analyzer's target. The dashboard is asked when values are missing,
-            or when the 1-second decision wanted another place that a data-loss risk held back; the card offers the
-            places, and picking the held-back one is the user's consent to that risk. Otherwise nothing is asked
-            (one touch)."""
+            when the 1-second decision wanted another place, or when the analyzer took a place off only for
+            data-loss risks; the card offers the places with why each was taken off, and picking a held-back one is
+            the user's consent to that risk. Otherwise nothing is asked (one touch)."""
             run_targets = list(targets) or [analysis.target]
-            held_back = not targets and bool(decision) and decision.get("target") != analysis.target
+            held_back = not targets and (
+                (bool(decision) and decision.get("target") != analysis.target)
+                or any(
+                    all(r["consent"] for r in rs)
+                    for rs in _removed_by_place(analysis, _target_options(analysis, decision)).values()
+                )
+            )
             values: dict[str, str] = {}
             missing: list[EnvRequirement] = []
             source_id = _source_identity(source)
@@ -1558,7 +1588,7 @@ def create_app() -> FastAPI:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
             return values, run_targets
 
-        def _target_question(analysis: AnalysisResult, decision: dict | None, held_back: bool) -> dict:
+        def _target_options(analysis: AnalysisResult, decision: dict | None) -> list[str]:
             """Places the card offers when CloudMorph picks (targets=[]): the pick first."""
             options = [analysis.target]
             if decision:
@@ -1566,14 +1596,16 @@ def create_app() -> FastAPI:
             options += ["cloudrun", "local"]
             if nodepool.load_registry().nodes:
                 options.append("node")
-            job.target_options = list(dict.fromkeys(options))
-            risk_notes = ("서버리스 컨테이너로는 갈 수 없어", "동의를 받지 못해 위험으로 두었습니다")
+            return list(dict.fromkeys(options))
+
+        def _target_question(analysis: AnalysisResult, decision: dict | None, held_back: bool) -> dict:
+            job.target_options = _target_options(analysis, decision)
             return {
                 "recommended": analysis.target,
                 "options": job.target_options,
                 "decision": decision,
                 "held_back": held_back,
-                "risks": [n for n in analysis.notes if n.startswith(risk_notes)],
+                "removed": _removed_by_place(analysis, job.target_options),
             }
 
         def _ask_env(
@@ -1588,8 +1620,13 @@ def create_app() -> FastAPI:
             Returns (values, targets the user picked or None)."""
             # targets=[]: the user picks on this card, so promise only what every place provisions
             places = targets or ["local", "cloudrun", "node"]
-            auto = deployer.provisioned_env(Path(source_dir), places, deployer.Config.from_env())
-            job.required_env = [e.model_copy(update={"auto": True}) if e.name in auto else e for e in items]
+            cfg = deployer.Config.from_env()
+            job.required_env = [
+                e.model_copy(update={"auto": True})
+                if e.role and deployer.provisionable(e.resource, places, cfg)
+                else e
+                for e in items
+            ]
             payload = {
                 "items": [e.model_dump() for e in job.required_env],
                 "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,

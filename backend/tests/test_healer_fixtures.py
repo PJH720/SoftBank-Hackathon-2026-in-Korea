@@ -614,10 +614,22 @@ def test_repo_agent_that_changes_nothing_gives_up_without_redeploy(tmp_path):
 
 def test_repo_agent_is_the_default_with_a_claude_key(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
     calls = []
     monkeypatch.setattr(healer, "default_repo_repair", lambda *a: calls.append(a) or None)
     heal(str(tmp_path), "local", _failed("broken-import.local"), "FROM x\n", _forbidden("redeploy"))
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("provider", ["sglang", "local", "openai"])
+def test_llm_provider_other_than_claude_turns_the_repo_agent_off(tmp_path, monkeypatch, provider):
+    # On-prem demo: the Claude key stays for analyzer, but healer must ask the forced provider
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", provider)
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://dgx:30000/v1")
+    monkeypatch.setattr(healer, "default_repo_repair", _forbidden("repo agent"))
+    report = heal(str(tmp_path), "local", _failed("broken-import.local"), "FROM x\n", _forbidden("redeploy"))
+    assert report.summary.startswith(APP_CODE_STOP)  # the no-agent policy, not a Claude repair
 
 
 def test_repo_edit_tool_edits_and_creates_inside_src_dir(tmp_path):

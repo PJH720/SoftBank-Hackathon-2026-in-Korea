@@ -50,14 +50,16 @@ def test_wants_database_respects_explicit_config(tmp_path):
 
 def test_sidecar_script_reuses_a_container_and_resets_only_a_fresh_postgres():
     script = nodes.sidecar_script(nodes.SIDECARS["postgres"], "todo", "pw123")
-    assert "if docker inspect todo-db >/dev/null 2>&1; then docker start todo-db" in script  # stopped counts
+    assert "if docker inspect todo-db >/dev/null 2>&1; then " in script and "docker start todo-db" in script
+    # an existing container of that name must run the expected image (another engine's data is not reused)
+    assert "img=$(docker inspect -f '{{.Config.Image}}' todo-db); [ \"$img\" = postgres:16-alpine ]" in script
     assert "-e POSTGRES_PASSWORD=pw123" in script and "postgres:16-alpine" in script
     # a volume that predates the container gets the new password (old one unknown)
     assert '[ -n "$fresh" ] && docker exec todo-db sh -c' in script and "ALTER USER app PASSWORD" in script
     # the password printed is the one the container runs with: an existing sidecar keeps its own
     assert script.endswith("sed -n 's/^POSTGRES_PASSWORD=//p'")
     mysql = nodes.sidecar_script(nodes.SIDECARS["mysql"], "todo", "pw")
-    assert "docker volume inspect todo-mysqldata" in mysql and "exit 3" in mysql  # cannot reset: refuse
+    assert "docker volume inspect todo-mysql-data" in mysql and "exit 3" in mysql  # cannot reset: refuse
 
 
 def _sh(monkeypatch, rc=0, out="", err=""):
@@ -79,9 +81,13 @@ def test_local_sidecar_url_carries_the_password_the_container_runs_with(monkeypa
     _sh(monkeypatch, out="app\n")  # a sidecar from before random passwords keeps working
     assert deployer.ensure_local_postgres("todo", r) == "postgresql://app:app@todo-db:5432/app"
     _sh(monkeypatch, out="secret\n")
-    assert (
-        deployer.ensure_local_sidecar("todo", "mysql", r, scheme="mysql+pymysql")
-        == "mysql+pymysql://app:secret@todo-db:3306/app"
+    conn = deployer.ensure_local_sidecar("todo", "mysql", r, scheme="mysql+pymysql")
+    assert conn["url"] == "mysql+pymysql://app:secret@todo-mysql:3306/app"
+    assert (conn["host"], conn["port"], conn["user"], conn["password"]) == (
+        "todo-mysql",
+        "3306",
+        "app",
+        "secret",
     )
 
 

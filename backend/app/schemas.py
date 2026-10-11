@@ -44,11 +44,34 @@ class EnvRequirement(BaseModel):
     reason: str = Field(default="", description="What the value is for")
     resource: str | None = Field(
         default=None,
-        description="postgres|mysql|redis|s3 when this is a connection setting of an external store "
+        description="postgres|mysql|redis|mongodb|s3|other when this is a connection setting of an external store "
         "(the user may point it at their own server)",
+    )
+    role: str | None = Field(
+        default=None,
+        description="Which part of the store's connection this is: url|host|port|user|password|database|"
+        "bucket|endpoint|region|access_key|secret_key (the deployer fills provisioned values by role)",
+    )
+    template: str | None = Field(
+        default=None,
+        description="role=url only: the URL form the app expects, with {host} {port} {user} {password} {database} "
+        "placeholders (e.g. jdbc:postgresql://{host}:{port}/{database}). None -> the kind's usual URL",
     )
     auto: bool = Field(default=False, description="Left blank, the deployer provisions it (set by main.py)")
     evidence: list[str] = Field(default_factory=list, description="'path:line' where the code reads it")
+
+
+class Removal(BaseModel):
+    """One reason the analyzer took a service model off `service_models`."""
+
+    model: ServiceModel
+    reason: str = Field(description="Why this model cannot (safely) run the code")
+    ai: str = Field(default="", description="What the AI inspector made of the code behind it")
+    evidence: list[str] = Field(default_factory=list, description="'path:line: code' that set it off")
+    consent: bool = Field(
+        default=False,
+        description="A data-loss risk the user may accept: picking this model on the dashboard is that consent",
+    )
 
 
 class AnalysisResult(BaseModel):
@@ -59,6 +82,9 @@ class AnalysisResult(BaseModel):
         default_factory=list,
         description="Every service model the code can run on, most preferred first (caas > paas > faas > iaas). "
         "Static sites are wrapped in an nginx container, so they get caas and iaas.",
+    )
+    removed: list[Removal] = Field(
+        default_factory=list, description="Models left out of `service_models`, one entry per reason"
     )
     language: str = Field(description="e.g. 'python', 'node', 'java'")
     framework: str | None = Field(default=None, description="e.g. 'fastapi', 'flask', 'express'")

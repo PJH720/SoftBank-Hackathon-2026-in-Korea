@@ -197,7 +197,7 @@ def test_users_own_database_url_skips_provisioning(tmp_path, monkeypatch, given,
     monkeypatch.setattr(
         deployer,
         "ensure_local_sidecar",
-        lambda app, engine, r, scheme=None: made.append(app) or "postgresql://sidecar/app",
+        lambda app, engine, r, scheme=None: made.append(app) or {"url": "postgresql://sidecar/app"},
     )
     monkeypatch.setattr(deployer, "build_image", lambda *args: None)
     monkeypatch.setattr(deployer, "cleanup_local", lambda handles, **kw: [])

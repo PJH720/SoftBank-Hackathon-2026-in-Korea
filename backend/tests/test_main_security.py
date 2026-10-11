@@ -17,7 +17,15 @@ import pytest
 from fastapi import HTTPException
 
 from app.accounts import LOCAL_ADMIN
-from app.schemas import AnalysisResult, DeployRequest, DeployResult, EnvInput, EnvRequirement, HealReport
+from app.schemas import (
+    AnalysisResult,
+    DeployRequest,
+    DeployResult,
+    EnvInput,
+    EnvRequirement,
+    HealReport,
+    Removal,
+)
 
 # handlers are called directly here, so pass the caller the auth middleware would have set
 ADMIN = SimpleNamespace(state=SimpleNamespace(user=LOCAL_ADMIN))
@@ -1183,15 +1191,19 @@ def test_without_ask_env_nothing_is_asked_or_injected(m, tmp_path, monkeypatch):
         return await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
 
     assert asyncio.run(scenario())["status"] == "completed"
-    assert calls == [{"db_owner": m._source_identity(str(source))}]  # no env values, only whose DB it is
+    # no env values; the stores list is empty because the user typed nothing for a store
+    assert calls == [
+        {"stores": [], "db_owner": m._source_identity(str(source))}
+    ]  # no env values, only whose DB it is
 
 
 def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
     source, routes = _ask_env_setup(m, tmp_path, monkeypatch, lambda *a, **k: None)
     (source / "app.py").write_text('import os\nDB = os.environ["DATABASE_URL"]\n')
     required = [
-        EnvRequirement(name="DATABASE_URL", scope="runtime", secret=True, resource="postgres"),
-        EnvRequirement(name="REDIS_URL", scope="runtime", secret=True, resource="redis"),
+        EnvRequirement(name="DATABASE_URL", scope="runtime", secret=True, resource="postgres", role="url"),
+        EnvRequirement(name="REDIS_URL", scope="runtime", secret=True, resource="redis", role="url"),
+        EnvRequirement(name="KAFKA_BROKERS", scope="runtime", secret=False, resource="other", role="url"),
     ]
     monkeypatch.setattr(
         m.analyzer,
@@ -1214,7 +1226,12 @@ def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
 
     items = asyncio.run(scenario())
     # only Postgres is provisioned when left blank; Redis is not, so the card must not promise it
-    assert [(i["name"], i["auto"]) for i in items] == [("DATABASE_URL", True), ("REDIS_URL", False)]
+    # local makes Postgres and Redis sidecars when left blank; nobody makes Kafka, so the card must not promise it
+    assert [(i["name"], i["auto"]) for i in items] == [
+        ("DATABASE_URL", True),
+        ("REDIS_URL", True),
+        ("KAFKA_BROKERS", False),
+    ]
 
 
 def test_redeploying_an_app_locally_removes_the_container_it_replaces(m, tmp_path, monkeypatch):
@@ -1335,9 +1352,62 @@ def test_held_back_pick_asks_and_choosing_it_is_consent(m, tmp_path, monkeypatch
     events = _events(routes, deployment_id)
     asked = next(d["payload"] for e, d in events if e == "input_required")
     assert asked["items"] == [] and asked["choose_target"]["options"] == ["local", "cloudrun"]
-    assert asked["choose_target"]["held_back"] is True and asked["choose_target"]["risks"] == [risk]
+    assert asked["choose_target"]["held_back"] is True
     lines = [d["payload"].get("line", "") for e, d in events if e == "log"]
     assert "target: cloudrun (위험을 알고 고름)" in lines
+
+
+SQLITE = Removal(
+    model="caas",
+    reason="SQLite 파일이 재시작·재배포 때 사라집니다",
+    ai="데모용 DB입니다",
+    evidence=["app.py:3: sqlite3.connect('app.db')"],
+    consent=True,
+)
+GPU = Removal(
+    model="caas", reason="GPU는 가상 서버에서만 쓸 수 있습니다", evidence=["app.py:1: import torch"]
+)
+
+
+def test_removed_place_is_asked_with_reasons_even_without_a_decision(m, tmp_path, monkeypatch):
+    analysis = AnalysisResult(
+        target="local", language="python", dockerfile="FROM scratch\n", removed=[SQLITE]
+    )
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, None)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=[], ask_env=True)
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        job = m._jobs[deployment_id]
+        await _until(lambda: job.state == "waiting_input")
+        await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(targets=["cloudrun"]), ADMIN)
+        await _until(lambda: job.completed)
+        return deployment_id
+
+    deployment_id = asyncio.run(scenario())
+    assert deployed == ["cloudrun"]
+    events = _events(routes, deployment_id)
+    asked = next(d["payload"] for e, d in events if e == "input_required")["choose_target"]
+    assert asked["held_back"] is True and asked["removed"] == {"cloudrun": [SQLITE.model_dump()]}
+    lines = [d["payload"].get("line", "") for e, d in events if e == "log"]
+    assert "target: cloudrun (위험을 알고 고름)" in lines
+
+
+def test_place_removed_for_a_hard_limit_is_not_asked(m, tmp_path, monkeypatch):
+    analysis = AnalysisResult(
+        target="local", language="python", dockerfile="FROM scratch\n", removed=[SQLITE, GPU]
+    )
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, None)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=[], ask_env=True)
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        await _until(lambda: m._jobs[deployment_id].completed)
+        return deployment_id
+
+    deployment_id = asyncio.run(scenario())
+    assert deployed == ["local"]  # 동의로 풀 수 있는 곳이 없으니 묻지 않는다 (원터치)
+    assert not any(e == "input_required" for e, _ in _events(routes, deployment_id))
 
 
 def test_push_deploy_with_no_targets_takes_the_safe_pick(m, tmp_path, monkeypatch):
@@ -1370,22 +1440,26 @@ def test_resources_become_deployer_options(m):
     assert new["database"] == "postgres" and new["env"] == {"SECRET_KEY": "k"}  # the deployer makes one
     project["resources"] = {"postgres": {"mode": "none"}}
     off = m._apply_resources("gb", project, {"env": {"DATABASE_URL": "postgresql://old"}})
-    assert off == {"database": None}  # nothing injected, nothing provisioned
+    assert off == {"skip_stores": ("postgres",)}  # nothing injected, nothing provisioned
     m._resource_secrets.clear()  # the user's own URL was lost (restart, no Secret Manager)
     project["resources"] = {"postgres": {"mode": "url"}}
-    assert m._apply_resources("gb", project, {}) == {"database": None}  # not a fresh DB in its place
+    assert m._apply_resources("gb", project, {}) == {
+        "skip_stores": ("postgres",)
+    }  # not a fresh DB in its place
 
 
 def test_detaching_redis_or_mysql_keeps_the_deployer_from_adding_its_own(m):
     """The deployer attaches Redis/MySQL sidecars by itself; a detach on the dashboard must win over that."""
     project = {"analysis": {"stores": {"redis": "REDIS_URL", "mysql": "DATABASE_URL"}}}
     project["resources"] = {"redis": {"mode": "none"}}
-    assert m._apply_resources("q", project, {"env": {"REDIS_URL": "redis://old"}}) == {"cache": False}
+    assert m._apply_resources("q", project, {"env": {"REDIS_URL": "redis://old"}}) == {
+        "skip_stores": ("redis",)
+    }
     project["resources"] = {"mysql": {"mode": "none"}}
-    assert m._apply_resources("q", project, {}) == {"database": None}
+    assert m._apply_resources("q", project, {}) == {"skip_stores": ("mysql",)}
     m._resource_secrets.clear()
     project["resources"] = {"redis": {"mode": "url"}}  # the user's own Redis address was lost
-    assert m._apply_resources("q", project, {}) == {"cache": False}
+    assert m._apply_resources("q", project, {}) == {"skip_stores": ("redis",)}
 
 
 def _dashboard(m, monkeypatch, project):
@@ -1482,18 +1556,35 @@ def test_move_takes_the_old_place_down_only_after_the_new_one_is_up(m, tmp_path,
     assert any(line.startswith("move: local 내림") for line in lines)
 
 
-def test_provisioned_env_follows_the_targets(tmp_path):
+def test_auto_follows_what_every_target_can_make():
     from app import deployer
 
-    (tmp_path / "app.py").write_text("import os\nos.environ['DATABASE_URL']\nos.environ['REDIS_URL']\n")
-    (tmp_path / "requirements.txt").write_text("pymysql\nredis\n")
     cfg = deployer.Config()
-    # MySQL and Redis come from sidecars: promised on local/node only
-    assert deployer.provisioned_env(tmp_path, ["local", "node"], cfg) == {"DATABASE_URL", "REDIS_URL"}
-    assert deployer.provisioned_env(tmp_path, ["local", "cloudrun"], cfg) == set()
-    (tmp_path / "requirements.txt").write_text("psycopg\n")
-    assert deployer.provisioned_env(tmp_path, ["cloudrun"], cfg) == {"DATABASE_URL"}
-    assert deployer.provisioned_env(tmp_path, ["function"], cfg) == set()
+    # sidecars make every kind on local/node; cloudrun makes Postgres (Cloud SQL) only; function nothing
+    assert all(
+        deployer.provisionable(k, ["local", "node"], cfg)
+        for k in ("postgres", "mysql", "redis", "mongodb", "s3")
+    )
+    assert deployer.provisionable("postgres", ["local", "cloudrun"], cfg)
+    assert not deployer.provisionable("mysql", ["local", "cloudrun"], cfg)
+    assert not deployer.provisionable("postgres", ["function"], cfg)
+    assert not deployer.provisionable("other", ["local"], cfg)
+    assert not deployer.provisionable("redis", ["local"], deployer.Config(cache=False))
+    assert not deployer.provisionable("postgres", ["local"], deployer.Config(database=None))
+    assert not deployer.provisionable("mysql", ["local"], deployer.Config(skip_stores=("mysql",)))
+
+
+def test_only_stores_left_entirely_blank_go_to_the_deployer(m):
+    req = [
+        EnvRequirement(name="DB_HOST", scope="runtime", secret=False, resource="mysql", role="host"),
+        EnvRequirement(name="DB_PASSWORD", scope="runtime", secret=True, resource="mysql", role="password"),
+        EnvRequirement(name="REDIS_URL", scope="runtime", secret=True, resource="redis", role="url"),
+        EnvRequirement(name="API_KEY", scope="runtime", secret=True),
+    ]
+    options = m._env_overrides(req, {"DB_HOST": "db.example", "API_KEY": "k"})
+    # a value for one MySQL setting means the user's own server: none of MySQL is provisioned
+    assert [e.name for e in options["stores"]] == ["REDIS_URL"]
+    assert options["env"] == {"DB_HOST": "db.example", "API_KEY": "k"}
 
 
 @pytest.mark.parametrize(

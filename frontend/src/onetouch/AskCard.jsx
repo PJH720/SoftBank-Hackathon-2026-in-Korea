@@ -37,7 +37,10 @@ export default function AskCard({ request, onSubmit }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const decided = choose?.decision;
-  const consenting = choose?.held_back && decided && target === decided.target;
+  // place -> why the analyzer took it off; a reason without `consent` is a hard limit, so the place can't be picked
+  const removed = choose?.removed || {};
+  const blocked = (t) => (removed[t] || []).some((r) => !r.consent);
+  const consenting = Boolean(removed[target]?.length) || (choose?.held_back && decided && target === decided.target);
 
   const send = async () => {
     setBusy(true);
@@ -62,25 +65,27 @@ export default function AskCard({ request, onSubmit }) {
       {choose && (
         <div className="mt-4">
           <p className="mb-2 text-sm font-semibold text-slate-100">어디에 올릴까요?</p>
-          {choose.held_back && decided && (
+          {choose.held_back && (
             <div className="mb-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-[12px] leading-5 text-amber-100">
-              <p className="flex items-center gap-1.5 font-semibold"><AlertTriangle className="h-4 w-4" /> AI는 {josa(SERVICE_NAME[decided.service], '을', '를')} 추천했어요</p>
-              <p className="mt-1">그런데 아래 이유로 데이터가 사라질 수 있어서, 안전하게 <b>{josa(PLACES[choose.recommended]?.name || choose.recommended, '을', '를')}</b> 먼저 골라 뒀어요.</p>
-              <ul className="mt-1.5 list-disc space-y-0.5 pl-4 text-amber-100/90">
-                {choose.risks.map((r) => <li key={r}>{r.replace(/^동의를 받지 못해 위험으로 두었습니다: /, '').replace(/^서버리스 컨테이너로는 갈 수 없어 local\(Docker\)에 배포합니다: /, '')}</li>)}
-              </ul>
-              <p className="mt-1.5">데이터가 사라져도 괜찮다면 {josa(PLACES[decided.target]?.name || decided.target, '을', '를')} 골라도 돼요. 고르시면 이 위험에 동의한 걸로 볼게요.</p>
+              <p className="flex items-center gap-1.5 font-semibold">
+                <AlertTriangle className="h-4 w-4" />
+                {decided && decided.target !== choose.recommended ? `AI는 ${josa(SERVICE_NAME[decided.service], '을', '를')} 추천했어요` : '데이터가 사라질 수 있는 곳이 있어요'}
+              </p>
+              <p className="mt-1">그래서 안전하게 <b>{josa(PLACES[choose.recommended]?.name || choose.recommended, '을', '를')}</b> 먼저 골라 뒀어요. 왜 위험한지와 그렇게 본 코드는 아래 카드에 적어 뒀어요.</p>
+              <p className="mt-1.5">데이터가 사라져도 괜찮다면 다른 곳을 골라도 돼요. 고르시면 이 위험에 동의한 걸로 볼게요.</p>
             </div>
           )}
           <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="올릴 곳">
             {choose.options.map((t) => {
               const place = PLACES[t] || { name: t, tech: t, short: '' };
               const on = target === t;
+              const off = blocked(t);
+              const pick = () => { if (!off) setTarget(t); };
               return (
                 // a div, not a button: the "?" explanation inside is a button of its own
-                <div key={t} role="radio" aria-checked={on} tabIndex={0} onClick={() => setTarget(t)}
-                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setTarget(t); } }}
-                  className={`cursor-pointer rounded-xl border p-3 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 ${on ? 'border-violet-400/60 bg-violet-500/10' : 'border-white/10 hover:border-white/25'}`}>
+                <div key={t} role="radio" aria-checked={on} aria-disabled={off} tabIndex={off ? -1 : 0} onClick={pick}
+                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } }}
+                  className={`rounded-xl border p-3 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 ${off ? 'cursor-not-allowed border-white/5 opacity-60' : on ? 'cursor-pointer border-violet-400/60 bg-violet-500/10' : 'cursor-pointer border-white/10 hover:border-white/25'}`}>
                   <span className="flex items-center gap-1.5 text-[13px] font-semibold text-white">
                     <Explain term={place.name} text={place.explain}>{place.name}</Explain>
                     <span className="font-normal text-slate-500">· {place.tech}</span>
@@ -88,6 +93,25 @@ export default function AskCard({ request, onSubmit }) {
                     {decided && t === decided.target && t !== choose.recommended && <span className="ml-auto rounded-md bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-200">AI 추천</span>}
                   </span>
                   <span className="mt-0.5 block text-[12px] text-slate-400">{place.short}</span>
+                  {removed[t] && (
+                    <ul className="mt-2 space-y-1.5 border-t border-white/5 pt-2 text-[12px] leading-5">
+                      <li className={`inline-block rounded-md px-1.5 py-0.5 text-[10px] ${off ? 'bg-slate-500/15 text-slate-300' : 'bg-amber-500/15 text-amber-200'}`}>
+                        {off ? '갈 수 없어요' : '데이터가 사라질 수 있어요'}
+                      </li>
+                      {removed[t].map((r, i) => (
+                        <li key={i}>
+                          <span className={r.consent ? 'text-amber-100' : 'text-slate-300'}>{r.reason}</span>
+                          {r.ai && <span className="block text-slate-400">AI 판단: {r.ai}</span>}
+                          {r.evidence?.length > 0 && (
+                            <details className="mt-0.5" onClick={(e) => e.stopPropagation()}>
+                              <summary className="cursor-pointer text-[11px] text-slate-500 hover:text-slate-300">그렇게 본 코드 {r.evidence.length}줄</summary>
+                              {r.evidence.map((line) => <span key={line} className="block truncate font-mono text-[11px] text-slate-500" title={line}>{line}</span>)}
+                            </details>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
               );
             })}
