@@ -1,5 +1,5 @@
 // Thin client for the CloudMorph backend. Same-origin: the Vite dev server (and the demo tunnel)
-// proxy /deploy, /health, /fleet, /projects, /auth and /webhook to FastAPI, so no base URL and no CORS.
+// proxy /deploy, /health, /fleet, /projects and /webhook to FastAPI, so no base URL and no CORS.
 const TOKEN_KEY = 'cloudmorph.apiToken'
 
 export const getToken = () => localStorage.getItem(TOKEN_KEY) || ''
@@ -46,6 +46,33 @@ export async function getAuthConfig() {
   return res?.ok ? res.json() : { signup_code: false }
 }
 
+async function post(path, body) {
+  const res = await fetch(path, { method: 'POST', headers: headers(), body: JSON.stringify(body || {}) })
+  if (!res.ok) {
+    const text = await res.text()
+    let detail = text
+    try { detail = JSON.parse(text).detail || text } catch { /* not JSON */ }
+    throw new Error(typeof detail === 'string' ? detail.slice(0, 300) : `${res.status}`)
+  }
+  return res.json()
+}
+
+/** What the incident guard sees and did: { guard, health, incidents }. */
+export async function getIncidents() {
+  const res = await fetch('/incidents', { headers: headers() })
+  if (!res.ok) return null
+  return res.json()
+}
+
+/** Disaster drill: kind = crash | db_down | outage. */
+export const drill = (name, kind) => post(`/projects/${encodeURIComponent(name)}/drill`, { kind })
+/** Drag & drop: { kind: postgres|mysql|redis, mode: new|url|none, url? } -> { deployment_id, warning } */
+export const setResource = (name, body) => post(`/projects/${encodeURIComponent(name)}/resources`, body)
+/** Run the app somewhere else, then take the old place down. */
+export const moveProject = (name, to) => post(`/projects/${encodeURIComponent(name)}/move`, { to })
+/** Answer input_required with values and, when asked, where to deploy. */
+export const submitAnswers = (id, values, targets) => post(`/deploy/${id}/env`, targets ? { values, targets } : { values })
+
 export async function startDeploy({ source, targets, name, ref }) {
   // ask_env: pause after analysis and ask for the values the code needs (EnvRequestCard answers)
   const body = { source, targets, ask_env: true, ...(name ? { name } : {}), ...(ref ? { ref } : {}) }
@@ -54,7 +81,7 @@ export async function startDeploy({ source, targets, name, ref }) {
   return (await res.json()).deployment_id
 }
 
-/** Answer the healer's question after it opened a source-fix PR: 'stop' or 'continue'. */
+/** Answer the healer's question (asked before any PR): 'continue' (PR + deploy), 'pr_only' or 'stop'. */
 export async function answerQuestion(id, questionId, choice) {
   const res = await fetch(`/deploy/${id}/answer`, { method: 'POST', headers: headers(), body: JSON.stringify({ question_id: questionId, choice }) })
   if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)

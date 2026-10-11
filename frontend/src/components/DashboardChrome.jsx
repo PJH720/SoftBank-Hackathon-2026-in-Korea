@@ -1,5 +1,5 @@
 import React from 'react';
-import { Boxes, Cloud, ExternalLink, LayoutGrid, Maximize, Minimize, Play, Rocket, Settings2, Sparkles, Square, Terminal, LogOut } from 'lucide-react';
+import { Boxes, Cloud, ExternalLink, LayoutGrid, LogOut, Maximize, Minimize, MousePointerClick, Play, Rocket, Settings2, Sparkles, Square, Terminal } from 'lucide-react';
 import { TARGET_META, stepStatus } from '../lib/run';
 import { activeStepLabel, liveEndpoints, pendingInput, recentKeyLogs } from '../lib/dashboard';
 import { fmtDur, fmtTime } from '../lib/style';
@@ -33,6 +33,10 @@ export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, 
         ))}
       </div>
       <div className="header-actions">
+        <a className="dashboard-button" href="#/deploy" title="원터치 배포 · 서버 지도 · 장애 대응">
+          <MousePointerClick size={14} aria-hidden="true" />
+          <span>원터치</span>
+        </a>
         <button
           type="button"
           className={`dashboard-button ${demoMode ? 'primary' : ''}`}

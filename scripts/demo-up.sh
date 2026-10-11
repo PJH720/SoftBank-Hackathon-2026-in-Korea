@@ -17,7 +17,18 @@ die() { printf '\033[1;31m[demo] %s\033[0m\n' "$*" >&2; exit 1; }
 # ---- preflight ---------------------------------------------------------------
 [[ -f "$ROOT/.env" ]] || die ".env not found. cp .env.example .env and fill GCP_PROJECT_ID / ANTHROPIC_API_KEY"
 set -a; source "$ROOT/.env"; set +a
-[[ -n "${ANTHROPIC_API_KEY:-}" ]] || die "ANTHROPIC_API_KEY is empty in .env (analyzer needs it; OPENAI_API_KEY alone is not enough)"
+# clef-flash: the 1-second service pick and the fast analyzer (CLEF=0 to skip; first run pulls ~12 GB)
+if [[ "${CLEF:-1}" != "0" && -z "${CLEF_BASE_URL:-}" ]]; then
+  "$ROOT/scripts/clef-up.sh" | tee "$STATE/clef.log" || true
+  line="$(tail -n 1 "$STATE/clef.log")"
+  [[ "$line" == CLEF_BASE_URL=* ]] && export CLEF_BASE_URL="${line#CLEF_BASE_URL=}"
+fi
+if [[ -n "${CLEF_BASE_URL:-}" ]]; then
+  say "clef-flash ok: $CLEF_BASE_URL (analysis in seconds)"
+else
+  say "WARNING: clef-flash is off -> the analyzer uses the Claude inspectors (~1.5 min per repo)"
+fi
+[[ -n "${ANTHROPIC_API_KEY:-}" || -n "${CLEF_BASE_URL:-}" ]] || die "no analyzer: set ANTHROPIC_API_KEY in .env or run scripts/clef-up.sh"
 command -v docker >/dev/null || die "docker not installed"
 docker info >/dev/null 2>&1 || die "Docker daemon not running (start Docker Desktop)"
 command -v uv >/dev/null || die "uv not installed"

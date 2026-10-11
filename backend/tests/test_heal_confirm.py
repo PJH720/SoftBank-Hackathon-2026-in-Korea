@@ -1,4 +1,5 @@
-"""Source fix -> PR -> ask the user (main.source_fix_confirm, POST /deploy/{id}/answer) and fixpr against a fake GitHub."""
+"""Source fix -> ask the user -> only then a PR (main.source_fix_confirm, POST /deploy/{id}/answer), and fixpr
+against a fake GitHub."""
 
 from __future__ import annotations
 
@@ -35,67 +36,96 @@ def _payloads(events, kind):
     return [e.payload for e in events if e.payload.get("kind") == kind]
 
 
-def test_stop_keeps_the_pr_and_tells_the_user_to_merge(monkeypatch):
-    job, events, confirm = _confirm(monkeypatch)
-    _answer_when_asked(job, "stop")
+def _never_open(*_):
+    pytest.fail("no PR may be opened before (or without) the user's consent")
+
+
+def test_the_question_comes_before_any_pr(monkeypatch):
+    opened = []
+
+    def pr(*args):
+        assert _payloads(events, "question"), "asked first"
+        opened.append(args)
+        return "https://github.com/acme/shop/pull/7"
+
+    job, events, confirm = _confirm(monkeypatch, pr=pr)
+    _answer_when_asked(job, "pr_only")
 
     stop = confirm("/src", FIX)
 
     (question,) = _payloads(events, "question")
-    assert question["ask"] and question["pr_url"] == "https://github.com/acme/shop/pull/7"
+    assert question["ask"] and question["pr_url"] is None and question["can_pr"]
+    assert question["choices"] == ["continue", "pr_only", "stop"]
     assert question["diff"] == FIX.source_diff and question["rationale"] == FIX.rationale
-    assert _payloads(events, "answer")[0]["choice"] == "stop"
-    assert "pull/7" in stop and "Merge it" in stop
+    (answer,) = _payloads(events, "answer")
+    assert answer["choice"] == "pr_only" and answer["pr_url"] == "https://github.com/acme/shop/pull/7"
+    assert len(opened) == 1 and "pull/7" in stop and "Merge it" in stop
     assert job.questions == {}
 
 
-def test_continue_redeploys_and_later_targets_reuse_the_answer(monkeypatch):
+def test_stop_opens_no_pr_and_deploys_nothing(monkeypatch):
+    job, events, confirm = _confirm(monkeypatch, pr=_never_open)
+    _answer_when_asked(job, "stop")
+    stop = confirm("/src", FIX)
+    assert _payloads(events, "answer")[0]["pr_url"] is None and "Apply the diff" in stop
+
+
+def test_continue_opens_the_pr_then_redeploys_and_later_targets_reuse_the_answer(monkeypatch):
     opened = []
     job, events, confirm = _confirm(monkeypatch, pr=lambda *a: opened.append(a) or "https://x/pull/1")
     _answer_when_asked(job, "continue")
 
     assert confirm("/src-local", FIX) is None
-    assert confirm("/src-cloudrun", FIX) is None  # second target: no second PR, no second question
+    assert confirm("/src-cloudrun", FIX) is None  # same change on the second target: no second question
     assert len(opened) == 1 and len(_payloads(events, "question")) == 1
     assert opened[0][1:4] == (None, "/src-local", ["app.py"])
+    assert _payloads(events, "answer")[0]["pr_url"] == "https://x/pull/1"
+    _answer_when_asked(job, "stop")  # a different change is asked again, even after "continue"
+    other = FIX._replace(source_diff="--- Dockerfile (before)\n+++ Dockerfile (after)\n+EXPOSE 8080\n")
+    assert confirm("/src-local", other)
+    assert len(_payloads(events, "question")) == 2 and len(opened) == 1
 
 
-def test_github_push_stops_without_asking(monkeypatch):
-    job, events, confirm = _confirm(monkeypatch, trigger="github-push")
+@pytest.mark.parametrize("trigger", ["github-push", "guard"])
+def test_unattended_deploys_propose_a_pr_and_stop(monkeypatch, trigger):
+    job, events, confirm = _confirm(monkeypatch, trigger=trigger)
     stop = confirm("/src", FIX)
     assert not _payloads(events, "question")[0]["ask"] and job.questions == {}
-    assert _payloads(events, "answer")[0]["reason"] == "github-push"
-    assert "pull/7" in stop
+    answer = _payloads(events, "answer")[0]
+    assert (answer["choice"], answer["reason"]) == ("pr_only", trigger)
+    assert "pull/7" in stop  # the PR review is the consent; nothing was deployed
 
 
-def test_no_answer_times_out_to_stop(monkeypatch):
+def test_no_answer_times_out_to_stop_without_a_pr(monkeypatch):
     monkeypatch.setattr(main, "ANSWER_TIMEOUT_S", 0.05)
-    _job, events, confirm = _confirm(monkeypatch)
+    _job, events, confirm = _confirm(monkeypatch, pr=_never_open)
     assert confirm("/src", FIX)
     assert _payloads(events, "answer")[0] == {
         "kind": "answer",
         "question_id": _payloads(events, "question")[0]["question_id"],
         "choice": "stop",
         "reason": "timeout",
+        "pr_url": None,
+        "pr_error": None,
     }
 
 
 def test_local_source_asks_without_a_pr(monkeypatch):
-    job, events, confirm = _confirm(monkeypatch, source="/home/me/app", pr=lambda *a: pytest.fail("no PR"))
-    _answer_when_asked(job, "stop")
-    stop = confirm("/src", FIX)
-    assert _payloads(events, "question")[0]["pr_url"] is None
-    assert "Apply the diff" in stop
+    job, events, confirm = _confirm(monkeypatch, source="/home/me/app", pr=_never_open)
+    _answer_when_asked(job, "continue")
+    assert confirm("/src", FIX) is None  # consent alone: there is no repository to open a PR on
+    question = _payloads(events, "question")[0]
+    assert not question["can_pr"] and question["choices"] == ["continue", "stop"]
 
 
-def test_pr_failure_still_asks(monkeypatch):
+def test_pr_failure_keeps_the_choice(monkeypatch):
     def broken(*_):
         raise RuntimeError("GITHUB_TOKEN is not set")
 
     job, events, confirm = _confirm(monkeypatch, pr=broken)
     _answer_when_asked(job, "continue")
     assert confirm("/src", FIX) is None
-    assert "GITHUB_TOKEN" in _payloads(events, "question")[0]["pr_error"]
+    assert "GITHUB_TOKEN" in _payloads(events, "answer")[0]["pr_error"]
 
 
 def test_answer_endpoint_delivers_the_choice_once(monkeypatch):
@@ -111,6 +141,11 @@ def test_answer_endpoint_delivers_the_choice_once(monkeypatch):
         assert answers.get_nowait() == "continue"
         assert client.post("/deploy/dep1/answer", json=body).status_code == 409
         assert client.post("/deploy/nope/answer", json=body).status_code == 404
+        job.questions["q2"] = answers
+        assert (
+            client.post("/deploy/dep1/answer", json={"question_id": "q2", "choice": "pr_only"}).status_code
+            == 200
+        )
         bad = {"question_id": "q1", "choice": "maybe"}
         assert client.post("/deploy/dep1/answer", json=bad).status_code == 422
     finally:

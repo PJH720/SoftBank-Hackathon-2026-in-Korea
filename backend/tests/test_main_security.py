@@ -888,7 +888,7 @@ def _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy):
 
 def _events(routes, deployment_id):
     async def collect():
-        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id, ADMIN)
         return [(e["event"], json.loads(e["data"])) async for e in response.body_iterator]
 
     return asyncio.run(collect())
@@ -926,7 +926,11 @@ def test_cancel_kills_the_build_and_skips_the_remaining_targets(m, tmp_path, mon
             await asyncio.sleep(0.001)
         with pytest.raises(m.HTTPException) as late:
             await routes["/deploy/{deployment_id}/cancel"](deployment_id, ADMIN)
-        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id), late.value.status_code
+        return (
+            deployment_id,
+            await routes["/deploy/{deployment_id}"](deployment_id, ADMIN),
+            late.value.status_code,
+        )
 
     deployment_id, status, late = asyncio.run(scenario())
     assert calls == ["local"]  # cloudrun never started
@@ -966,7 +970,7 @@ def test_cancel_stops_the_healer_before_its_next_redeploy(m, tmp_path, monkeypat
         )["deployment_id"]
         while not m._jobs[deployment_id].completed:
             await asyncio.sleep(0.001)
-        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id)
+        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
 
     deployment_id, status = asyncio.run(scenario())
     assert len(calls) == 2
@@ -1014,8 +1018,8 @@ def test_ask_env_waits_for_values_and_heal_redeploys_with_them(m, tmp_path, monk
             await routes["/deploy/{deployment_id}/env"](deployment_id, answer, ADMIN)
         assert again.value.status_code == 409
         await _until(lambda: job.completed)
-        status = await routes["/deploy/{deployment_id}"](deployment_id)
-        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        status = await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id, ADMIN)
         return status, [event async for event in response.body_iterator]
 
     status, events = asyncio.run(scenario())
@@ -1065,7 +1069,7 @@ def test_named_app_keeps_its_values_across_redeploys_and_push(m, tmp_path, monke
             await _until(lambda: job.state == "waiting_input")
             await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(values=answer), ADMIN)
         await _until(lambda: job.completed)
-        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id, ADMIN)
         events = [event async for event in response.body_iterator]
         return [
             [i["name"] for i in json.loads(e["data"])["payload"]["items"]]
@@ -1151,7 +1155,7 @@ def test_ask_env_gives_up_when_nobody_answers(m, tmp_path, monkeypatch):
         request = DeployRequest(source=str(source), targets=["local"], ask_env=True)
         deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
         await _until(lambda: m._jobs[deployment_id].completed)
-        return await routes["/deploy/{deployment_id}"](deployment_id)
+        return await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
 
     status = asyncio.run(scenario())
     assert status["status"] == "failed" and status["error"].startswith("TimeoutError")
@@ -1176,7 +1180,7 @@ def test_without_ask_env_nothing_is_asked_or_injected(m, tmp_path, monkeypatch):
                 deployment_id, EnvInput(values={"API_KEY": "x"}), ADMIN
             )
         assert not_waiting.value.status_code == 409
-        return await routes["/deploy/{deployment_id}"](deployment_id)
+        return await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
 
     assert asyncio.run(scenario())["status"] == "completed"
     assert calls == [{}]
@@ -1202,7 +1206,7 @@ def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
         deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
         job = m._jobs[deployment_id]
         await _until(lambda: job.state == "waiting_input")
-        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id, ADMIN)
         async for event in response.body_iterator:
             if event["event"] == "input_required":
                 job.env_ready.set()  # let the worker finish
@@ -1211,3 +1215,256 @@ def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
     items = asyncio.run(scenario())
     # only Postgres is provisioned when left blank; Redis is not, so the card must not promise it
     assert [(i["name"], i["auto"]) for i in items] == [("DATABASE_URL", True), ("REDIS_URL", False)]
+
+
+def test_redeploying_an_app_locally_removes_the_container_it_replaces(m, tmp_path, monkeypatch):
+    """Each deploy builds in a fresh work dir, so the deployer cannot clean up the previous container itself."""
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(target="local", language="python", dockerfile="FROM x\n"),
+    )
+    monkeypatch.setattr(
+        m.deployer,
+        "deploy",
+        lambda d, f, t, **kw: DeployResult(success=True, target=t, exit_code=0, url="http://127.0.0.1:1"),
+    )
+    names = iter(["gb-local-1", "gb-local-2"])
+    monkeypatch.setattr(
+        m.deployer, "last_handles", lambda d: {"container_name": next(names), "db_container": "gb-db"}
+    )
+    removed = []
+    monkeypatch.setattr(m.deployer, "cleanup_local", lambda handles, **kw: removed.append(handles) or [])
+    original_mkdtemp = m.tempfile.mkdtemp
+    monkeypatch.setattr(m.tempfile, "mkdtemp", lambda *a, **kw: original_mkdtemp(dir=tmp_path, **kw))
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+
+    async def deploy_twice():
+        for _ in range(2):
+            deployment_id = (
+                await routes["/deploy"](
+                    DeployRequest(source=str(source), targets=["local"], name="gb"), ADMIN
+                )
+            )["deployment_id"]
+            job = m._jobs[deployment_id]
+            await _until(lambda job=job: job.completed)
+
+    asyncio.run(deploy_twice())
+    assert removed == [{"container_name": "gb-local-1", "db_container": "gb-db"}]  # the first one, once
+    assert m._projects["gb"]["live"]["local"]["container_name"] == "gb-local-2"
+
+
+# ---------- targets=[]: CloudMorph picks where to deploy ----------
+
+
+def _pick_setup(m, tmp_path, monkeypatch, analysis, decision):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    deployed = []
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        deployed.append(target)
+        return DeployResult(success=True, target=target, exit_code=0, url=f"https://{target}.example")
+
+    monkeypatch.setattr(m.analyzer, "analyze", lambda _: analysis)
+    monkeypatch.setattr(m.analyzer, "quick_decision", lambda _: decision)
+    monkeypatch.setattr(m.deployer, "deploy", fake_deploy)
+    monkeypatch.setattr(m.deployer, "last_handles", lambda d: {})
+    monkeypatch.setattr(m.nodepool, "load_registry", lambda: type("R", (), {"nodes": []})())
+    original_mkdtemp = m.tempfile.mkdtemp
+    monkeypatch.setattr(m.tempfile, "mkdtemp", lambda *a, **kw: original_mkdtemp(dir=tmp_path, **kw))
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+    return source, routes, deployed
+
+
+DECISION = {
+    "service": "serverless_container",
+    "target": "cloudrun",
+    "ms": 450,
+    "label": "Cloud Run",
+}
+
+
+def test_one_touch_deploys_to_the_pick_without_asking(m, tmp_path, monkeypatch):
+    analysis = AnalysisResult(target="cloudrun", language="python", dockerfile="FROM scratch\n")
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, DECISION)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=[], ask_env=True, name="one")
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        await _until(lambda: m._jobs[deployment_id].completed)
+        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
+
+    deployment_id, status = asyncio.run(scenario())
+    assert deployed == ["cloudrun"] and status["status"] == "completed"
+    assert status["targets"]["cloudrun"]["url"] == "https://cloudrun.example"
+    events = _events(routes, deployment_id)
+    assert not any(e == "input_required" for e, _ in events)
+    decision = next(d["payload"] for e, d in events if d["payload"].get("kind") == "decision")
+    assert decision["target"] == "cloudrun" and decision["ms"] == 450
+    assert m._projects["one"]["targets"] == ["cloudrun"]
+
+
+def test_held_back_pick_asks_and_choosing_it_is_consent(m, tmp_path, monkeypatch):
+    risk = "서버리스 컨테이너로는 갈 수 없어 local(Docker)에 배포합니다: SQLite 파일이 재시작·재배포 때 사라집니다"
+    analysis = AnalysisResult(target="local", language="python", dockerfile="FROM scratch\n", notes=[risk])
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, DECISION)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=[], ask_env=True)
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        job = m._jobs[deployment_id]
+        await _until(lambda: job.state == "waiting_input")
+        assert deployed == []
+        with pytest.raises(HTTPException) as bad:
+            await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(targets=["function"]), ADMIN)
+        assert bad.value.status_code == 422
+        answer = await routes["/deploy/{deployment_id}/env"](
+            deployment_id, EnvInput(targets=["cloudrun"]), ADMIN
+        )
+        assert answer == {"accepted": [], "targets": ["cloudrun"]}
+        await _until(lambda: job.completed)
+        return deployment_id
+
+    deployment_id = asyncio.run(scenario())
+    assert deployed == ["cloudrun"]
+    events = _events(routes, deployment_id)
+    asked = next(d["payload"] for e, d in events if e == "input_required")
+    assert asked["items"] == [] and asked["choose_target"]["options"] == ["local", "cloudrun"]
+    assert asked["choose_target"]["held_back"] is True and asked["choose_target"]["risks"] == [risk]
+    lines = [d["payload"].get("line", "") for e, d in events if e == "log"]
+    assert "target: cloudrun (위험을 알고 고름)" in lines
+
+
+def test_push_deploy_with_no_targets_takes_the_safe_pick(m, tmp_path, monkeypatch):
+    analysis = AnalysisResult(target="local", language="python", dockerfile="FROM scratch\n")
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, DECISION)
+
+    async def scenario():
+        deployment_id = (await routes["/deploy"](DeployRequest(source=str(source), targets=[]), ADMIN))[
+            "deployment_id"
+        ]
+        await _until(lambda: m._jobs[deployment_id].completed)
+
+    asyncio.run(scenario())
+    assert deployed == ["local"]  # nobody to ask: the analyzer's (safe) target, not the decision's
+
+
+# ---------- dashboard: drag & drop resources, move local <-> cloud ----------
+
+
+def test_resources_become_deployer_options(m):
+    project = {"analysis": {"stores": {"postgres": "DATABASE_URL"}}}
+    m._resource_secrets["gb"] = {"DATABASE_URL": "postgresql://me:pw@db.example:5432/gb"}
+    saved = {"env": {"DATABASE_URL": "postgresql://old", "SECRET_KEY": "k"}}
+    project["resources"] = {"postgres": {"mode": "url"}}
+    assert m._apply_resources("gb", project, dict(saved))["env"]["DATABASE_URL"].endswith(
+        "db.example:5432/gb"
+    )
+    project["resources"] = {"postgres": {"mode": "new"}}
+    new = m._apply_resources("gb", project, dict(saved))
+    assert new["database"] == "postgres" and new["env"] == {"SECRET_KEY": "k"}  # the deployer makes one
+    project["resources"] = {"postgres": {"mode": "none"}}
+    off = m._apply_resources("gb", project, {"env": {"DATABASE_URL": "postgresql://old"}})
+    assert off == {"database": None}  # nothing injected, nothing provisioned
+    m._resource_secrets.clear()  # the user's own URL was lost (restart, no Secret Manager)
+    project["resources"] = {"postgres": {"mode": "url"}}
+    assert m._apply_resources("gb", project, {}) == {"database": None}  # not a fresh DB in its place
+
+
+def _dashboard(m, monkeypatch, project):
+    m._projects[project["name"]] = project
+    launched = []
+
+    def fake_launch(source, targets, **kw):
+        launched.append((source, targets, kw))
+        return "dep-1"
+
+    monkeypatch.setattr(m.app.state, "launch", fake_launch)
+    monkeypatch.setattr(m, "_save_projects", lambda: None)
+    routes = {(r.path, tuple(r.methods)): r.endpoint for r in m.app.routes if hasattr(r, "endpoint")}
+    return launched, lambda path: next(e for (p, _), e in routes.items() if p == path)
+
+
+def test_drag_and_drop_postgres_redeploys_where_the_app_runs(m, monkeypatch):
+    project = {
+        "name": "gb",
+        "source": "https://github.com/o/gb",
+        "ref": None,
+        "last_status": "completed",
+        "live": {"local": {"container_name": "c"}},
+        "analysis": {"stores": {"postgres": "DATABASE_URL"}},
+    }
+    launched, route = _dashboard(m, monkeypatch, project)
+    attach = route("/projects/{name}/resources")
+    out = asyncio.run(attach("gb", m.ResourceRequest(kind="postgres", mode="new"), ADMIN))
+    assert out["deployment_id"] == "dep-1" and out["warning"] is None
+    assert project["resources"] == {"postgres": {"mode": "new", "var": "DATABASE_URL"}}
+    ((source, targets, kw),) = launched
+    assert source == project["source"] and targets == ["local"] and kw["trigger"] == "resources"
+    with pytest.raises(HTTPException) as bad:
+        asyncio.run(attach("gb", m.ResourceRequest(kind="postgres", mode="url", url="not a url"), ADMIN))
+    assert bad.value.status_code == 422
+    out = asyncio.run(
+        attach("gb", m.ResourceRequest(kind="redis", mode="url", url="redis://cache:6379/0"), ADMIN)
+    )
+    assert "REDIS_URL를 읽는 곳을 찾지 못했어요" in out["warning"]  # honest: this app never reads it
+    assert "redis://cache" not in json.dumps(project)  # the URL is a secret: memory / Secret Manager only
+    project["last_status"] = "running"
+    with pytest.raises(HTTPException) as busy:
+        asyncio.run(attach("gb", m.ResourceRequest(kind="postgres", mode="none"), ADMIN))
+    assert busy.value.status_code == 409
+
+
+def test_move_deploys_to_the_new_place_and_retires_the_old_one(m, monkeypatch):
+    project = {
+        "name": "gb",
+        "source": "/src",
+        "ref": None,
+        "last_status": "completed",
+        "live": {"local": {"container_name": "c"}},
+    }
+    launched, route = _dashboard(m, monkeypatch, project)
+    move = route("/projects/{name}/move")
+    out = asyncio.run(move("gb", m.MoveRequest(to="cloudrun"), ADMIN))
+    assert out == {"name": "gb", "to": "cloudrun", "retire": ["local"], "deployment_id": "dep-1"}
+    ((_, targets, kw),) = launched
+    assert targets == ["cloudrun"] and kw["retire"] == ["local"] and kw["trigger"] == "move"
+    with pytest.raises(HTTPException) as same:
+        asyncio.run(move("gb", m.MoveRequest(to="local"), ADMIN))  # it already runs there and nowhere else
+    assert same.value.status_code == 409
+
+
+def test_move_takes_the_old_place_down_only_after_the_new_one_is_up(m, tmp_path, monkeypatch):
+    analysis = AnalysisResult(target="local", language="python", dockerfile="FROM scratch\n")
+    source, routes, deployed = _pick_setup(m, tmp_path, monkeypatch, analysis, None)
+    torn = []
+    monkeypatch.setattr(
+        m.deployer, "teardown", lambda target, handles: torn.append((target, handles)) or ["gone"]
+    )
+    m._projects["gb"] = {
+        "name": "gb",
+        "source": str(source),
+        "ref": None,
+        "history": [],
+        "last_status": "completed",
+        "live": {"local": {"container_name": "old"}},
+        "urls": {"local": "http://127.0.0.1:1"},
+    }
+
+    async def scenario():
+        deployment_id = m.app.state.launch(
+            str(source), ["cloudrun"], name="gb", trigger="move", retire=["local"]
+        )
+        await _until(lambda: m._jobs[deployment_id].completed)
+        return deployment_id
+
+    deployment_id = asyncio.run(scenario())
+    assert deployed == ["cloudrun"] and torn == [("local", {"container_name": "old"})]
+    assert list(m._projects["gb"]["live"]) == ["cloudrun"] and "local" not in m._projects["gb"]["urls"]
+    lines = [d["payload"].get("line", "") for e, d in _events(routes, deployment_id) if e == "log"]
+    assert any(line.startswith("move: local 내림") for line in lines)

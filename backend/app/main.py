@@ -49,7 +49,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from app import accounts, agents, analyzer, deployer, env_store, fixpr, healer, users, webhooks
+from app import accounts, agents, analyzer, deployer, env_store, fixpr, healer, incident, users, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
 from app.accounts import User
@@ -110,7 +110,7 @@ _LOCAL_SOURCE_DENY_ROOTS = tuple(
 _logger = logging.getLogger(__name__)
 # API token guard: every path under these prefixes needs a token (admin or per-user, see accounts.py).
 # /health and the GitHub webhooks (HMAC-verified on their own) stay open.
-PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects", "/agent")
+PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects", "/incidents", "/agent")
 # "testclient" is Starlette TestClient's client host; ASGI servers only ever report IPs here.
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 _PROXY_HEADERS = ("cf-connecting-ip", "x-forwarded-for", "forwarded")
@@ -159,6 +159,8 @@ class Job:
     required_env: list[EnvRequirement] = field(default_factory=list)
     env_values: dict[str, str] | None = None
     env_ready: threading.Event = field(default_factory=threading.Event)
+    target_options: list[str] = field(default_factory=list)  # offered when CloudMorph picks the target
+    env_targets: list[str] | None = None
 
 
 _jobs: dict[str, Job] = {}
@@ -496,14 +498,20 @@ def _remove_workspace(path: Path) -> None:
         _logger.warning("Could not remove completed Cloud Run workspace %s", path, exc_info=True)
 
 
-ANSWER_TIMEOUT_S = 300  # no answer by then -> stop; the PR stays open
+ANSWER_TIMEOUT_S = 300  # no answer by then -> stop, and no PR is opened
 
 
 class AnswerRequest(BaseModel):
     """POST /deploy/{deployment_id}/answer body."""
 
     question_id: str
-    choice: Literal["stop", "continue"]
+    choice: Literal["stop", "continue", "pr_only"]
+
+
+class DrillRequest(BaseModel):
+    """POST /projects/{name}/drill body."""
+
+    kind: Literal["crash", "db_down", "outage"]
 
 
 PR_MERGE_HINT = (
@@ -514,25 +522,22 @@ PR_MERGE_HINT = (
 def source_fix_confirm(
     job: Job, emit: Callable[[PipelineEvent], None], source: str, ref: str | None, trigger: str
 ) -> healer.ConfirmFn:
-    """healer's confirm_fn for one job: open a PR with the source fix, then ask the user whether to stop
-    or deploy the edited copy now. Asked once per job; later targets reuse the answer.
-    A GitHub-push deployment has nobody watching, so it stops without asking."""
-    decided: dict = {}
+    """healer's confirm_fn for one job. The user is asked *before* anything touches the repository:
+        continue  open a PR with the fix, then deploy the edited copy now
+        pr_only   open the PR and stop this deployment (merge, then deploy again)
+        stop      no PR, nothing deployed
+    Every *different* change is asked (and gets its own PR); the same change on another target reuses the
+    answer. A deployment nobody watches (GitHub push, the incident guard) cannot ask: it proposes the fix as a
+    PR and stops, so the PR review is the consent."""
+    answered: dict[str, dict] = {}  # source_diff -> {"choice", "pr_url"}
 
     def confirm(src_dir: str, fix: healer.RepoFix) -> str | None:
+        decided = answered.setdefault(fix.source_diff, {})
         if not decided:
-            pr_url = pr_error = None
-            if source.startswith("https://"):
-                try:
-                    pr_url = fixpr.open_pr(
-                        source, ref, src_dir, list(fix.changed), fix.rationale, fix.source_diff
-                    )
-                except Exception as exc:  # no PR still leaves the question
-                    _logger.warning("could not open the fix PR", exc_info=True)
-                    pr_error = f"{type(exc).__name__}: {exc}"
+            can_pr = source.startswith("https://")
             question_id = uuid.uuid4().hex[:12]
             answers: SimpleQueue[str] = SimpleQueue()
-            ask = trigger != "github-push"
+            ask = trigger not in ("github-push", "guard")  # nobody is watching these deployments
             if ask:
                 job.questions[question_id] = answers
             emit(
@@ -543,23 +548,32 @@ def source_fix_confirm(
                         "kind": "question",
                         "question_id": question_id,
                         "ask": ask,
-                        "pr_url": pr_url,
-                        "pr_error": pr_error,
+                        "can_pr": can_pr,
+                        "pr_url": None,
                         "rationale": fix.rationale,
                         "diff": fix.source_diff,
-                        "choices": ["stop", "continue"],
+                        "choices": ["continue", "pr_only", "stop"] if can_pr else ["continue", "stop"],
                         "timeout_s": ANSWER_TIMEOUT_S,
                     },
                 )
             )
-            choice, reason = "stop", "github-push"
+            choice, reason = ("pr_only" if can_pr else "stop"), trigger
             if ask:
                 try:
                     choice, reason = answers.get(timeout=ANSWER_TIMEOUT_S), "user"
                 except Empty:
-                    reason = "timeout"
+                    choice, reason = "stop", "timeout"
                 finally:
                     job.questions.pop(question_id, None)
+            pr_url = pr_error = None
+            if can_pr and choice in ("continue", "pr_only"):  # only after the answer
+                try:
+                    pr_url = fixpr.open_pr(
+                        source, ref, src_dir, list(fix.changed), fix.rationale, fix.source_diff
+                    )
+                except Exception as exc:  # no PR still keeps the user's choice
+                    _logger.warning("could not open the fix PR", exc_info=True)
+                    pr_error = f"{type(exc).__name__}: {exc}"
             decided.update(choice=choice, pr_url=pr_url)
             emit(
                 PipelineEvent(
@@ -570,6 +584,8 @@ def source_fix_confirm(
                         "question_id": question_id,
                         "choice": choice,
                         "reason": reason,
+                        "pr_url": pr_url,
+                        "pr_error": pr_error,
                     },
                 )
             )
@@ -603,6 +619,59 @@ def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> di
     return {k: v for k, v in options.items() if v}
 
 
+# Connection URLs the user typed for an app's resources. Kept in memory and, like env values, in env_store
+# (Secret Manager) when GCP is configured; never in projects.json or in events.
+_resource_secrets: dict[str, dict[str, str]] = {}
+STORE_ENV = {"postgres": "DATABASE_URL", "mysql": "DATABASE_URL", "redis": "REDIS_URL"}
+
+
+class ResourceRequest(BaseModel):
+    """POST /projects/{name}/resources body (the dashboard's drag & drop).
+    new: CloudMorph makes the database (Postgres sidecar on local/node, Cloud SQL on cloudrun);
+    url: connect the user's own server; none: disconnect (the data stays where it is)."""
+
+    kind: Literal["postgres", "mysql", "redis"]
+    mode: Literal["new", "url", "none"]
+    url: str | None = None
+
+
+class MoveRequest(BaseModel):
+    """POST /projects/{name}/move body: run the app somewhere else, then take the old place down."""
+
+    to: DeployTarget
+
+
+def _apply_resources(name: str, project: dict, overrides: dict) -> dict:
+    """Deployer options for the resources the user attached or removed on the dashboard."""
+    resources = project.get("resources") or {}
+    if not resources:
+        return overrides
+    stores = (project.get("analysis") or {}).get("stores") or {}
+    env = dict(overrides.get("env") or {})
+    for kind, setting in resources.items():
+        var = stores.get(kind) or STORE_ENV[kind]
+        mode = setting.get("mode")
+        if mode == "url":
+            if url := _resource_secrets.get(name, {}).get(var) or env.get(var):
+                env[var] = url
+            elif kind == "postgres":
+                # the user's own address is gone (restart without Secret Manager): never quietly swap in a new DB
+                overrides["database"] = None
+        elif mode == "new":
+            env.pop(var, None)  # the deployer makes one and injects DATABASE_URL
+            if kind == "postgres":
+                overrides["database"] = "postgres"
+        elif mode == "none":
+            env.pop(var, None)
+            if kind == "postgres":
+                overrides["database"] = None
+    if env:
+        overrides["env"] = env
+    else:
+        overrides.pop("env", None)
+    return overrides
+
+
 def run_pipeline(
     source: str,
     target: DeployTarget,
@@ -611,9 +680,12 @@ def run_pipeline(
     deploy_fn: Callable[[str, str, DeployTarget], DeployResult] | None = None,
     confirm: healer.ConfirmFn | None = None,
     overrides: dict | None = None,
+    dockerfile_is_source: bool = False,
 ) -> bool:
     """Run one target synchronously; healer owns all retry attempts.
     deploy_fn defaults to deployer.deploy; the "agent" target passes one that runs on the user's machine.
+    `dockerfile_is_source`: the repo brought its own Dockerfile, so a healer patch to it is a code change
+    and goes through `confirm` (ask the user, then a PR) like any other source edit.
     `overrides` (deployer options such as env/build_secrets) apply to the healer's redeploys too."""
     if analysis is None:  # Preserve backward compatibility for direct calls.
         emit(PipelineEvent(type="stage", stage="analyze"))
@@ -638,7 +710,14 @@ def run_pipeline(
         )
     )
     report = healer.heal(
-        source, target, result, analysis.dockerfile, deploy_fn, emit=emit, confirm_fn=confirm
+        source,
+        target,
+        result,
+        analysis.dockerfile,
+        deploy_fn,
+        emit=emit,
+        confirm_fn=confirm,
+        dockerfile_is_source=dockerfile_is_source,
     )
     payload = report.model_dump(mode="json")
     emit(PipelineEvent(type="done" if report.success else "error", payload=payload))
@@ -765,6 +844,66 @@ def create_app() -> FastAPI:
                 float(os.getenv("CLOUDMORPH_FLEET_INTERVAL", "10")), emit=fleet_events.append
             )
 
+    # --- incident response: Jev judges, the guard fixes (app/incident.py) -------------------------
+    def _job_status(deployment_id: str) -> dict | None:
+        job = _jobs.get(deployment_id)
+        return {"completed": job.completed, "targets": dict(job.targets)} if job else None
+
+    def _can_failover(project: dict, target: str) -> str | None:
+        """Where an app can move when its platform is down: the cloud <-> this machine."""
+        if target in ("local", "node") and os.getenv("GCP_PROJECT_ID"):
+            return "cloudrun"
+        if target == "local" and nodepool.load_registry().nodes:
+            return "node"
+        if target in ("cloudrun", "node") and shutil.which("docker"):
+            return "local"
+        return None
+
+    guard_loop: dict = {}
+
+    def _failover(project: dict, target: str) -> str:
+        """Called from the guard thread: start a normal deployment of the same app on `target`."""
+
+        async def launch() -> str:
+            return app.state.launch(
+                project["source"],
+                [target],
+                name=project["name"],
+                ref=project.get("ref"),
+                intro=[f"guard: {project['name']} -> {target} (incident response)"],
+                trigger="guard",
+                owner=project.get("owner", accounts.ADMIN),
+            )
+
+        return asyncio.run_coroutine_threadsafe(launch(), guard_loop["loop"]).result(timeout=30)
+
+    guard = incident.Guard(
+        projects=lambda: list(_projects.values()),
+        busy=lambda name: bool((lock := _app_locks.get(name)) and lock.locked()),
+        failover=_failover,
+        job=_job_status,
+        can_failover=_can_failover,
+    )
+    app.state.guard = guard
+
+    @app.on_event("startup")
+    async def start_guard() -> None:
+        # On by default: every live app is watched. CLOUDMORPH_GUARD=0 turns it off (tests, read-only servers).
+        guard_loop["loop"] = asyncio.get_running_loop()
+        if os.getenv("CLOUDMORPH_GUARD", "1") != "0":
+            guard.start()
+
+    @app.get("/incidents")
+    async def incidents(request: Request) -> dict:
+        """What the guard sees (health per app and target) and what it did (incident timelines).
+        Only the caller's apps (admin: all), like /projects."""
+        snap = await asyncio.to_thread(guard.snapshot)
+        user = _user(request)
+        mine = {name for name, p in _projects.items() if user.owns(p)}
+        snap["health"] = {name: h for name, h in snap["health"].items() if name in mine}
+        snap["incidents"] = [i for i in snap["incidents"] if i.get("app") in mine]
+        return snap
+
     @app.get("/fleet")
     async def fleet_status(request: Request) -> dict:
         """Nodes (with live load), apps, replicas and recent scale events — for the dashboard."""
@@ -815,13 +954,16 @@ def create_app() -> FastAPI:
         trigger: str = "api",
         owner: str = accounts.ADMIN,
         ask_env: bool = False,
+        retire: list[str] | None = None,
     ) -> str:
         """Create a job and run analyze -> deploy -> heal for every target in a worker thread.
         Shared by POST /deploy (user click) and the GitHub webhooks (push).
+        `targets=[]`: CloudMorph picks (the analyzer's target); see _resolve_env for when the user is asked.
+        `retire`: targets to take down once every new target is up (POST /projects/{name}/move).
         An app name belongs to whoever deployed it first; anyone else gets 409 (no admin override either,
         so a shared-secret push can never overwrite a user's service)."""
-        if not targets or len(targets) != len(set(targets)):
-            raise HTTPException(status_code=422, detail="targets must be non-empty and unique")
+        if len(targets) != len(set(targets)):
+            raise HTTPException(status_code=422, detail="targets must be unique")
         if name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
             raise HTTPException(status_code=422, detail="name must match [a-z0-9][a-z0-9-]{0,39}")
         if len(_jobs) >= MAX_JOBS:
@@ -904,6 +1046,9 @@ def create_app() -> FastAPI:
         def _run_locked() -> None:
             with prepare_source(source, ref) as source_dir:
                 emit(PipelineEvent(type="stage", stage="analyze"))
+                # clef-flash picks the service in under a second; the dashboard shows it before the analysis ends
+                if decision := analyzer.quick_decision(source_dir):
+                    emit(PipelineEvent(type="log", stage="analyze", payload={"kind": "decision", **decision}))
                 analysis = analyzer.analyze(source_dir)
                 emit(
                     PipelineEvent(
@@ -917,15 +1062,30 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
-                overrides = _env_overrides(analysis.required_env, _resolve_env(analysis, source_dir))
+                project["analysis"] = {
+                    "target": analysis.target,
+                    "language": analysis.language,
+                    "framework": analysis.framework,
+                    "port": analysis.port,
+                    "service_models": analysis.service_models,
+                    "stores": {e.resource: e.name for e in reversed(analysis.required_env) if e.resource},
+                    "notes": analysis.notes[:6],
+                }
+                project["decision"] = decision
+                values, run_targets = _resolve_env(analysis, source_dir, decision)
+                overrides = _apply_resources(app_name, project, _env_overrides(analysis.required_env, values))
+                for t in run_targets:  # targets=[] (CloudMorph picks): the job learns its targets only now
+                    job.targets.setdefault(t, {"success": None, "url": None})
+                project["targets"] = run_targets
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
                 # the default name is per-deployment unique. Local state is retained for container/tunnel cleanup.
                 work_root = job.work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
                 confirm = source_fix_confirm(job, emit, source, ref, trigger)
+                own_dockerfile = (Path(source_dir) / "Dockerfile").is_file()  # before the deployer writes one
                 try:
-                    for target in targets:
+                    for target in run_targets:
                         target_dir = work_root / f"{app_name}-{target}"
                         try:
                             target_dir = Path(_copy_for_target(source_dir, target_dir))
@@ -938,6 +1098,7 @@ def create_app() -> FastAPI:
                                     overrides=overrides,
                                     deploy_fn=_deploy_fn(target),
                                     confirm=confirm,
+                                    dockerfile_is_source=own_dockerfile,
                                 )
                                 and target != "agent"
                             ):  # the agent's container is on the user's PC
@@ -955,37 +1116,48 @@ def create_app() -> FastAPI:
                             if target == "cloudrun":
                                 _remove_workspace(target_dir)
                 finally:
-                    if "local" not in targets:
+                    if "local" not in run_targets:
                         _remove_workspace(work_root)
 
-        def _resolve_env(analysis: AnalysisResult, source_dir: str) -> dict[str, str]:
-            """Values saved for this app (named deploys only) first; the dashboard is asked only for the rest.
-            A blank runtime secret that may be random gets one, and new values are saved for the next deploy,
-            so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same. Values are kept per
-            name *and* source: another repo deployed under the same name is asked afresh, never handed these."""
-            if not analysis.required_env:
-                return {}
+        def _resolve_env(
+            analysis: AnalysisResult, source_dir: str, decision: dict | None
+        ) -> tuple[dict[str, str], list[str]]:
+            """(env values, targets). Values saved for this app (named deploys only) first; the dashboard is
+            asked only for the rest. A blank runtime secret that may be random gets one, and new values are saved
+            for the next deploy, so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same. Values are
+            kept per name *and* source: another repo deployed under the same name is asked afresh, never handed these.
+
+            targets=[] (CloudMorph picks): the analyzer's target. The dashboard is asked when values are missing,
+            or when the 1-second decision wanted another place that a data-loss risk held back; the card offers the
+            places, and picking the held-back one is the user's consent to that risk. Otherwise nothing is asked
+            (one touch)."""
+            run_targets = list(targets) or [analysis.target]
+            held_back = not targets and bool(decision) and decision.get("target") != analysis.target
+            values: dict[str, str] = {}
+            missing: list[EnvRequirement] = []
             source_id = _source_identity(source)
-            values = env_store.load(app_name, source_id) if name else {}
+            if analysis.required_env:
+                values = env_store.load(app_name, source_id) if name else {}
+                if used := sorted({e.name for e in analysis.required_env if values.get(e.name)}):
+                    emit(
+                        PipelineEvent(
+                            type="log", stage="analyze", payload={"line": f"env: 저장된 값 {', '.join(used)}"}
+                        )
+                    )
+                missing = [e for e in analysis.required_env if not values.get(e.name)]
+                if missing and not ask_env:  # scripts and GitHub push: nobody to ask
+                    lacking = ", ".join(sorted({e.name for e in missing}))
+                    emit(
+                        PipelineEvent(
+                            type="log", stage="analyze", payload={"line": f"env: 저장된 값 없음 {lacking}"}
+                        )
+                    )
             saved = dict(values)
-            if used := sorted({e.name for e in analysis.required_env if values.get(e.name)}):
-                emit(
-                    PipelineEvent(
-                        type="log", stage="analyze", payload={"line": f"env: 저장된 값 {', '.join(used)}"}
-                    )
-                )
-            missing = [e for e in analysis.required_env if not values.get(e.name)]
-            if not missing:
-                return values
-            if not ask_env:  # scripts and GitHub push: nobody to ask
-                lacking = ", ".join(sorted({e.name for e in missing}))
-                emit(
-                    PipelineEvent(
-                        type="log", stage="analyze", payload={"line": f"env: 저장된 값 없음 {lacking}"}
-                    )
-                )
-                return values
-            values |= _ask_env(missing, source_dir)
+            if not ask_env or not (missing or held_back):
+                return values, run_targets
+            answered, chosen = _ask_env(missing, source_dir, analysis, decision, held_back)
+            values |= answered
+            run_targets = chosen or run_targets
             for e in missing:
                 if e.scope == "runtime" and e.generate and not values.get(e.name):
                     values[e.name] = secrets.token_urlsafe(32)
@@ -995,33 +1167,56 @@ def create_app() -> FastAPI:
                 except env_store.EnvStoreError as exc:
                     line = f"env: 값을 저장하지 못해 다음 배포에서 다시 묻습니다 ({exc})"
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
-            return values
+            return values, run_targets
 
-        def _ask_env(items: list[EnvRequirement], source_dir: str) -> dict[str, str]:
+        def _target_question(analysis: AnalysisResult, decision: dict | None, held_back: bool) -> dict:
+            """Places the card offers when CloudMorph picks (targets=[]): the pick first."""
+            options = [analysis.target]
+            if decision:
+                options.append(decision["target"])
+            options += ["cloudrun", "local"]
+            if nodepool.load_registry().nodes:
+                options.append("node")
+            job.target_options = list(dict.fromkeys(options))
+            risk_notes = ("서버리스 컨테이너로는 갈 수 없어", "동의를 받지 못해 위험으로 두었습니다")
+            return {
+                "recommended": analysis.target,
+                "options": job.target_options,
+                "decision": decision,
+                "held_back": held_back,
+                "risks": [n for n in analysis.notes if n.startswith(risk_notes)],
+            }
+
+        def _ask_env(
+            items: list[EnvRequirement],
+            source_dir: str,
+            analysis: AnalysisResult,
+            decision: dict | None,
+            held_back: bool,
+        ) -> tuple[dict[str, str], list[str] | None]:
             """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
-            `auto` marks what the deployer provisions when left blank, so the card can say so honestly."""
+            `auto` marks what the deployer provisions when left blank, so the card can say so honestly.
+            Returns (values, targets the user picked or None)."""
             postgres = deployer.wants_database(Path(source_dir), deployer.Config.from_env()) == "postgres"
             job.required_env = [
                 e.model_copy(update={"auto": True}) if postgres and e.name == "DATABASE_URL" else e
                 for e in items
             ]
+            payload = {
+                "items": [e.model_dump() for e in job.required_env],
+                "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,
+            }
+            if not targets:
+                payload["choose_target"] = _target_question(analysis, decision, held_back)
             job.state = "waiting_input"
-            emit(
-                PipelineEvent(
-                    type="input_required",
-                    stage="analyze",
-                    payload={
-                        "items": [e.model_dump() for e in job.required_env],
-                        "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,
-                    },
-                )
-            )
+            emit(PipelineEvent(type="input_required", stage="analyze", payload=payload))
             if not job.env_ready.wait(ENV_INPUT_TIMEOUT_SECONDS):
                 raise TimeoutError(
                     f"배포에 필요한 값을 {ENV_INPUT_TIMEOUT_SECONDS // 60}분 안에 받지 못해 배포를 멈췄습니다"
                 )
             job.state = "running"
             values, job.env_values = job.env_values or {}, None
+            chosen, job.env_targets = job.env_targets, None
             given = sorted(values)
             emit(
                 PipelineEvent(
@@ -1030,7 +1225,11 @@ def create_app() -> FastAPI:
                     payload={"line": f"env: 입력받은 값 {', '.join(given) if given else '없음'}"},
                 )
             )
-            return values
+            if chosen:
+                consent = held_back and analysis.target not in chosen
+                line = f"target: {', '.join(chosen)} ({'위험을 알고 고름' if consent else '사용자 선택'})"
+                emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
+            return values, chosen
 
         async def worker() -> None:
             job.state = "running"
@@ -1051,6 +1250,14 @@ def create_app() -> FastAPI:
                 job.error = f"{type(exc).__name__}: {exc}"
                 _publish(job, PipelineEvent(type="error", payload={"message": job.error}))
             finally:
+                # A redeploy builds in a fresh work dir, so the deployer cannot see the local container it
+                # replaces; without this, every redeploy of the same app (CD push, dashboard) leaves one running.
+                old, new = (project.get("live") or {}).get("local"), live.get("local")
+                if old and new and old.get("container_name") != new.get("container_name"):
+                    try:
+                        await asyncio.to_thread(deployer.cleanup_local, old)  # keeps the database sidecar
+                    except Exception:  # the new deployment is up; a leftover is not fatal (logged)
+                        _logger.warning("could not remove the replaced local container", exc_info=True)
                 project.update(
                     last_status=job.state,
                     urls={t: v.get("url") for t, v in job.targets.items()},
@@ -1058,11 +1265,27 @@ def create_app() -> FastAPI:
                     live={**project.get("live", {}), **live},
                     updated_at=time.time(),
                 )
+                if retire and job.state == "completed":
+                    await _retire(project, job, retire)
                 _save_projects()
                 _publish(job, None)
 
         asyncio.create_task(worker())
         return deployment_id
+
+    async def _retire(project: dict, job: Job, targets: list[str]) -> None:
+        """After a move: take the old place down (its database is kept, like POST /projects/{name}/stop)."""
+        for target in targets:
+            handles = (project.get("live") or {}).pop(target, None)
+            (project.get("urls") or {}).pop(target, None)
+            if not handles:
+                continue
+            try:
+                done = await asyncio.to_thread(deployer.teardown, target, handles)
+                line = f"move: {target} 내림 ({', '.join(done) or '이미 내려가 있었어요'})"
+            except Exception as exc:  # noqa: BLE001 — the new place is up; report and keep going
+                line = f"move: {target}을(를) 내리지 못했어요 ({type(exc).__name__}: {exc})"
+            _publish(job, PipelineEvent(type="log", payload={"line": line}))
 
     app.state.launch = _launch  # tests swap this for a fake
 
@@ -1087,10 +1310,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown deployment_id")
         if job.state != "waiting_input" or job.env_ready.is_set():
             raise HTTPException(status_code=409, detail="deployment is not waiting for input")
+        if body.targets is not None:
+            picked = list(dict.fromkeys(body.targets))
+            if not picked or not set(picked) <= set(job.target_options):
+                raise HTTPException(status_code=422, detail=f"targets must be among {job.target_options}")
+            job.env_targets = picked
         wanted = {e.name for e in job.required_env}
         job.env_values = {k: v for k, v in body.values.items() if k in wanted and v}
         job.env_ready.set()
-        return {"accepted": sorted(job.env_values)}
+        accepted: dict = {"accepted": sorted(job.env_values)}
+        if job.env_targets:
+            accepted["targets"] = job.env_targets
+        return accepted
 
     @app.get("/projects")
     async def projects(request: Request) -> dict:
@@ -1288,6 +1519,101 @@ def create_app() -> FastAPI:
         finally:
             lock.release()
         return {"name": name, "stopped": stopped, "failed": failed}
+
+    def _redeploy(project: dict, intro: str, trigger: str, targets: list[str], retire=None) -> str:
+        return app.state.launch(
+            project["source"],
+            targets,
+            name=project["name"],
+            ref=project.get("ref"),
+            intro=[intro],
+            trigger=trigger,
+            retire=retire,
+            owner=project.get("owner", accounts.ADMIN),
+        )
+
+    def _idle_project(request: Request, name: str) -> dict:
+        project = _own_project(request, name)
+        if project.get("last_status") == "running" or ((lock := _app_locks.get(name)) and lock.locked()):
+            raise HTTPException(status_code=409, detail="a deployment of this app is in progress")
+        return project
+
+    @app.post("/projects/{name}/resources")
+    async def attach_resource(name: str, body: ResourceRequest, request: Request) -> dict:
+        """Drag & drop: attach a database (new or the user's own URL) or detach it, then redeploy the app
+        where it runs now so the change takes effect. Returns the redeploy's deployment_id."""
+        project = _idle_project(request, name)
+        stores = (project.get("analysis") or {}).get("stores") or {}
+        var = stores.get(body.kind) or STORE_ENV[body.kind]
+        warning = None
+        if (
+            body.mode != "none"
+            and body.kind not in stores
+            and not (body.kind == "postgres" and "DATABASE_URL" in stores.values())
+        ):
+            warning = f"이 앱 코드에서 {var}를 읽는 곳을 찾지 못했어요. 연결해도 앱이 쓰지 않을 수 있어요."
+        if body.mode == "new" and body.kind != "postgres":
+            raise HTTPException(
+                status_code=422,
+                detail="새로 만들 수 있는 건 PostgreSQL이에요. 다른 DB는 주소로 연결해 주세요.",
+            )
+        if body.mode == "url":
+            if not body.url or "://" not in body.url:
+                raise HTTPException(
+                    status_code=422,
+                    detail="접속 주소를 넣어 주세요 (예: postgresql://user:pass@host:5432/db)",
+                )
+            _resource_secrets.setdefault(name, {})[var] = body.url
+            try:
+                saved = env_store.load(name, _source_identity(project["source"]))
+                env_store.save(name, _source_identity(project["source"]), {**saved, var: body.url})
+            except env_store.EnvStoreError:
+                pass  # memory still has it for this server's lifetime
+        project.setdefault("resources", {})[body.kind] = {"mode": body.mode, "var": var}
+        _save_projects()
+        targets = list(project.get("live") or {}) or list(project.get("targets") or [])
+        if not targets:
+            return {
+                "name": name,
+                "resources": project["resources"],
+                "deployment_id": None,
+                "warning": warning,
+            }
+        what = {"new": "새로 만들어 연결", "url": "주소로 연결", "none": "연결 끊기"}[body.mode]
+        deployment_id = _redeploy(project, f"resources: {body.kind} {what} → 다시 배포", "resources", targets)
+        return {
+            "name": name,
+            "resources": project["resources"],
+            "deployment_id": deployment_id,
+            "warning": warning,
+        }
+
+    @app.post("/projects/{name}/move")
+    async def move_project(name: str, body: MoveRequest, request: Request) -> dict:
+        """Local <-> cloud in one step: deploy the same app (same name, saved values) to `to`, and once it is
+        up take the old place down. Its database data does not move with it."""
+        project = _idle_project(request, name)
+        old = [t for t in (project.get("live") or {}) if t != body.to]
+        if body.to in (project.get("live") or {}) and not old:
+            raise HTTPException(status_code=409, detail=f"이미 {body.to}에서 돌아가고 있어요")
+        deployment_id = _redeploy(
+            project, f"move: {', '.join(old) or '-'} → {body.to}", "move", [body.to], old
+        )
+        return {"name": name, "to": body.to, "retire": old, "deployment_id": deployment_id}
+
+    @app.post("/projects/{name}/drill")
+    async def drill(name: str, body: DrillRequest, request: Request) -> dict:
+        """Disaster drill: break a live app on purpose and let the guard notice and recover it.
+        crash = kill the container · db_down = stop its database · outage = pretend its platform is down."""
+        project = _own_project(request, name)
+        if project.get("last_status") == "running":
+            raise HTTPException(status_code=409, detail="a deployment of this app is in progress")
+        try:
+            return await asyncio.to_thread(guard.drill, project, body.kind)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.post("/webhook/github")
     async def github_webhook(request: Request) -> dict:
