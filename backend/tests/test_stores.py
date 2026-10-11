@@ -138,10 +138,27 @@ def test_mount_grants_the_runtime_account_and_never_passes_the_value_as_an_argum
         },
     )
     r = Runner()
-    assert deployer.mount_db_secret("svc", URL, Config(project="p"), r) == "cloudmorph-db-gb_x"
+    assert (
+        deployer.mount_db_secret("svc", URL, Config(project="p", db_secret_mount=True), r)
+        == "cloudmorph-db-gb_x"
+    )
     grant = next(c for c, _ in calls if "add-iam-policy-binding" in c)
     assert "--member=serviceAccount:123456-compute@developer.gserviceaccount.com" in grant
     assert not any("pw@" in part for c, _ in calls for part in c)
+
+
+def test_mount_is_off_unless_each_app_has_its_own_account(monkeypatch):
+    """Apps share DEPLOYER_APP_SERVICE_ACCOUNT: granting it one app's secret would let every app read it."""
+    calls = _gcloud(monkeypatch, {"versions access latest": (0, URL)})
+    assert Config(project="p").db_secret_mount is False
+    assert deployer.mount_db_secret("svc", URL, Config(project="p"), Runner()) is None
+    assert not any("add-iam-policy-binding" in c for c, _ in calls)
+
+
+def test_runtime_account_is_the_app_service_account_deploy_uses(monkeypatch):
+    monkeypatch.setattr(deployer.subprocess, "run", lambda *a, **k: pytest.fail("no lookup needed"))
+    cfg = Config(project="p", app_service_account="cloudmorph-apps")
+    assert deployer._runtime_service_account("svc", cfg) == "cloudmorph-apps@p.iam.gserviceaccount.com"
 
 
 def test_mount_refuses_a_stale_secret(monkeypatch):

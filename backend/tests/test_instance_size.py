@@ -201,3 +201,39 @@ def test_heal_graph_raises_memory_instead_of_stopping_on_a_memoryerror(tmp_path)
         and report.records[0].category == ErrorCategory.OUT_OF_MEMORY
         and 'cloudmorph.memory="1Gi"' in attempts[0]
     )
+
+
+def test_an_oom_kill_is_healed_not_stopped_as_a_silent_crash():
+    """An OOM-killed container exits 137 (SIGKILL) with no traceback: without the OOM category first,
+    healer's needs_human_stop would call it a silent crash and give up."""
+    log = (
+        "[deployer] stage=verify kind=runtime_error target=local\n"
+        "[deployer] instance memory=512Mi\n"
+        "container exited during startup (connection refused); see runtime logs for the traceback\n"
+        "--- error ---\n"
+        "container status=exited exit_code=137 (OOMKilled: the container ran out of memory and exceeded "
+        "its memory limit of 512Mi); connection refused\n"
+        "--- runtime logs ---\n"
+        "loading model weights\n"
+    )
+    assert healer.needs_human_stop(log) is not None  # what would have happened
+    attempts: list[str] = []
+
+    def fake_deploy(src_dir, dockerfile, target):
+        from app.schemas import DeployResult
+
+        attempts.append(dockerfile)
+        return DeployResult(success=True, target=target, exit_code=0, url="http://ok")
+
+    from app.schemas import DeployResult
+
+    failed = DeployResult(success=False, target="local", exit_code=1, stderr=log)
+    report = healer.heal(
+        "/tmp",
+        "local",
+        failed,
+        'FROM python:3.12\nCMD ["python", "app.py"]\n',
+        fake_deploy,
+        llm_patch_fn=lambda *a: None,
+    )
+    assert report.success and 'cloudmorph.memory="1Gi"' in attempts[0]

@@ -168,7 +168,12 @@ class Config:
     cloudsql_tier: str = "db-f1-micro"
     migrate: bool = True  # run the app's schema migrations (alembic, Django, prisma) before it starts
     cache: bool = True  # Redis sidecar (local/node) for an app that reads REDIS_URL
-    db_secret: bool = True  # cloudrun: keep DATABASE_URL in Secret Manager and mount it (env var fallback)
+    db_secret: bool = (
+        True  # cloudrun: keep the Cloud SQL DATABASE_URL in Secret Manager (CloudMorph reads it back)
+    )
+    # ...and mount it into the app instead of a plain env var. Only with one runtime account per app: the
+    # account gets read access to the secret, and apps sharing DEPLOYER_APP_SERVICE_ACCOUNT would read each other's
+    db_secret_mount: bool = False
     db_owner: str | None = None  # where the code comes from (main._source_identity): isolates shared DB names
     # instance size. cpu in vCPUs ("1", "2"), memory like "512Mi"/"1Gi"; None -> platform default.
     # Precedence: detected from dependencies < cpu/memory (env or override) < Dockerfile LABEL cloudmorph.*
@@ -202,6 +207,7 @@ class Config:
             cache=env.get("DEPLOYER_CACHE", "1") not in ("0", "false", "no", ""),
             migrate=env.get("DEPLOYER_MIGRATE", "1") not in ("0", "false", "no", ""),
             db_secret=env.get("DEPLOYER_DB_SECRET", "1") not in ("0", "false", "no", ""),
+            db_secret_mount=env.get("DEPLOYER_DB_SECRET_MOUNT", "0") in ("1", "true", "yes"),
             cloudsql_instance=env.get("CLOUDSQL_INSTANCE", "cloudmorph-pg"),
             app_service_account=env.get("DEPLOYER_APP_SERVICE_ACCOUNT") or None,
             cloudsql_autocreate=env.get("CLOUDSQL_AUTOCREATE", "0") in ("1", "true", "yes"),
@@ -1018,7 +1024,10 @@ def remember_db_url(cfg: Config, r: Runner, dbname: str, url: str) -> bool:
 
 
 def _runtime_service_account(service: str, cfg: Config) -> str | None:
-    """The identity the service runs as: its own, else the project's default compute account."""
+    """The identity the service runs as: DEPLOYER_APP_SERVICE_ACCOUNT (what deploy passes), else the
+    service's own, else the project's default compute account."""
+    if account := cfg.runtime_account():
+        return account
     cp = subprocess.run(
         _gcr(cfg, "services", "describe", service, "--format=value(spec.template.spec.serviceAccountName)"),
         capture_output=True,
@@ -1042,7 +1051,7 @@ def mount_db_secret(service: str, db_url: str, cfg: Config, r: Runner) -> str | 
     None (-> plain env var, as before) when the secret does not hold exactly `db_url` or the service
     account cannot be given access to it."""
     m = _SOCKET_DB.search(db_url)
-    if not cfg.db_secret or not m or read_db_secret(cfg, m.group(1)) != db_url:
+    if not (cfg.db_secret and cfg.db_secret_mount) or not m or read_db_secret(cfg, m.group(1)) != db_url:
         return None
     sid = db_secret_id(m.group(1))
     account = _runtime_service_account(service, cfg)

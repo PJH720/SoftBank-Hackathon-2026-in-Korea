@@ -1376,6 +1376,18 @@ def test_resources_become_deployer_options(m):
     assert m._apply_resources("gb", project, {}) == {"database": None}  # not a fresh DB in its place
 
 
+def test_detaching_redis_or_mysql_keeps_the_deployer_from_adding_its_own(m):
+    """The deployer attaches Redis/MySQL sidecars by itself; a detach on the dashboard must win over that."""
+    project = {"analysis": {"stores": {"redis": "REDIS_URL", "mysql": "DATABASE_URL"}}}
+    project["resources"] = {"redis": {"mode": "none"}}
+    assert m._apply_resources("q", project, {"env": {"REDIS_URL": "redis://old"}}) == {"cache": False}
+    project["resources"] = {"mysql": {"mode": "none"}}
+    assert m._apply_resources("q", project, {}) == {"database": None}
+    m._resource_secrets.clear()
+    project["resources"] = {"redis": {"mode": "url"}}  # the user's own Redis address was lost
+    assert m._apply_resources("q", project, {}) == {"cache": False}
+
+
 def _dashboard(m, monkeypatch, project):
     m._projects[project["name"]] = project
     launched = []
