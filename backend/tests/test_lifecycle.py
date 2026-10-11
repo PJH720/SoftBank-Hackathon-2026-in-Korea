@@ -132,7 +132,7 @@ def test_cloudrun_migration_job_uses_the_service_database_and_identity(monkeypat
         Config(project="p"),
         Runner(),
         conn="p:r:inst",
-        db_secret="cloudmorph-db-gb_x",
+        db_secret=("DATABASE_URL", "cloudmorph-db-gb_x"),
         env={},
     )
     cmd = seen[0]

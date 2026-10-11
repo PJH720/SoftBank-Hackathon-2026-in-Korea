@@ -47,13 +47,14 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from app import nodes as nodepool
-from app.schemas import DeployResult, DeployTarget
+from app.schemas import DeployResult, DeployTarget, EnvRequirement
 from app.storage import write_json
 
 TAIL = 6000  # max chars kept per captured stream
@@ -168,6 +169,10 @@ class Config:
     cloudsql_autocreate: bool = False
     cloudsql_tier: str = "db-f1-micro"
     migrate: bool = True  # run the app's schema migrations (alembic, Django, prisma) before it starts
+    # analyzer's store settings (EnvRequirement) the user left blank: provisioned and filled by role.
+    # None (no analysis, e.g. CLI) -> guess DATABASE_URL / REDIS_URL from the code
+    stores: list | None = None
+    skip_stores: tuple = ()  # kinds not to provision (dashboard detach)
     cache: bool = True  # Redis sidecar (local/node) for an app that reads REDIS_URL
     db_secret: bool = (
         True  # cloudrun: keep the Cloud SQL DATABASE_URL in Secret Manager (CloudMorph reads it back)
@@ -615,8 +620,9 @@ def db_identifier(app: str, owner: str | None) -> str:
     return f"{base[:23]}_{hashlib.sha256(owner.encode()).hexdigest()[:8]}"
 
 
-def ensure_local_sidecar(app: str, engine: str, r: Runner, *, scheme: str | None = None) -> str:
-    """`engine` sidecar `<app>-<suffix>` on the app's local docker network (nodes.SIDECARS); returns its URL.
+def ensure_local_sidecar(app: str, engine: str, r: Runner, *, scheme: str | None = None) -> dict[str, str]:
+    """`engine` sidecar `<app>-<suffix>` on the app's local docker network (nodes.SIDECARS); returns its
+    connection values by role (Sidecar.conn).
     Same script as the node target, run here. Not via Runner: the script carries the password."""
     sc = nodepool.SIDECARS[engine]
     t0 = time.time()
@@ -648,13 +654,11 @@ def ensure_local_sidecar(app: str, engine: str, r: Runner, *, scheme: str | None
     if cp.returncode != 0:
         raise StepError("deploy", "deploy_error", f"{engine} sidecar {app}-{sc.suffix} failed: {err[-800:]}")
     out = cp.stdout.strip()
-    return sc.url.format(
-        scheme=scheme or engine, pw=out.splitlines()[-1] if out else "", host=f"{app}-{sc.suffix}"
-    )
+    return sc.conn(out.splitlines()[-1] if out else "", f"{app}-{sc.suffix}", scheme)
 
 
 def ensure_local_postgres(app: str, r: Runner) -> str:
-    return ensure_local_sidecar(app, "postgres", r, scheme="postgresql")
+    return ensure_local_sidecar(app, "postgres", r)["url"]
 
 
 _REDIS_URL = re.compile(r"\bREDIS_URL\b")
@@ -751,7 +755,7 @@ def migrate_cloudrun(
     r: Runner,
     *,
     conn: str | None,
-    db_secret: str | None,
+    db_secret: tuple[str, str] | None,
     env: dict,
 ) -> None:
     """A Cloud Run job `<service>-migrate` with the new image: same database, same identity as the service.
@@ -785,7 +789,7 @@ def migrate_cloudrun(
         cmd += ["--set-cloudsql-instances", conn]
     if account := _runtime_service_account(service, cfg):
         cmd += ["--service-account", account]
-    cmd += [f"--set-secrets=DATABASE_URL={db_secret}:latest"] if db_secret else ["--clear-secrets"]
+    cmd += [f"--set-secrets={db_secret[0]}={db_secret[1]}:latest"] if db_secret else ["--clear-secrets"]
     with env_vars_file(env) as env_file:
         flags = ["--env-vars-file", env_file] if env_file else []
         cp = r.run("migrate (cloud run job)", cmd + flags, timeout=900, check=False, stage="deploy")
@@ -793,32 +797,153 @@ def migrate_cloudrun(
         raise _migration_failed(argv, cp.stderr + cp.stdout, f"in job {job}; traffic untouched")
 
 
-SIDECAR_TARGETS = {"local", "node"}
+# --------------------------------------------------------------------------- #
+# external stores, filled by role. The analyzer names every connection setting the app reads
+# (EnvRequirement.resource/role/template); main.py passes the stores the user left entirely blank
+# (Config.stores). Each is provisioned where the app runs (sidecars on local/node, Cloud SQL Postgres on
+# cloudrun) and its values go into the env names the app reads. Without an analysis (CLI) the scan above
+# guesses DATABASE_URL / REDIS_URL.
+# --------------------------------------------------------------------------- #
+DB_KINDS = {"postgres", "mysql", "mongodb"}
+STORE_KINDS = {
+    "local": set(nodepool.SIDECARS),
+    "node": set(nodepool.SIDECARS),
+    "cloudrun": {"postgres"},
+    "function": set(),
+}
 
 
-def provisioned_env(src_dir: Path, targets, cfg: Config) -> set[str]:
-    """Env names the deployer fills in on every one of `targets` when the user leaves them blank:
-    DATABASE_URL (Postgres everywhere but function; MySQL on sidecar targets), REDIS_URL (sidecar targets)."""
-    targets, r = set(targets), Runner()
-    names = set()
-    engine = wants_database(src_dir, cfg)
-    if engine and "function" not in targets and (engine == "postgres" or targets <= SIDECAR_TARGETS):
-        names.add("DATABASE_URL")
-    if targets <= SIDECAR_TARGETS and cache_for(src_dir, cfg, r):
-        names.add("REDIS_URL")
-    return names
+def can_provision(kind: str | None, target: str) -> bool:
+    return kind in STORE_KINDS.get(target, set())
 
 
-def _attach_sidecars(src_dir: Path, cfg: Config, r: Runner, out: Outcome, env: dict, ensure) -> None:
-    """DATABASE_URL / REDIS_URL from sidecars (local, node) unless the user gave their own.
-    `ensure(engine, scheme) -> url` starts the sidecar where the app runs."""
+def store_enabled(kind: str | None, cfg: Config) -> bool:
+    """Off: DEPLOYER_DATABASE="" for databases, DEPLOYER_CACHE=0 for Redis, a dashboard detach for any kind."""
+    if not kind or kind in cfg.skip_stores:
+        return False
+    if kind in DB_KINDS:
+        return cfg.database is not None
+    return cfg.cache if kind == "redis" else True
+
+
+def provisionable(kind: str | None, targets, cfg: Config) -> bool:
+    """main.py marks a blank store setting `auto` when every one of `targets` makes its kind."""
+    return store_enabled(kind, cfg) and all(can_provision(kind, t) for t in targets)
+
+
+def _url_setting(kind: str, name: str, template: str | None = None) -> EnvRequirement:
+    return EnvRequirement(
+        name=name, scope="runtime", secret=True, resource=kind, role="url", template=template
+    )
+
+
+def _guessed_stores(src_dir: Path, cfg: Config, r: Runner) -> list[EnvRequirement]:
+    items = []
+    if engine := database_for(src_dir, cfg, r):
+        scheme = url_scheme(src_dir, engine)
+        default = nodepool.SIDECARS[engine].scheme if engine in nodepool.SIDECARS else scheme
+        template = (
+            f"{scheme}://{{user}}:{{password}}@{{host}}:{{port}}/{{database}}" if scheme != default else None
+        )
+        items.append(_url_setting(engine, "DATABASE_URL", template))
+    if cache_for(src_dir, cfg, r):
+        items.append(_url_setting("redis", "REDIS_URL"))
+    return items
+
+
+def _has_database(out: Outcome, env: dict) -> bool:
+    """Something for migrations to run against: a provisioned database or the user's DATABASE_URL."""
+    return "DATABASE_URL" in env or out.handles.get("database") is not None
+
+
+def store_settings(src_dir: Path, cfg: Config, r: Runner) -> dict[str, list[EnvRequirement]]:
+    """kind -> the blank connection settings to fill. A setting the user gave a value is never touched."""
+    if cfg.stores is None:
+        items = _guessed_stores(src_dir, cfg, r)
+    else:
+        items = [e if isinstance(e, EnvRequirement) else EnvRequirement.model_validate(e) for e in cfg.stores]
+        if cfg.database == "postgres" and not any(e.resource in DB_KINDS for e in items):
+            items.append(
+                _url_setting("postgres", "DATABASE_URL")
+            )  # dashboard "new" on an app with no store found
+    by_kind: dict[str, list[EnvRequirement]] = {}
+    for e in items:
+        if e.role and e.name not in cfg.env and store_enabled(e.resource, cfg):
+            by_kind.setdefault(str(e.resource), []).append(e)
+    if by_kind:
+        shown = "; ".join(f"{k}: " + ", ".join(f"{e.name}({e.role})" for e in v) for k, v in by_kind.items())
+        r.steps.append(Step("stores", shown, 0, 0.0, "", ""))
+    return by_kind
+
+
+def render_url(template: str, conn: dict) -> str | None:
+    """Fill the analyzer's URL form ({host} {port} {user} {password} {database}).
+    A Cloud SQL unix socket has no host:port: libpq-style `?host=<dir>` instead (JDBC can't take that -> None)."""
+    socket_dir = conn.get("socket")
+    if socket_dir:
+        if template.startswith("jdbc:"):
+            return None
+        template = re.sub(r"\{host\}(:\{port\})?", "", template)
+    values = {k: urllib.parse.quote(str(conn.get(k) or ""), safe="") for k in ("user", "password")}
+    values |= {k: str(conn.get(k) or "") for k in ("host", "port", "database")}
+    try:
+        url = template.format(**values)
+    except (KeyError, IndexError, ValueError):
+        return None
+    return f"{url}{'&' if '?' in url else '?'}host={socket_dir}" if socket_dir else url
+
+
+def fill_store_env(items: list[EnvRequirement], conn: dict) -> dict[str, str]:
+    """Each setting gets the value of its role, in the env name the app reads; roles the store lacks stay
+    unset. S3 also gets AWS_ENDPOINT_URL_S3, which current AWS SDKs read, so an app with no endpoint setting
+    still reaches the provisioned store."""
+    env = {"AWS_ENDPOINT_URL_S3": conn["endpoint"]} if "endpoint" in conn else {}
+    for e in items:
+        value = render_url(e.template, conn) if e.role == "url" and e.template else conn.get(e.role or "")
+        if value is not None:
+            env[e.name] = value
+    return env
+
+
+def cloudsql_conn(connection: str, url: str) -> dict:
+    """Connection values of ensure_cloudsql_database's URL; host is the socket directory (libpq and
+    node-postgres take a directory as host)."""
+    p, socket_dir = urllib.parse.urlsplit(url), f"/cloudsql/{connection}"
+    return {
+        "url": url,
+        "host": socket_dir,
+        "socket": socket_dir,
+        "port": "5432",
+        "user": p.username,
+        "password": p.password,
+        "database": p.path.lstrip("/"),
+    }
+
+
+def _attach_stores(
+    src_dir: Path, cfg: Config, r: Runner, out: Outcome, env: dict, target: str, ensure
+) -> None:
+    """Sidecars for the blank stores (local, node); `ensure(kind) -> conn` starts one where the app runs.
+    The user's own values (already in `env`) always win."""
     name = slug(src_dir.name)
-    if "DATABASE_URL" not in env and (engine := database_for(src_dir, cfg, r)):
-        env["DATABASE_URL"] = ensure(engine, url_scheme(src_dir, engine))
-        out.handles.update(database=engine, db_container=f"{name}-db")
-    if "REDIS_URL" not in env and cache_for(src_dir, cfg, r) == "redis":
-        env["REDIS_URL"] = ensure("redis", "redis")
-        out.handles.update(cache="redis", cache_container=f"{name}-redis")
+    for kind, items in store_settings(src_dir, cfg, r).items():
+        if not can_provision(kind, target):
+            names = ", ".join(e.name for e in items)
+            out.warnings.append(
+                f"{kind} left blank ({names}): {target} cannot make one; give your own values"
+            )
+            continue
+        for k, v in fill_store_env(items, ensure(kind)).items():
+            env.setdefault(k, v)
+        sc = nodepool.SIDECARS[kind]
+        container = f"{name}-{sc.suffix}"
+        out.handles.setdefault("sidecars", []).append(
+            {"engine": kind, "container": container, "volume": f"{name}-{sc.volume}"}
+        )
+        if kind == "redis":
+            out.handles.update(cache="redis", cache_container=container)
+        elif "db_container" not in out.handles:
+            out.handles.update(database=kind, db_container=container)
 
 
 def _pg_socket_url(serving_url: str | None, name: str, conn: str) -> bool:
@@ -1388,22 +1513,35 @@ def tunnel_registered(log_path: Path, wait: int = 30) -> bool:
 # --------------------------------------------------------------------------- #
 BACKUP_DIR = Path(__file__).resolve().parents[1] / ".cloudmorph" / "backups"
 # run inside the sidecar (its env has the password); Redis is a cache here, so it is not dumped
-_DUMPS = {
-    "postgres": "pg_dump -U app app",
-    "mysql": 'mysqldump -uapp -p"$MYSQL_PASSWORD" --no-tablespaces app',
+_DUMPS = {  # engine -> (command, file extension)
+    "postgres": ("pg_dump -U app app", "sql"),
+    "mysql": ('mysqldump -uapp -p"$MYSQL_PASSWORD" --no-tablespaces app', "sql"),
+    "mongodb": (
+        'mongodump --archive -u app -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin',
+        "archive",
+    ),
+    "s3": ("tar -C /data -cf - .", "tar"),  # the stored objects themselves
 }
 
 
 def sidecars_of(handles: dict) -> list[tuple[str, str, str]]:
     """(engine, container, volume) of the sidecars a deploy attached."""
-    found = []
+    if listed := handles.get("sidecars"):
+        return [(s["engine"], s["container"], s["volume"]) for s in listed]
+    found = []  # state written before every store kind had a sidecar: <app>-db held Postgres or MySQL
+    legacy_volume = {
+        "postgres": ("db", "dbdata"),
+        "mysql": ("db", "mysqldata"),
+        "redis": ("redis", "redisdata"),
+    }
     for key, engine in (
         ("db_container", handles.get("database") or "postgres"),
         ("cache_container", "redis"),
     ):
         if container := handles.get(key):
-            sc = nodepool.SIDECARS.get(engine, nodepool.SIDECARS["postgres"])
-            found.append((sc.engine, container, f"{container.removesuffix('-' + sc.suffix)}-{sc.volume}"))
+            engine = engine if engine in legacy_volume else "postgres"
+            suffix, volume = legacy_volume[engine]
+            found.append((engine, container, f"{container.removesuffix('-' + suffix)}-{volume}"))
     return found
 
 
@@ -1436,10 +1574,11 @@ def drop_local_sidecars(handles: dict) -> list[str]:
             continue
         if engine in _DUMPS:
             subprocess.run(["docker", "start", container], capture_output=True, check=False)
-            dest = backup_path(container)
+            dump, ext = _DUMPS[engine]
+            dest = backup_path(container, ext)
             with dest.open("wb") as f:
                 cp = subprocess.run(
-                    ["docker", "exec", container, "sh", "-c", _DUMPS[engine]],
+                    ["docker", "exec", container, "sh", "-c", dump],
                     stdout=f,
                     stderr=subprocess.PIPE,
                     check=False,
@@ -1547,15 +1686,8 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         out.handles["network"] = network
         r.run("docker network", ["docker", "network", "create", network], check=False)
         env = dict(cfg.env)
-        _attach_sidecars(
-            src_dir,
-            cfg,
-            r,
-            out,
-            env,
-            lambda engine, scheme: ensure_local_sidecar(name, engine, r, scheme=scheme),
-        )
-        if argv := migration_for(src_dir, cfg, r, has_database="DATABASE_URL" in env):
+        _attach_stores(src_dir, cfg, r, out, env, "local", lambda kind: ensure_local_sidecar(name, kind, r))
+        if argv := migration_for(src_dir, cfg, r, has_database=_has_database(out, env)):
             migrate_local(image, argv, env, r, network=network)
         run_cmd = [
             "docker",
@@ -1802,32 +1934,38 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
     )
     env = dict(cfg.env)
     label = owner_label(cfg)
-    db_secret = None
-    if "DATABASE_URL" not in env and (engine := database_for(src_dir, cfg, r)):  # the user's own DB wins
-        if engine != "postgres":
+    db_secret = None  # (env name, secret id) when the URL is mounted instead of a plain env var
+    for kind, items in store_settings(src_dir, cfg, r).items():  # the user's own values win
+        names = ", ".join(e.name for e in items)
+        if kind in ("mysql", "mongodb"):
             raise StepError(
                 "deploy",
                 "user_action_required",
-                f"the app uses {engine}; on cloudrun CloudMorph provisions Cloud SQL for PostgreSQL only. "
-                f"Give DATABASE_URL of your {engine} server, or deploy to local/node (a {engine} sidecar)",
+                f"the app uses {kind} ({names}); on cloudrun CloudMorph provisions Cloud SQL for PostgreSQL "
+                f"only. Give the values of your {kind} server, or deploy to local/node (a {kind} sidecar)",
             )
-        serving_url = _revision_env(prev, "DATABASE_URL", cfg) if prev else None
+        if kind != "postgres":
+            out.warnings.append(
+                f"{kind} left blank ({names}): cloudrun has no {kind} to provision; give a server's values "
+                "or deploy to local/node"
+            )
+            continue
+        plain = next((e.name for e in items if e.role == "url" and not e.template), None)
+        serving_url = _revision_env(prev, plain, cfg) if prev and plain else None
         mine = bool(prev) and service_owner(service, cfg) in (None, label)
         conn, db_url = ensure_cloudsql_database(name, cfg, r, serving_url, adopt_legacy=mine)
         cmd += ["--add-cloudsql-instances", conn]
         out.handles.update(database="cloudsql", cloudsql_connection=conn)
         if m := _SOCKET_DB.search(db_url):
             out.handles["cloudsql_database"] = m.group(1)
-        if db_secret := mount_db_secret(service, db_url, cfg, r):
-            out.handles["db_secret"] = db_secret
+        filled = fill_store_env(items, cloudsql_conn(conn, db_url))
+        if filled == {plain: db_url} and (sid := mount_db_secret(service, db_url, cfg, r)):
+            db_secret = (plain, sid)
+            out.handles["db_secret"] = sid
         else:
-            env["DATABASE_URL"] = db_url
-    if "REDIS_URL" not in env and cache_for(src_dir, cfg, r):
-        out.warnings.append(
-            "the app reads REDIS_URL, but cloudrun has no Redis sidecar; give REDIS_URL of a Redis server "
-            "(Memorystore, Upstash ...) or deploy to local/node"
-        )
-    has_db = bool(db_secret) or "DATABASE_URL" in env
+            for k, v in filled.items():
+                env.setdefault(k, v)
+    has_db = bool(db_secret) or _has_database(out, env)
     if argv := migration_for(src_dir, cfg, r, has_database=has_db):
         migrate_cloudrun(
             service,
@@ -1839,8 +1977,8 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
             db_secret=db_secret,
             env=env,
         )
-    # DATABASE_URL is either a mounted secret or a literal; switching kinds needs the other one cleared
-    cmd += [f"--set-secrets=DATABASE_URL={db_secret}:latest"] if db_secret else ["--clear-secrets"]
+    # the URL is either a mounted secret or a literal; switching kinds needs the other one cleared
+    cmd += [f"--set-secrets={db_secret[0]}={db_secret[1]}:latest"] if db_secret else ["--clear-secrets"]
     if label:
         cmd += ["--update-labels", f"{OWNER_LABEL}={label}"]
     cmd += _cloud_size_flags(src_dir, cfg, r, out, database="cloudsql_connection" in out.handles)
@@ -2023,15 +2161,10 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     t0 = time.time()
     try:
         env = dict(cfg.env)
-        _attach_sidecars(
-            src_dir,
-            cfg,
-            r,
-            out,
-            env,
-            lambda engine, scheme: nodepool.ensure_sidecar(node, name, engine, scheme=scheme),
+        _attach_stores(
+            src_dir, cfg, r, out, env, "node", lambda kind: nodepool.ensure_sidecar(node, name, kind)
         )
-        if argv := migration_for(src_dir, cfg, r, has_database="DATABASE_URL" in env):
+        if argv := migration_for(src_dir, cfg, r, has_database=_has_database(out, env)):
             rc, output = nodepool.run_once(node, image, argv, env, network=nodepool.app_network(name))
             r.steps.append(Step("migrate (remote)", f"ssh {node.name} {' '.join(argv)}", rc, 0.0, "", ""))
             if rc != 0:
@@ -2103,7 +2236,7 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
                     node=node.name, container=cname, host=node.host, port=host_port, provider=node.provider
                 ),
                 str(src_dir),
-                stateful=bool(out.handles.get("database") or out.handles.get("cache")),
+                stateful=bool(out.handles.get("sidecars") or out.handles.get("database")),
                 limits=size.docker_flags(),
             )
             r.steps.append(
@@ -2428,8 +2561,9 @@ def teardown(target: str, handles: dict, *, drop_database: bool = False) -> list
         if drop_database and (sidecars := sidecars_of(handles)):
             node = nodepool.load_registry().get(handles["node"])
             for engine, container, volume in sidecars:
-                dest = backup_path(f"{handles['node']}-{container}") if engine in _DUMPS else None
-                nodepool.drop_sidecar(node, container, volume, _DUMPS.get(engine), dest)
+                dump, ext = _DUMPS.get(engine, (None, ""))
+                dest = backup_path(f"{handles['node']}-{container}", ext) if dump else None
+                nodepool.drop_sidecar(node, container, volume, dump, dest)
                 done += [f"backed up {container} to {dest}"] if dest else []
                 done.append(f"removed {engine} {container} and volume {volume} on {handles['node']}")
         if handles.get("network") and handles.get("node"):
