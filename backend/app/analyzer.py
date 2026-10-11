@@ -32,7 +32,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.schemas import AnalysisResult, EnvRequirement
+from app.schemas import AnalysisResult, EnvRequirement, Removal
 
 DEFAULT_MODEL = "claude-haiku-5-5"
 # 고를 유형 순서와 그 타깃
@@ -127,10 +127,11 @@ def analyze_with(
         why = f"서버리스 컨테이너로는 갈 수 없어 local(Docker)에 배포합니다: {'; '.join(dict.fromkeys(removed[2]))}"
     else:
         why = f"{TYPES[t]} 유형으로 판단해 {targets[t]}에 배포합니다."
-    models = [m for n, m in SERVICE_MODELS.items() if n in candidates]
+    models = ["caas", "iaas"] if t == 5 else [m for n, m in SERVICE_MODELS.items() if n in candidates]
     return AnalysisResult(
         target=targets[t],
-        service_models=["caas", "iaas"] if t == 5 else models,
+        service_models=models,
+        removed=_removals(values, reports, models),
         language=app.language or "unknown",
         framework=app.framework,
         port=port,
@@ -193,6 +194,28 @@ def _required_env(reports: dict) -> list[EnvRequirement]:
         if e["required"] and e["name"] not in used
     ]
     return build + list(stores.values()) + runtime
+
+
+def _removals(values: dict, reports: dict, kept: list[str]) -> list[Removal]:
+    """service_models에서 빠진 모델마다 걸린 규칙 하나씩: 이유, AI가 코드를 본 판단, 근거 줄.
+    데이터 손실 계열(FATAL)은 사용자가 대시보드에서 그 모델의 장소를 고르면 동의한 것으로 보고 풀 수 있다."""
+    out = []
+    for n, model in SERVICE_MODELS.items():
+        if model in kept:
+            continue
+        for when, types, reason, signal in RULES:
+            if n in types and when(values):
+                r = reports[signal]
+                out.append(
+                    Removal(
+                        model=model,
+                        reason=reason,
+                        ai=r["reason"] if r else "검사관이 판정하지 못해 위험으로 두었습니다",
+                        evidence=[f"{h['evidence']}: {h['text']}" for h in r["hits"]] if r else [],
+                        consent=signal in FATAL,
+                    )
+                )
+    return out
 
 
 def _signals(reports: dict) -> tuple[dict, list[str]]:
@@ -340,38 +363,66 @@ FATAL = {
     "scheduler": "요청이 없으면 멈추는 환경에서는 주기 작업이 조용히 실행되지 않습니다",
 }
 
-# (발동 조건, 지울 유형, 이유)
+# (발동 조건, 지울 유형, 이유, 근거를 보여 줄 신호)
 RULES = [
     (
         lambda s: s["is_spa"] == "yes" and s["has_server"] != "yes",
         {1, 2, 3, 4},
         "서버 코드가 없어 정적 호스팅으로 충분합니다",
+        "is_spa",
     ),
-    (lambda s: s["has_server"] == "yes", {5}, "정적 호스팅은 서버 코드를 실행할 수 없습니다"),
-    (lambda s: s["long_running"] == "yes", {1}, "실행 시간 제한이 있고 상주 연결을 유지할 수 없습니다"),
+    (lambda s: s["has_server"] == "yes", {5}, "정적 호스팅은 서버 코드를 실행할 수 없습니다", "has_server"),
+    (
+        lambda s: s["long_running"] == "yes",
+        {1},
+        "실행 시간 제한이 있고 상주 연결을 유지할 수 없습니다",
+        "long_running",
+    ),
     (
         lambda s: s["scheduler"] == "yes",
         {1},
         "요청이 없으면 멈추는 환경이라 프로세스 안의 주기 작업이 돌지 않습니다",
+        "scheduler",
     ),
     (
         lambda s: s["memory_state"] == "yes",
         {1, 2, 3},
         "인스턴스가 여러 대로 늘면 메모리 상태가 갈라지고, 재시작하면 사라집니다",
+        "memory_state",
     ),
-    (lambda s: s["sqlite"] == "yes", {1, 2, 3}, "SQLite 파일이 재시작·재배포 때 사라집니다"),
-    (lambda s: s["file_write"] == "yes", {1, 2, 3}, "로컬 디스크에 쓴 파일이 재시작·재배포 때 사라집니다"),
-    (lambda s: s["gpu"] == "yes", {1, 2, 3, 5}, "GPU는 가상 서버에서만 쓸 수 있습니다"),
-    (lambda s: s["system_packages"] == "yes", {1, 3}, "OS 패키지를 설치할 수 없거나 까다롭습니다"),
-    (lambda s: s["os_windows"] == "yes", {1, 2, 3, 5}, "Windows 전용 코드는 리눅스 환경에서 돌지 않습니다"),
-    (lambda s: s["os_macos"] == "yes", {1, 2, 3, 4, 5}, "macOS 전용 코드는 클라우드에서 돌지 않습니다"),
+    (lambda s: s["sqlite"] == "yes", {1, 2, 3}, "SQLite 파일이 재시작·재배포 때 사라집니다", "sqlite"),
+    (
+        lambda s: s["file_write"] == "yes",
+        {1, 2, 3},
+        "로컬 디스크에 쓴 파일이 재시작·재배포 때 사라집니다",
+        "file_write",
+    ),
+    (lambda s: s["gpu"] == "yes", {1, 2, 3, 5}, "GPU는 가상 서버에서만 쓸 수 있습니다", "gpu"),
+    (
+        lambda s: s["system_packages"] == "yes",
+        {1, 3},
+        "OS 패키지를 설치할 수 없거나 까다롭습니다",
+        "system_packages",
+    ),
+    (
+        lambda s: s["os_windows"] == "yes",
+        {1, 2, 3, 5},
+        "Windows 전용 코드는 리눅스 환경에서 돌지 않습니다",
+        "os_windows",
+    ),
+    (
+        lambda s: s["os_macos"] == "yes",
+        {1, 2, 3, 4, 5},
+        "macOS 전용 코드는 클라우드에서 돌지 않습니다",
+        "os_macos",
+    ),
 ]
 
 
 def apply_rules(values: dict) -> tuple[list, dict]:
     """values: {신호: yes/no/unknown}. (남은 유형, {지운 유형: [이유]})"""
     removed = {}
-    for when, types, reason in RULES:
+    for when, types, reason, _ in RULES:
         if when(values):
             for t in sorted(types):
                 removed.setdefault(t, []).append(reason)

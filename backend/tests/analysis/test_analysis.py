@@ -201,6 +201,37 @@ def test_service_models_the_code_can_run_on(flask_app, found, models):
     assert run(flask_app, answers).service_models == models  # 추천 순서대로, deployer가 지원하는 것을 고른다
 
 
+def test_removed_models_carry_reason_and_evidence(flask_app):
+    r = run(
+        flask_app,
+        {
+            "file_write": SignalReport(value="no", reason="캐시라 잃어도 됩니다", evidence=[FILE_WRITE]),
+            "system_packages": SignalReport(
+                value="yes", reason="ffmpeg", evidence=[ev("app.py:1", "from flask import Flask")]
+            ),
+        },
+    )
+    caas = [x for x in r.removed if x.model == "caas"]
+    assert [(x.reason, x.ai, x.evidence, x.consent) for x in caas] == [
+        (
+            "로컬 디스크에 쓴 파일이 재시작·재배포 때 사라집니다",
+            "캐시라 잃어도 됩니다",
+            ['app.py:9: open("last.json", "w").write("{}")'],
+            True,  # 데이터 손실 계열: 사용자가 고르면 동의
+        )
+    ]
+    paas = {x.reason: x.consent for x in r.removed if x.model == "paas"}
+    assert paas["OS 패키지를 설치할 수 없거나 까다롭습니다"] is False  # 동의로 풀 수 없다
+    assert {x.model for x in r.removed} == {"caas", "paas", "faas"}  # 남은 iaas는 없다
+
+
+def test_removed_without_inspection(flask_app):
+    r = run(flask_app, {"sqlite": RuntimeError("rate limited")})
+    assert {(x.model, x.ai, tuple(x.evidence), x.consent) for x in r.removed} == {
+        (m, "검사관이 판정하지 못해 위험으로 두었습니다", (), True) for m in ("caas", "paas", "faas")
+    }
+
+
 @pytest.mark.parametrize("name, target", [("gpu", "cloudrun"), ("sqlite", "local")])
 def test_risk_without_checked_evidence(flask_app, name, target):
     r = run(flask_app, {name: SignalReport(value="yes", reason="?", evidence=[MADE_UP])})
