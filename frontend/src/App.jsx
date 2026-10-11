@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { answerQuestion, cancelDeploy, getDeployment, getFleet, getHealth, getMe, getProjects, getToken, logOut, setToken, startDeploy, stopProject, submitEnv, subscribe } from './api';
+import { answerQuestion, cancelDeploy, getDeployment, getFleet, getHealth, getMe, getProjects, getToken, getTrafficShadow, logOut, setToken, startDeploy, stopProject, submitEnv, subscribe } from './api';
 import AuthScreen from './components/AuthScreen';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
@@ -53,6 +53,11 @@ export default function App() {
   const projectsRequest = useRef(0);
   const mounted = useRef(true);
   const [fleet, setFleet] = useState(null);
+  const [trafficShadow, setTrafficShadow] = useState(() => ({
+    ownerToken: getToken(),
+    status: 'loading',
+    records: [],
+  }));
   const [healthy, setHealthy] = useState(null);
   const [token, setTokenState] = useState(getToken());
   const [me, setMe] = useState(null);
@@ -277,11 +282,40 @@ export default function App() {
 
   useEffect(() => {
     let alive = true;
-    const poll = async () => { const f = await getFleet().catch(() => null); if (alive) setFleet(f); };
+    let inFlight = false;
+    const poll = async () => {
+      if (!alive || document.visibilityState === 'hidden' || inFlight) return;
+      inFlight = true;
+      try {
+        const [fleetResult, shadowResult] = await Promise.allSettled([getFleet(), getTrafficShadow()]);
+        if (!alive) return;
+        setFleet(fleetResult.status === 'fulfilled' ? fleetResult.value : null);
+        setTrafficShadow(
+          shadowResult.status === 'fulfilled'
+            ? {
+                ownerToken: token,
+                status: 'ready',
+                enabled: shadowResult.value.enabled,
+                records: shadowResult.value.comparisons,
+              }
+            : { ownerToken: token, status: 'error', error: shadowResult.reason, records: [] },
+        );
+      } finally {
+        inFlight = false;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') poll();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
     poll();
     const h = setInterval(poll, 15000);
-    return () => { alive = false; clearInterval(h); };
-  }, []);
+    return () => {
+      alive = false;
+      clearInterval(h);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [token]);
 
   // whose dashboard this is: projects, deployments and CD links are per user
   useEffect(() => {
@@ -444,7 +478,11 @@ export default function App() {
       setRedeploying(null);
     }
   };
-  const saveToken = (v) => { setToken(v); setTokenState(v); };
+  const saveToken = (v) => {
+    setToken(v);
+    setTokenState(v);
+    setTrafficShadow({ ownerToken: v, status: 'loading', records: [] });
+  };
   const onLogout = async () => { await logOut(); saveToken(''); };
   const celebrate = shouldCelebrate(run, dismissedVictoryIds);
 
@@ -502,6 +540,11 @@ export default function App() {
                 onStop={onStop}
                 onNewDeploy={() => setPanel('deploy')}
                 onShowNodes={() => selectScene('fleet')}
+                trafficShadow={
+                  trafficShadow.ownerToken === token
+                    ? trafficShadow
+                    : { status: 'loading', records: [] }
+                }
                 demoMode={demoMode}
                 scenario={demoScenario}
                 setScenario={onSelectDemoScenario}

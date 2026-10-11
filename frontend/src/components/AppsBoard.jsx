@@ -5,6 +5,7 @@ import { Badge, Bar, Dot } from './ui';
 import { STATUS_STYLE, classifyNode, loadRatio } from '../lib/fleetStatus';
 import { sortApps, summarizeApps } from '../lib/operations';
 import { GuideBubble, Mascot } from './Mascot';
+import TrafficShadowPanel from './TrafficShadowPanel';
 import './apps-board.css';
 
 const PERCENT = 100;
@@ -195,7 +196,7 @@ function EmptyState({ projects, projectsState, onNewDeploy, onEnableDemo }) {
 export default function AppsBoard({
   projects, projectsState, fleet, currentRunId, runRunning, highlight, stopping, redeploying,
   autoFollow, setAutoFollow, onOpenLogs, onRedeploy, onStop, onNewDeploy, onShowNodes,
-  demoMode, scenario, setScenario, onEnableDemo,
+  trafficShadow, demoMode, scenario, setScenario, onEnableDemo,
 }) {
   const apps = useMemo(() => sortApps(projects), [projects]);
   const summary = useMemo(() => summarizeApps(projects, fleet), [projects, fleet]);
@@ -268,6 +269,7 @@ export default function AppsBoard({
         </div>
         <NodesPanel fleet={fleet} onShowNodes={onShowNodes} />
       </div>
+      <TrafficShadowPanel state={trafficShadow} />
     </div>
   );
 }

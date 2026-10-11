@@ -1,5 +1,5 @@
 // Thin client for the CloudMorph backend. Same-origin: the Vite dev server (and the demo tunnel)
-// proxy /deploy, /health, /fleet, /projects, /auth and /webhook to FastAPI, so no base URL and no CORS.
+// proxy /deploy, /health, /fleet, /traffic, /projects, /auth and /webhook to FastAPI, so no base URL and no CORS.
 const TOKEN_KEY = 'cloudmorph.apiToken'
 
 export const getToken = () => localStorage.getItem(TOKEN_KEY) || ''
@@ -119,6 +119,45 @@ export const unlinkCd = (name, { githubToken } = {}) =>
 export async function getAgents() {
   const res = await fetch('/agent/status', { headers: headers() })
   return res.ok ? (await res.json()).agents : []
+}
+
+/** Read the caller's bounded, ownership-filtered Fleet Shadow comparisons. */
+export async function getTrafficShadow() {
+  let res
+  try {
+    res = await fetch('/traffic/shadow', { headers: headers() })
+  } catch {
+    const error = new Error('백엔드에 연결할 수 없습니다.')
+    error.kind = 'network'
+    throw error
+  }
+  if (!res.ok) {
+    const isAuth = res.status === 401 || res.status === 403
+    const error = new Error(
+      isAuth
+        ? 'API 토큰이 없거나 유효하지 않습니다.'
+        : res.status === 503
+          ? '서버 인증 설정을 확인해 주세요.'
+          : `Shadow 결과 조회 실패 (${res.status})`,
+    )
+    error.status = res.status
+    error.kind = isAuth ? 'auth' : 'server'
+    throw error
+  }
+  let payload
+  try {
+    payload = await res.json()
+  } catch {
+    const error = new Error('Shadow API 응답 형식이 올바르지 않습니다.')
+    error.kind = 'response'
+    throw error
+  }
+  if (!payload || typeof payload.enabled !== 'boolean' || !Array.isArray(payload.comparisons)) {
+    const error = new Error('Shadow API 응답 형식이 올바르지 않습니다.')
+    error.kind = 'response'
+    throw error
+  }
+  return payload
 }
 
 export async function getProjects() {

@@ -63,6 +63,11 @@ from app.schemas import (
     EnvRequirement,
     PipelineEvent,
 )
+from app.traffic import TrafficMonitor
+from app.traffic_ai import TrafficAIAnalyzer
+from app.traffic_collector import CaddyLogCollector
+from app.traffic_service import TrafficAnalysisService, TrafficIncidentStore
+from app.traffic_shadow import TrafficShadowConfig, TrafficShadowEvaluator, TrafficShadowStore
 
 load_dotenv()
 
@@ -110,7 +115,7 @@ _LOCAL_SOURCE_DENY_ROOTS = tuple(
 _logger = logging.getLogger(__name__)
 # API token guard: every path under these prefixes needs a token (admin or per-user, see accounts.py).
 # /health and the GitHub webhooks (HMAC-verified on their own) stay open.
-PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects", "/agent")
+PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects", "/agent", "/traffic")
 # "testclient" is Starlette TestClient's client host; ASGI servers only ever report IPs here.
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 _PROXY_HEADERS = ("cf-connecting-ip", "x-forwarded-for", "forwarded")
@@ -664,6 +669,22 @@ def _publish(job: Job, event: PipelineEvent | None) -> None:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="CloudMorph", version="0.2.0")
+    traffic_monitor = TrafficMonitor()
+    traffic_collector: CaddyLogCollector | None = None
+    traffic_analysis_service: TrafficAnalysisService | None = None
+    traffic_incidents = TrafficIncidentStore()
+    traffic_shadow_store = TrafficShadowStore()
+    traffic_shadow_evaluator = TrafficShadowEvaluator(
+        traffic_shadow_store,
+        config=TrafficShadowConfig(
+            cpu_hot_percent=fleetmod.CPU_HOT,
+            cpu_cold_percent=fleetmod.CPU_COLD,
+        ),
+    )
+    app.state.traffic_monitor = traffic_monitor
+    app.state.traffic_incidents = traffic_incidents
+    app.state.traffic_shadow = traffic_shadow_store
+    shadow_enabled = os.getenv("CLOUDMORPH_TRAFFIC_SHADOW") == "1"
     origins = [
         x.strip()
         for x in os.getenv("CLOUDMORPH_CORS_ORIGINS", "http://localhost:5173,http://localhost:5174").split(
@@ -757,13 +778,133 @@ def create_app() -> FastAPI:
     # --- node pool / fleet (target "node") -------------------------------------------------------
     fleet_events: deque[dict] = deque(maxlen=200)
 
+    def emit_fleet_row(row: dict) -> None:
+        fleet_events.append(row)
+        if shadow_enabled:
+            try:
+                traffic_shadow_evaluator.observe(row, traffic_monitor)
+            except Exception as exc:  # noqa: BLE001 — optional telemetry must not disrupt Fleet
+                _logger.error("traffic shadow evaluation failed (%s)", type(exc).__name__)
+
     @app.on_event("startup")
-    async def start_fleet_watcher() -> None:
+    async def start_background_services() -> None:
+        nonlocal traffic_collector, traffic_analysis_service
         # Opt-in: CLOUDMORPH_FLEET_WATCH=1 starts the auto scale-out watcher inside the API process.
         if os.getenv("CLOUDMORPH_FLEET_WATCH") == "1" and nodepool.load_registry().nodes:
             fleetmod.start_background_watcher(
-                float(os.getenv("CLOUDMORPH_FLEET_INTERVAL", "10")), emit=fleet_events.append
+                float(os.getenv("CLOUDMORPH_FLEET_INTERVAL", "10")), emit=emit_fleet_row
             )
+        elif shadow_enabled:
+            _logger.error(
+                "traffic shadow is enabled but Fleet watcher is disabled; no comparisons will be recorded"
+            )
+
+        if os.getenv("CLOUDMORPH_TRAFFIC_COLLECTION") == "1":
+            if os.getenv("CLOUDMORPH_TRAFFIC_COLLECTION_SINGLE_INSTANCE") != "1":
+                _logger.error(
+                    "traffic collection disabled: set "
+                    "CLOUDMORPH_TRAFFIC_COLLECTION_SINGLE_INSTANCE=1 only when the "
+                    "backend deployment is constrained to one instance"
+                )
+                return
+            if traffic_collector is not None:
+                if traffic_collector.is_running:
+                    _logger.info("traffic collector is already running; duplicate startup ignored")
+                else:
+                    _logger.warning(
+                        "traffic collector startup skipped because an earlier collector "
+                        "is running, stopping, or failed to acquire the singleton lock"
+                    )
+                return
+            router = nodepool.load_registry().router
+            if router is None:
+                _logger.warning("traffic collection enabled but no Node Pool router is configured")
+            else:
+                traffic_collector = CaddyLogCollector(
+                    router,
+                    traffic_monitor,
+                    interval_seconds=float(os.getenv("CLOUDMORPH_TRAFFIC_INTERVAL", "10")),
+                )
+                if not traffic_collector.start():
+                    _logger.error(
+                        "traffic collection disabled: could not acquire its single-process lock (%s)",
+                        traffic_collector.start_error,
+                    )
+
+        if os.getenv("CLOUDMORPH_TRAFFIC_AI") == "1":
+            if os.getenv("CLOUDMORPH_TRAFFIC_COLLECTION_SINGLE_INSTANCE") != "1":
+                _logger.error(
+                    "traffic AI disabled: set "
+                    "CLOUDMORPH_TRAFFIC_COLLECTION_SINGLE_INSTANCE=1 only when the "
+                    "backend deployment is constrained to one instance"
+                )
+                return
+            if traffic_collector is None or not traffic_collector.is_running:
+                _logger.error(
+                    "traffic AI disabled: the Caddy log collector is not running in this "
+                    "single-instance worker"
+                )
+                return
+            if traffic_analysis_service is not None:
+                if traffic_analysis_service.is_running:
+                    _logger.info("traffic AI scheduler is already running; duplicate startup ignored")
+                else:
+                    _logger.warning(
+                        "traffic AI scheduler startup skipped because an earlier scheduler "
+                        "is stopping or has exited"
+                    )
+                return
+            traffic_analysis_service = TrafficAnalysisService(
+                traffic_monitor,
+                TrafficAIAnalyzer(),
+                traffic_incidents,
+                interval_seconds=float(os.getenv("CLOUDMORPH_TRAFFIC_AI_INTERVAL", "30")),
+            )
+            if not traffic_analysis_service.start():
+                _logger.error(
+                    "traffic AI scheduler could not start (%s)",
+                    traffic_analysis_service.last_error,
+                )
+
+    @app.on_event("shutdown")
+    async def stop_traffic_collection() -> None:
+        if traffic_analysis_service is not None and not traffic_analysis_service.stop():
+            _logger.error("traffic AI workers are still stopping at shutdown")
+        if traffic_collector is not None and not traffic_collector.stop():
+            _logger.error("traffic collector thread is still stopping; singleton lock remains held")
+
+    def owned_traffic_records(request: Request, records):
+        user = _user(request)
+        # Resolve ownership against the current project registry on every request. Missing or
+        # deleted project metadata is not enough to authorize access, even for an admin.
+        return [
+            record
+            for record in records
+            if (project := _projects.get(record.app_id)) is not None and user.owns(project)
+        ]
+
+    @app.get("/traffic/incidents")
+    async def traffic_incident_list(request: Request, limit: int = 100) -> dict:
+        """Return only incidents for projects currently visible to the authenticated user."""
+        try:
+            incidents = traffic_incidents.list(limit=limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        visible = owned_traffic_records(request, incidents)
+        return {"incidents": [incident.model_dump(mode="json") for incident in visible]}
+
+    @app.get("/traffic/shadow")
+    async def traffic_shadow_list(request: Request, limit: int = 100) -> dict:
+        """Return only observation-only comparisons for currently owned projects."""
+        try:
+            records = traffic_shadow_store.list(limit=limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        visible = owned_traffic_records(request, records)
+        return {
+            "enabled": shadow_enabled,
+            "comparisons": [record.model_dump(mode="json") for record in visible],
+        }
 
     @app.get("/fleet")
     async def fleet_status(request: Request) -> dict:
