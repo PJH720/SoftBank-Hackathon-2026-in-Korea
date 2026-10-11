@@ -1,9 +1,10 @@
 import React from 'react';
-import { Boxes, Cloud, ExternalLink, LayoutGrid, Maximize, Minimize, Play, Rocket, Settings2, Sparkles, Square, Terminal, LogOut } from 'lucide-react';
+import { Boxes, Cloud, ExternalLink, LayoutGrid, LogOut, Maximize, Minimize, MousePointerClick, Play, Rocket, Settings2, Sparkles, Square } from 'lucide-react';
 import { TARGET_META, stepStatus } from '../lib/run';
-import { activeStepLabel, liveEndpoints, pendingInput, recentKeyLogs } from '../lib/dashboard';
-import { fmtDur, fmtTime } from '../lib/style';
+import { activeStepLabel, liveEndpoints, pendingInput } from '../lib/dashboard';
+import { fmtDur } from '../lib/style';
 import { Dot } from './ui';
+import LogConsole from './LogConsole';
 
 const STEPS = { analyze: '분석', deploy: '배포', heal: '자가치유', live: '공개 URL' };
 const PHASES = { pending: '대기', deploying: '배포 중', healing: '치유 중', done: '완료', failed: '실패', cancelled: '중단' };
@@ -33,6 +34,10 @@ export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, 
         ))}
       </div>
       <div className="header-actions">
+        <a className="dashboard-button" href="#/deploy" title="원터치 배포 · 서버 지도 · 장애 대응">
+          <MousePointerClick size={14} aria-hidden="true" />
+          <span>원터치</span>
+        </a>
         <button
           type="button"
           className={`dashboard-button ${demoMode ? 'primary' : ''}`}
@@ -85,18 +90,12 @@ export function RunHUD({ run, now, notice, onPanel, onCancel, cancelling, celebr
   );
 }
 
-export function ActivityDock({ run, project, onPanel }) {
-  const logs = recentKeyLogs(run.logs);
+export function ActivityDock({ run, project }) {
   const urls = liveEndpoints(run, project);
   return (
-    <footer className="activity-dock" aria-label="핵심 로그와 공개 URL">
-      <div className="dock-heading"><span><Terminal size={13} />LIVE ACTIVITY</span><button onClick={() => onPanel('details')}>전체 로그 보기</button></div>
-      <ol className="key-logs" aria-live="polite" aria-relevant="additions text">
-        {logs.length === 0 ? <li className="empty-log">새 배포를 눌러 시작하세요. 진행 상황이 이곳에 표시됩니다.</li> : logs.map((log) => (
-          <li key={log.id} data-kind={log.kind}><time>{fmtTime(log.at)}</time><span title={log.text}>{log.text}</span></li>
-        ))}
-      </ol>
+    <section className="activity-dock" aria-label="파이프라인 로그">
+      <LogConsole logs={run.logs} running={run.status === 'running'} height="var(--dock-log-height)" />
       {urls.length > 0 && <div className="live-links">{urls.map(({ target, label, url }) => <a key={target} href={url} target="_blank" rel="noopener noreferrer"><ExternalLink size={12} />{label} 열기</a>)}</div>}
-    </footer>
+    </section>
   );
 }

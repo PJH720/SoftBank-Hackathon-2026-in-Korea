@@ -48,27 +48,66 @@ def test_wants_database_respects_explicit_config(tmp_path):
     assert wants_database(_app(tmp_path / "f", **{"app.py": "DATABASE_URL"}), Config(database=None)) is None
 
 
-@pytest.mark.parametrize("listed, restarted", [("3f2a9c1b\n", True), ("", False)])
-def test_local_postgres_restarts_a_stopped_sidecar_instead_of_recreating_it(monkeypatch, listed, restarted):
-    calls: list[list[str]] = []
+def test_sidecar_script_reuses_a_container_and_resets_only_a_fresh_postgres():
+    script = nodes.sidecar_script(nodes.SIDECARS["postgres"], "todo", "pw123")
+    assert "if docker inspect todo-db >/dev/null 2>&1; then docker start todo-db" in script  # stopped counts
+    assert "-e POSTGRES_PASSWORD=pw123" in script and "postgres:16-alpine" in script
+    # a volume that predates the container gets the new password (old one unknown)
+    assert '[ -n "$fresh" ] && docker exec todo-db sh -c' in script and "ALTER USER app PASSWORD" in script
+    # the password printed is the one the container runs with: an existing sidecar keeps its own
+    assert script.endswith("sed -n 's/^POSTGRES_PASSWORD=//p'")
+    mysql = nodes.sidecar_script(nodes.SIDECARS["mysql"], "todo", "pw")
+    assert "docker volume inspect todo-mysqldata" in mysql and "exit 3" in mysql  # cannot reset: refuse
+
+
+def _sh(monkeypatch, rc=0, out="", err=""):
+    seen: list[list[str]] = []
 
     def fake_run(cmd, **kw):
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, listed if cmd[:2] == ["docker", "ps"] else "", "")
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, rc, out, err)
 
     monkeypatch.setattr(deployer.subprocess, "run", fake_run)
-    url = deployer.ensure_local_postgres("todo", deployer.Runner())
-    assert url == "postgresql://app:app@todo-db:5432/app"
-    assert ["docker", "ps", "-aq", "-f", "name=^todo-db$"] in calls  # stopped containers count as existing
-    assert (["docker", "start", "todo-db"] in calls) is restarted
-    assert any(c[:2] == ["docker", "run"] for c in calls) is not restarted  # same name again -> Conflict
+    return seen
 
 
-def test_node_postgres_restarts_a_stopped_sidecar_instead_of_recreating_it(monkeypatch):
+def test_local_sidecar_url_carries_the_password_the_container_runs_with(monkeypatch):
+    seen = _sh(monkeypatch, out="3f2a9c1b\n")
+    r = deployer.Runner()
+    assert deployer.ensure_local_postgres("todo", r) == "postgresql://app:3f2a9c1b@todo-db:5432/app"
+    assert seen[0][:2] == ["sh", "-c"] and not any("3f2a9c1b" in s.cmd for s in r.steps)  # not in the log
+    _sh(monkeypatch, out="app\n")  # a sidecar from before random passwords keeps working
+    assert deployer.ensure_local_postgres("todo", r) == "postgresql://app:app@todo-db:5432/app"
+    _sh(monkeypatch, out="secret\n")
+    assert (
+        deployer.ensure_local_sidecar("todo", "mysql", r, scheme="mysql+pymysql")
+        == "mysql+pymysql://app:secret@todo-db:3306/app"
+    )
+
+
+def test_local_sidecar_refusal_needs_a_person(monkeypatch):
+    _sh(monkeypatch, rc=3, err="volume todo-mysqldata holds mysql data but its container todo-db is gone")
+    with pytest.raises(deployer.StepError) as exc:
+        deployer.ensure_local_sidecar("todo", "mysql", deployer.Runner())
+    assert exc.value.kind == "user_action_required"
+
+
+def test_node_sidecar_errors_do_not_repeat_the_command(monkeypatch):
     sent: list[str] = []
-    monkeypatch.setattr(nodes, "ssh_text", lambda node, cmd, timeout=60: sent.append(cmd) or "")
-    nodes.ensure_postgres(nodes.Node(name="a", host="10.0.0.2"), "todo")
-    assert "docker start todo-db >/dev/null 2>&1 || docker run -d" in sent[0]
+
+    def fake_ssh(node, cmd, timeout=60, stdin=None):
+        sent.append(cmd)
+        return subprocess.CompletedProcess(cmd, 1, b"", b"postgres sidecar todo-db did not become ready")
+
+    monkeypatch.setattr(nodes, "ssh", fake_ssh)
+    with pytest.raises(RuntimeError) as exc:
+        nodes.ensure_postgres(nodes.Node(name="a", host="10.0.0.2"), "todo")
+    assert "POSTGRES_PASSWORD" in sent[0] and "POSTGRES_PASSWORD" not in str(exc.value)
+    monkeypatch.setattr(nodes, "ssh", lambda *a, **k: subprocess.CompletedProcess(a, 0, b"pw9\n", b""))
+    assert (
+        nodes.ensure_postgres(nodes.Node(name="a", host="1"), "todo")
+        == "postgresql://app:pw9@todo-db:5432/app"
+    )
 
 
 def test_cloudsql_provisioning_builds_unix_socket_url(monkeypatch):
@@ -103,6 +142,58 @@ def test_cloudsql_provisioning_builds_unix_socket_url(monkeypatch):
     assert any(
         c[:4] == ["gcloud", "sql", "databases", "create"] for c in calls
     )  # db did not exist -> created
+
+
+def test_cloudsql_keeps_the_password_the_serving_revision_uses(monkeypatch):
+    """Regression: every deploy reset the password before the candidate passed verify, so the revision
+    still serving traffic (and any rollback target) lost its database connection."""
+
+    class R:
+        def __init__(self):
+            self.steps = []
+
+        def run(self, name, cmd, **kw):
+            class CP:
+                returncode = 0
+                stdout = {
+                    "cloudsql instance": "RUNNABLE p:r:inst\n",
+                    "cloudsql databases": "my_app\n",
+                    "cloudsql users": "my_app\n",
+                }.get(name, "")
+                stderr = ""
+
+            return CP()
+
+    direct: list[list[str]] = []
+    monkeypatch.setattr(
+        deployer.subprocess,
+        "run",
+        lambda cmd, **k: (
+            direct.append(cmd) or type("CP", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        ),
+    )
+    serving = "postgresql://my_app:oldpw@/my_app?host=/cloudsql/p:r:inst"
+    assert deployer.ensure_cloudsql_database("My App", Config(project="p"), R(), serving) == (
+        "p:r:inst",
+        serving,
+    )
+    assert not [c for c in direct if c[:3] == ["gcloud", "sql", "users"]]  # no set-password
+
+    # a URL for another database/instance is not reused
+    _, url = deployer.ensure_cloudsql_database(
+        "My App", Config(project="p"), R(), "postgresql://my_app:x@/my_app?host=/cloudsql/p:r:other"
+    )
+    users = [c for c in direct if c[:3] == ["gcloud", "sql", "users"]]
+    assert "x@" not in url and users[0][:4] == ["gcloud", "sql", "users", "set-password"]
+
+
+def test_revision_env_reads_database_url_without_runner(monkeypatch):
+    out = '{"spec": {"containers": [{"env": [{"name": "A", "value": "1"}, {"name": "DATABASE_URL", "value": "u"}]}]}}'
+    monkeypatch.setattr(
+        deployer.subprocess, "run", lambda cmd, **k: type("CP", (), {"returncode": 0, "stdout": out})()
+    )
+    assert deployer._revision_env("svc-00002-abc", "DATABASE_URL", Config(project="p")) == "u"
+    assert deployer._revision_env("svc-00002-abc", "MISSING", Config(project="p")) is None
 
 
 def test_stateful_apps_never_scale_out(monkeypatch, tmp_path):
@@ -178,3 +269,141 @@ def test_stateful_app_redeploys_to_the_node_that_holds_its_database(monkeypatch,
     )
     assert deployer._pinned_node(reg, "web-node") is None
     del nodes, Metrics
+
+
+def test_mysql_apps_get_mysql_not_a_postgres_url(tmp_path):
+    """Regression: any MySQL driver used to count as Postgres, so MySQL apps were handed postgresql://."""
+    assert detect_database(_app(tmp_path / "a", **{"requirements.txt": "flask\nPyMySQL==1.1"})) == "mysql"
+    assert (
+        detect_database(_app(tmp_path / "b", **{"package.json": '{"dependencies": {"mysql2": "^3"}}'}))
+        == "mysql"
+    )
+    prisma = 'datasource db {\n  provider = "mysql"\n  url = env("DATABASE_URL")\n}'
+    assert detect_database(_app(tmp_path / "c", **{"schema.prisma": prisma})) == "mysql"
+    both = {"requirements.txt": "psycopg[binary]\npymysql"}
+    assert detect_database(_app(tmp_path / "d", **both)) == "postgres"  # Postgres first
+
+
+def test_an_orm_alone_or_a_sqlite_fallback_is_not_a_database(tmp_path):
+    """Regression: `sqlalchemy` alone used to provision Postgres for SQLite apps (no driver -> crash)."""
+    sqlite_fallback = 'import os\nURL = os.getenv("DATABASE_URL", "sqlite:///app.db")'
+    assert (
+        detect_database(_app(tmp_path / "a", **{"app.py": sqlite_fallback, "requirements.txt": "sqlalchemy"}))
+        is None
+    )
+    no_driver = {"app.py": "import os\nURL = os.environ['DATABASE_URL']", "requirements.txt": "sqlalchemy"}
+    engine, why = deployer.scan_database(_app(tmp_path / "b", **no_driver))
+    assert engine is None and "requirements.txt lists no database driver" in why
+    assert detect_database(_app(tmp_path / "c", **{"requirements.txt": "sqlalchemy\nprisma"})) is None
+
+
+def test_lockfiles_and_dependency_folders_are_not_evidence(tmp_path):
+    src = _app(tmp_path, **{"package-lock.json": '{"packages": {"node_modules/pg": {}}, "pg": "1"}'})
+    (src / "node_modules" / "pg").mkdir(parents=True)
+    (src / "node_modules" / "pg" / "index.js").write_text("require('pg')")
+    assert detect_database(src) is None
+
+
+def test_database_names_are_scoped_to_the_source():
+    a, b = (
+        deployer.db_identifier("Demo-App", "git:github.com/a/x"),
+        deployer.db_identifier("Demo-App", "git:github.com/b/x"),
+    )
+    assert a != b and a.startswith("demo_app_") and len(a) <= 32
+    assert deployer.db_identifier("Demo-App", "git:github.com/a/x") == a  # stable across deploys
+    assert deployer.db_identifier("Demo-App", None) == "demo_app"  # pre-owner name kept for direct calls
+    assert len(deployer.db_identifier("x" * 60 + "-cloudrun", "o")) == 32
+
+
+def _cloudsql_runner(dbs: str, users: str):
+    class R:
+        def __init__(self):
+            self.steps = []
+
+        def run(self, name, cmd, **kw):
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                {
+                    "cloudsql instance": "RUNNABLE p:r:inst\n",
+                    "cloudsql databases": dbs,
+                    "cloudsql users": users,
+                }.get(name, ""),
+                "",
+            )
+
+    return R()
+
+
+def test_cloudsql_uses_the_owner_scoped_name(monkeypatch):
+    direct: list[list[str]] = []
+    monkeypatch.setattr(
+        deployer.subprocess,
+        "run",
+        lambda cmd, **k: direct.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+    cfg = Config(project="p", db_owner="git:github.com/a/x")
+    name = deployer.db_identifier("gb-cloudrun", cfg.db_owner)
+    _, url = deployer.ensure_cloudsql_database(
+        "gb-cloudrun", cfg, _cloudsql_runner("gb_cloudrun\n", "gb_cloudrun\n")
+    )
+    assert url.startswith(f"postgresql://{name}:") and url.endswith(f"@/{name}?host=/cloudsql/p:r:inst")
+    users = [c for c in direct if c[:3] == ["gcloud", "sql", "users"]]
+    assert users[0][:5] == ["gcloud", "sql", "users", "create", name]  # never the legacy user
+
+
+def test_a_live_service_keeps_its_pre_owner_database(monkeypatch):
+    """Upgrade path: an app already serving from `<app>` keeps that data instead of starting empty."""
+    monkeypatch.setattr(
+        deployer.subprocess,
+        "run",
+        lambda cmd, **k: (
+            pytest.fail(f"must not touch users: {cmd}")
+            if cmd[:3] == ["gcloud", "sql", "users"]
+            else subprocess.CompletedProcess(cmd, 0, "", "")
+        ),
+    )
+    cfg = Config(project="p", db_owner="git:github.com/a/x")
+    serving = "postgresql://gb_cloudrun:pw@/gb_cloudrun?host=/cloudsql/p:r:inst"
+    runner = _cloudsql_runner("gb_cloudrun\n", "gb_cloudrun\n")
+    assert deployer.ensure_cloudsql_database("gb-cloudrun", cfg, runner, serving, adopt_legacy=True) == (
+        "p:r:inst",
+        serving,
+    )
+    # someone else's live service (labelled with another owner): its database is not handed over
+    monkeypatch.setattr(
+        deployer.subprocess, "run", lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, "", "")
+    )
+    _, url = deployer.ensure_cloudsql_database("gb-cloudrun", cfg, runner, serving, adopt_legacy=False)
+    assert url != serving and "gb_cloudrun_" in url
+
+
+def test_cloudrun_deploy_labels_the_owner_and_records_why_a_db_came(monkeypatch, tmp_path):
+    commands: list[list[str]] = []
+    for fn in ("build_image", "push_image"):
+        monkeypatch.setattr(deployer, fn, lambda *a, **k: None)
+    monkeypatch.setattr(deployer, "serving_revision", lambda *a, **k: None)
+    monkeypatch.setattr(deployer, "latest_revision", lambda *a, **k: "svc-00001-new")
+    monkeypatch.setattr(deployer, "tagged_url", lambda *a, **k: "https://candidate---svc.run.app")
+    monkeypatch.setattr(deployer, "wait_up", lambda *a, **k: (True, "HTTP 200"))
+    monkeypatch.setattr(
+        deployer,
+        "ensure_cloudsql_database",
+        lambda *a, **k: ("p:r:inst", "postgresql://u:p@/d?host=/cloudsql/x"),
+    )
+    monkeypatch.setattr(
+        deployer.Runner,
+        "run",
+        lambda self, name, cmd, **_: (
+            commands.append(cmd) or subprocess.CompletedProcess(cmd, 0, "https://svc", "")
+        ),
+    )
+    src = _app(tmp_path / "gb", **{"requirements.txt": "psycopg[binary]"})
+    cfg = Config(project="p", service="svc", tag="t", skip_preflight=True, db_owner="git:github.com/a/x")
+    r = deployer.Runner()
+    deployer.deploy_cloudrun(src, cfg, r, deployer.Outcome(target="cloudrun"))
+    deploy = next(c for c in commands if "deploy" in c)
+    assert f"{deployer.OWNER_LABEL}={deployer.owner_label(cfg)}" in deploy
+    assert any(
+        s.name == "database" and s.cmd.startswith("postgres (requirements.txt: psycopg") for s in r.steps
+    )

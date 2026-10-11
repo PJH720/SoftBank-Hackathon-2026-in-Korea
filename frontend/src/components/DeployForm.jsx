@@ -52,14 +52,14 @@ export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailab
 
         <div>
           <label className="mb-1.5 block text-xs font-semibold text-slate-300">배포 타깃</label>
-          <div className="grid gap-2">
+          <div className="grid grid-cols-1 gap-2">
             {Object.entries(TARGET_META).map(([t, m]) => {
               const Icon = ICONS[t];
               const on = form.targets[t];
               const disabled = (t === 'node' && !fleetAvailable) || (t === 'agent' && !agentOnline);
               return (
                 <button key={t} type="button" disabled={disabled} onClick={() => toggle(t)}
-                  className={`flex items-center gap-3 rounded-[14px] border px-3.5 py-2.5 text-left transition ${on ? `${TONE[m.tone].border} bg-white/[0.05]` : 'border-[rgba(150,160,215,0.12)] bg-black/20 hover:border-[rgba(150,160,215,0.25)]'} ${disabled ? 'cursor-not-allowed opacity-40' : ''}`}>
+                  className={`flex min-w-0 items-center gap-3 rounded-[14px] border px-3.5 py-2.5 text-left transition ${on ? `${TONE[m.tone].border} bg-white/[0.05]` : 'border-[rgba(150,160,215,0.12)] bg-black/20 hover:border-[rgba(150,160,215,0.25)]'} ${disabled ? 'cursor-not-allowed opacity-40' : ''}`}>
                   <span className={`grid h-8 w-8 place-items-center rounded-lg ${on ? TONE[m.tone].soft : 'bg-white/5 text-slate-500'} ring-1 ring-inset ring-white/10`}><Icon className="h-4 w-4" /></span>
                   <span className="min-w-0 flex-1">
                     <span className={`block text-[13px] font-semibold ${on ? 'text-slate-100' : 'text-slate-400'}`}>{m.label}</span>

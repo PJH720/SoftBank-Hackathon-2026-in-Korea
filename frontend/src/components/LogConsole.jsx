@@ -63,7 +63,7 @@ function Row({ log }) {
   );
 }
 
-export default function LogConsole({ logs, running, height = 460, active = true }) {
+export default function LogConsole({ logs, running, height = 460 }) {
   const [filter, setFilter] = useState('key');
   const [target, setTarget] = useState('all');
   const [follow, setFollow] = useState(true);
@@ -76,7 +76,7 @@ export default function LogConsole({ logs, running, height = 460, active = true 
   }, [logs, filter, target]);
 
   const scrollToEnd = () => { const box = boxRef.current; if (box) box.scrollTop = box.scrollHeight; };
-  useEffect(() => { if (follow && active) scrollToEnd(); }, [shown.length, follow, active]);
+  useEffect(() => { if (follow) scrollToEnd(); }, [shown.length, follow]);
 
   const onScroll = () => {
     const el = boxRef.current;
@@ -113,10 +113,10 @@ export default function LogConsole({ logs, running, height = 460, active = true 
     >
       <div ref={boxRef} onScroll={onScroll} className="overflow-y-auto px-2 py-2" style={{ height }}>
         {shown.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-slate-500">
+          <div className="flex min-h-full flex-col items-center justify-center gap-2 text-center text-sm text-slate-500">
             <Sparkles className="h-6 w-6 text-slate-600" />
             <p>배포를 시작하면 분석 · 빌드 · 자가치유 · 공개 URL 발급 과정이 여기에 실시간으로 흐릅니다.</p>
-            <p className="text-xs text-slate-600">GitHub에 push된 배포는 아래 프로젝트 목록에서 자동으로 따라옵니다.</p>
+            <p className="text-xs text-slate-600">GitHub에 push된 배포는 앱 관리 탭의 프로젝트 목록에서 자동으로 따라옵니다.</p>
           </div>
         ) : (
           shown.map((l) => <Row key={l.id} log={l} />)

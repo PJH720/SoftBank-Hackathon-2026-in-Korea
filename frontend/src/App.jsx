@@ -4,7 +4,6 @@ import AuthScreen from './components/AuthScreen';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
 import EnvRequestCard from './components/EnvRequestCard';
-import LogConsole from './components/LogConsole';
 import { AnalysisCard, Endpoints, PatchList, QuestionCard } from './components/ResultPanels';
 import AppsBoard from './components/AppsBoard';
 import { DashboardHeader, RunHUD, ActivityDock } from './components/DashboardChrome';
@@ -80,7 +79,6 @@ export default function App() {
   const [lookingUpLogs, setLookingUpLogs] = useState(false);
   const lookupLock = useRef(null);
   const lookupVersion = useRef(0);
-  const [logsRequest, setLogsRequest] = useState(null);
   const closeRef = useRef(null);
   const seenDeployments = useRef(null);
   const [now, setNow] = useState(() => Date.now());
@@ -394,11 +392,8 @@ export default function App() {
 
   const runRunning = run.status === 'running';
 
-  const openLogPanel = () => {
-    setActiveScene('journey');
-    setPanel('details');
-    setLogsRequest({});
-  };
+  // The pipeline log is docked under the journey scene, so showing it needs no modal.
+  const showLogs = () => setActiveScene('journey');
   const onOpenLogs = async (project) => {
     const current = tracking.current;
     if (!canOpenLogs(project, { runId: current.id, runRunning: current.status === 'running', launching: !!launchLock.current, lookingUpLogs: lookupLock.current !== null }).ok) return;
@@ -422,11 +417,11 @@ export default function App() {
           { id: 3, at: new Date(), kind: 'stdout', stage: 'live', text: `서비스 상태: ${project.last_status}` },
         ],
       });
-      openLogPanel();
+      showLogs();
       return;
     }
     const id = project.last_deployment_id;
-    if (id === current.id) { openLogPanel(); return; }
+    if (id === current.id) { showLogs(); return; }
     const version = ++lookupVersion.current;
     lookupLock.current = version;
     setLookingUpLogs(true);
@@ -434,7 +429,7 @@ export default function App() {
       await getDeployment(id);
       if (version !== lookupVersion.current || launchLock.current || tracking.current.status === 'running') return;
       attach(id, { source: project.source, targets: project.targets || [], name: project.name, trigger: project.trigger });
-      openLogPanel();
+      showLogs();
     } catch (e) {
       if (version === lookupVersion.current) flash(e.message === '404' ? EXPIRED_LOGS : `로그를 불러오지 못했어요 · ${e.message}`);
     } finally {
@@ -559,10 +554,10 @@ export default function App() {
               </Suspense>
             </SceneBoundary>}
           </div>
-          <ActivityDock run={run} project={currentProject} onPanel={setPanel} />
+          <ActivityDock run={run} project={currentProject} />
         </main>
       </div>
-      <DetailsModal logsRequest={logsRequest} panel={panel} onPanel={setPanel} onClose={() => setPanel(null)}>
+      <DetailsModal panel={panel} onPanel={setPanel} onClose={() => setPanel(null)}>
         <div className="modal-section" id="modal-section-deploy" role="region" aria-labelledby="modal-menu-deploy" hidden={panel !== 'deploy'}>
           <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={starting || runRunning || !!redeploying || stopping.has(form.name.trim())} fleetAvailable={!!fleet} />
         </div>
@@ -572,7 +567,6 @@ export default function App() {
           <AnalysisCard run={run} />
           <Endpoints run={run} project={currentProject} onStop={onStop} stopping={stopping.has(currentProject?.name) ? currentProject?.name : null} stopDisabled={starting || !!redeploying || runRunning} />
           <PatchList patches={run.patches} />
-          <div data-deployment-logs><LogConsole logs={run.logs} running={run.status === 'running'} height={320} active={panel === 'details'} /></div>
         </div>
         <div className="modal-section settings-section" id="modal-section-settings" role="region" aria-labelledby="modal-menu-settings" hidden={panel !== 'settings'}>
           <h3>API 토큰</h3>

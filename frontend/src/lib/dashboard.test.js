@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { emptyRun } from './run'
-import { activeStepLabel, liveEndpoints, pendingInput, recentKeyLogs } from './dashboard'
+import { activeStepLabel, liveEndpoints, pendingInput } from './dashboard'
 
 describe('dashboard summaries', () => {
   it('keeps required input visible and prioritizes environment values', () => {
@@ -11,12 +11,6 @@ describe('dashboard summaries', () => {
     expect(pendingInput(run).key).toBe('a:question:q')
     run.question.choice = 'continue'
     expect(pendingInput(run)).toBeNull()
-  })
-
-  it('keeps the latest key events in time order without mutating the complete log', () => {
-    const logs = ['stage', 'info', 'heal', 'note', 'error', 'success'].map((kind, id) => ({ kind, id }))
-    expect(recentKeyLogs(logs).map((l) => l.id)).toEqual([2, 4, 5])
-    expect(logs).toHaveLength(6)
   })
 
   it('offers only successful web endpoints that have not been stopped', () => {

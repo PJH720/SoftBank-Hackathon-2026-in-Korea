@@ -71,6 +71,7 @@ class App:
     replicas: list[Replica] = field(default_factory=list)
     hot_streak: int = 0
     stateful: bool = False  # has a database sidecar on its node -> never replicate (data would diverge)
+    limits: list[str] = field(default_factory=list)  # docker run --cpus/--memory, kept for scale-out replicas
     events: list[dict] = field(default_factory=list)  # scale history shown in the dashboard
 
 
@@ -234,6 +235,7 @@ def register(
     src_dir: str | None = None,
     *,
     stateful: bool = False,
+    limits: list[str] | None = None,
 ) -> str:
     """Add/replace the primary replica of an app and publish it through the router. Returns the public URL."""
     reg = nodepool.load_registry()
@@ -259,6 +261,7 @@ def register(
         0,
     )
     app.stateful = stateful
+    app.limits = list(limits or [])
     app.events.append(
         {"ts": time.time(), "type": "deploy", "node": replica.node, "upstream": replica.upstream}
     )
@@ -286,7 +289,7 @@ def scale_out(app: App, reg: Registry, state: State, reason: str) -> Replica | N
     log.info("image %s available on %s (%.0fs)", app.image, node.name, secs)
     port = nodepool.free_port_on(node)
     cname = f"{app.name}-r{len(app.replicas) + 1}-{int(time.time())}"
-    nodepool.run_container(node, app.image, cname, port, app.container_port)
+    nodepool.run_container(node, app.image, cname, port, app.container_port, limits=app.limits)
     rep = Replica(node=node.name, container=cname, host=node.host, port=port)
     # only route to it once it answers
     for _ in range(30):

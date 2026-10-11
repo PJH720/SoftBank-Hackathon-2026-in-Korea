@@ -31,7 +31,24 @@ GitHub 환경 `production`(배포 브랜치 main만)에 둔다. 다른 브랜치
 | variable | `CLOUDMORPH_SERVER` | `cloudmorph@34.64.253.41` |
 | variable | `CLOUDMORPH_DOMAIN` | `cloudmorph.34-64-253-41.sslip.io` |
 
-배포할 때마다 백엔드가 재시작되므로 진행 중인 배포 작업은 끊긴다. 배포는 한 번에 하나씩, 뒤에 온 push는 기다린다.
+배포할 때마다 백엔드가 재시작되므로 진행 중인 배포 작업은 끊긴다. 배포는 한 번에 하나씩, 뒤에 온 push는 기다린다. CI가 늦게 끝난 옛 커밋은 그사이 main이 앞서 나갔으면 건너뛴다(서버가 뒤로 돌아가지 않게).
+
+## 사용자 앱 격리 (누구나 가입해서 배포하는 서버)
+사용자 코드는 GCP 메타데이터 서버(`169.254.169.254`)에서 **자기가 도는 기계의 서비스 계정 토큰**을 꺼낼 수 있다. 그래서 사용자 앱에는 권한 없는 계정만 닿게 한다.
+
+| 타깃 | 사용자 앱이 닿는 계정 | 장치 |
+|---|---|---|
+| cloudrun, function | `cloudmorph-apps@…` — `cloudsql.client`만 | `DEPLOYER_APP_SERVICE_ACCOUNT=cloudmorph-apps` (`cloudmorph-backend.service`) |
+| local (서버 Docker) | 없음 | `cloudmorph-egress-guard.service`: `DOCKER-USER` 체인에서 컨테이너 → 메타데이터 서버 차단. 백엔드 자신은 영향 없음 |
+| node | 노드 VM의 기본 계정, 범위 `devstorage.read_only` | (노드에도 같은 차단을 넣으면 더 좋다) |
+
+이 설정이 없으면 cloudrun 앱은 프로젝트 기본 Compute 계정(**편집자**)으로, local 앱은 `cloudmorph-control`(run·sql·secret·storage 관리자)로 돈다.
+
+```bash
+# 한 번: 앱 전용 계정
+gcloud iam service-accounts create cloudmorph-apps --display-name "CloudMorph user apps"
+gcloud projects add-iam-policy-binding <PROJECT> --member serviceAccount:cloudmorph-apps@<PROJECT>.iam.gserviceaccount.com --role roles/cloudsql.client --condition=None
+```
 
 ## 서버에서 달라지는 점
 - **local 타깃 = 서버 자신의 Docker** (대시보드 표기 "CloudMorph 서버"). 사용자 PC 자원을 쓰는 진짜 온프레미스는 `agent` 타깃이다 → [onprem-agent.md](onprem-agent.md). 내 노트북에 배포하는 장면이 필요하면 노트북에서 `scripts/demo-up.sh`로 같은 코드를 띄운다(노트북은 공인 IP가 없어 서버가 들어갈 수 없음).

@@ -88,6 +88,8 @@ test('로그 보기 attaches one stream when the deployment still exists', async
   await openAppsTab(page);
   await card(page, 'guestbook').getByRole('button', { name: '로그 보기' }).click();
   await expect(page.getByRole('tab', { name: '배포 여정' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('region', { name: '파이프라인 로그' })).toBeInViewport();
+  await expect(page.getByRole('dialog')).toBeHidden();
   await expect.poll(() => streamCount(page)).toBe(1);
   expect(await page.evaluate(() => window.testStreams[0].url)).toContain('/deploy/dep-guestbook/events');
   expect(sent.lookups).toContain('/deploy/dep-guestbook');
@@ -197,7 +199,7 @@ for (const [width, height] of [[1366, 768], [375, 320]]) {
       expect(await tab.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
     }
     await expect(page.getByRole('button', { name: '새 배포', exact: true }).first()).toBeInViewport();
-    await expect(page.getByRole('button', { name: '전체 로그 보기' })).toBeInViewport();
+    await expect(page.getByRole('region', { name: '파이프라인 로그' })).toBeInViewport();
 
     await board.evaluate((el) => { el.scrollTop = el.scrollHeight; });
     expect(await board.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);

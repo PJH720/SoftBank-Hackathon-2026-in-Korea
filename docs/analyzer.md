@@ -1,7 +1,37 @@
 # analyzer (이요환)
 
 `analyze(src_dir) -> AnalysisResult` — 소스를 읽고 배포 타깃(`local` / `cloudrun`)과 초기 Dockerfile을 정한다.
-계약은 [`interfaces.md`](interfaces.md) 그대로이고, 코드는 `backend/app/analyzer.py` 하나에 있다.
+계약은 [`interfaces.md`](interfaces.md) 그대로이고, 코드는 `backend/app/analyzer.py`(정책·Claude 검사관)와
+`backend/app/quick.py`(빠른 분석)에 있다.
+
+## 빠른 분석: 로컬 clef-flash로 1초 안에 서비스를 고른다
+
+```
+전처리 (코드 읽기, 모델 없음)  →  판단 (clef-flash 1회, 1초 안)  →  검사 (clef-flash 1~2회)  →  analyze_with (울타리·정책 그대로)
+```
+
+- **clef-flash**: Cloudflare가 공개한 9B 판정 모델(Apache-2.0). 글을 만들지 않고, 질문의 선택지마다 확률을 한 번에 매긴다.
+  로컬 Ollama(0.35.1 이상)의 `POST /v1/systemone`으로 부른다. TypeSafe의 Jev와 같은 API다.
+- **전처리**: 저장소를 한 번 훑어 매니페스트·시작 명령 후보·환경변수 이름·신호별 *후보 줄*을 모은다. 패턴에 걸린 줄은 판정이 아니라
+  "모델에게 보여 줄 줄"일 뿐이다. 비밀값은 `***`로 가린 뒤 모델에 보낸다. 실측 1~4ms.
+- **판단 (1초 예산)**: 찾은 것만 적은 약 250토큰 요약에 선택형 질문 하나(`serverless_container` / `vm` / `static_site` /
+  `serverless_function`)를 묻는다. 이 Mac(M4 Pro)에서 clef-flash는 입력을 초당 약 460토큰 읽으므로 400토큰 아래로 맞췄다.
+  라벨을 붙인 저장소 12개에서 12개 모두 맞혔고, 캐시가 없을 때 0.45~0.67초였다. 대시보드는 이 판단을 분석이 끝나기 전에 보여 준다.
+  - "없는 것"을 나열하면(디스크 쓰기 없음 …) 모델이 `vm` 쪽으로 끌려가서, 요약에는 찾은 것만 넣는다.
+- **검사**: 후보 줄이 있는 신호마다 예/아니오, 환경변수마다 종류(무작위 비밀값 / 외부 키 / 필수 설정 / 선택 / 파일 경로),
+  시작 명령 후보가 여럿이면 고르기, 의심 줄마다 악성 여부를 묻는다. 답은 Claude 검사관과 같은 보고 형식으로 바꿔
+  `analyze_with`에 넣는다. 그래서 근거 확인, `RULES`, 치명적 위험의 동의 처리, 저장소 Dockerfile 판정은 그대로다.
+  - 판단은 규칙을 통과한 유형의 **순서**만 정한다. 규칙이 지운 유형은 고르지 않는다 (AI가 추천하고, 코드가 울타리를 친다).
+  - 후보 줄이 있어도 모델이 "아니오"를 20% 미만으로 확신하면 그 줄은 버린다 (패턴 잡음). 그 사이면 줄을 남겨 동의를 받는다.
+  - 의심 줄이 해롭다고 판단되면(50% 이상) 분석을 멈춘다. 검사하지 못해도 멈춘다.
+- **Claude 검사관과 다른 점**: 후보 줄이 없는 신호는 "아니오"다. Dockerfile은 템플릿 그대로다 (AI가 고치지 않는다).
+  "기타 위험"은 찾지 않는다. 분석 1건이 약 90초에서 0.3~2초로 줄어든다.
+- **고르는 방법** (`ANALYZER_MODE`): `auto`(기본)는 clef-flash가 켜져 있으면 빠른 분석, 아니면 Claude 검사관.
+  빠른 분석이 만들 수 없는 저장소(템플릿 없는 언어 등)는 키가 있으면 Claude 검사관으로 넘어간다. `fast`는 clef-flash만, `full`은 Claude만.
+- **켜기**: `scripts/clef-up.sh` — 내 Ollama는 건드리지 않는다. PATH의 Ollama가 0.35.1보다 낮으면 공식 릴리스를 받아(체크섬 확인)
+  `~/.cache/cloudmorph`에 두고 11436 포트에 따로 띄운다. 모델(약 12GB)을 받고 한 번 불러 둔 뒤 `CLEF_BASE_URL`을 알려 준다.
+  `scripts/demo-up.sh`는 이것을 자동으로 부른다.
+- 실측 확인: `cd backend && CLEF_LIVE=1 uv run pytest tests/analysis/test_quick.py -k live -s` (샘플 앱 4개, 1초 예산을 잰다).
 
 ## 어떻게 판정하나
 
@@ -63,6 +93,9 @@ AI 검사관 18개 (Claude, 동시에)  →  울타리 (코드)  →  타깃  �
 | `ANALYZER_MODEL` | `claude-haiku-5-5` | 검사관 모델 |
 | `ANALYZER_MAX_LLM_CALLS` | `6` | 서버 전체에서 동시에 도는 검사관 호출 수. 분석이 여러 건 겹치면 나머지는 기다린다 |
 | `ANALYZER_MAX_TURNS` | `15` | 검사관 하나가 파일을 읽으며 주고받는 최대 횟수 |
+| `ANALYZER_MODE` | `auto` | `auto`: clef-flash가 켜져 있으면 빠른 분석 · `fast`: clef-flash만 · `full`: Claude 검사관만 |
+| `CLEF_BASE_URL` | | 로컬 clef-flash (`scripts/clef-up.sh`가 알려 준다, 예: `http://127.0.0.1:11436`). 비우면 빠른 분석을 하지 않는다 |
+| `CLEF_MODEL` | `clef-flash` | 판정 모델 이름 |
 
 실제 Claude로 확인: `cd backend && ANALYZER_LIVE=1 uv run pytest tests/analysis -k live -s` (키는 저장소 맨 위 `.env`에서 읽는다).
 평소 `pytest`에서는 건너뛴다.
