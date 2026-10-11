@@ -1,5 +1,5 @@
 import React from 'react';
-import { Boxes, Cloud, ExternalLink, LayoutGrid, Maximize, Minimize, Play, Rocket, Settings2, Sparkles, Square, Terminal, LogOut } from 'lucide-react';
+import { Boxes, Cloud, ExternalLink, LayoutGrid, LogOut, Maximize, Minimize, MousePointerClick, Play, Rocket, Settings2, Sparkles, Square, Terminal } from 'lucide-react';
 import { TARGET_META, stepStatus } from '../lib/run';
 import { activeStepLabel, liveEndpoints, pendingInput, recentKeyLogs } from '../lib/dashboard';
 import { fmtDur, fmtTime } from '../lib/style';
@@ -33,6 +33,10 @@ export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, 
         ))}
       </div>
       <div className="header-actions">
+        <a className="dashboard-button" href="#/deploy" title="원터치 배포 · 서버 지도 · 장애 대응">
+          <MousePointerClick size={14} aria-hidden="true" />
+          <span>원터치</span>
+        </a>
         <button
           type="button"
           className={`dashboard-button ${demoMode ? 'primary' : ''}`}
@@ -85,17 +89,18 @@ export function RunHUD({ run, now, notice, onPanel, onCancel, cancelling, celebr
   );
 }
 
-export function ActivityDock({ run, project, onPanel }) {
+export function ActivityDock({ run, project, onPanel, children }) {
   const logs = recentKeyLogs(run.logs);
   const urls = liveEndpoints(run, project);
   return (
-    <footer className="activity-dock" aria-label="핵심 로그와 공개 URL">
+    <footer className={`activity-dock${children ? ' has-console' : ''}`} aria-label="핵심 로그와 공개 URL">
       <div className="dock-heading"><span><Terminal size={13} />LIVE ACTIVITY</span><button onClick={() => onPanel('details')}>전체 로그 보기</button></div>
       <ol className="key-logs" aria-live="polite" aria-relevant="additions text">
         {logs.length === 0 ? <li className="empty-log">새 배포를 눌러 시작하세요. 진행 상황이 이곳에 표시됩니다.</li> : logs.map((log) => (
           <li key={log.id} data-kind={log.kind}><time>{fmtTime(log.at)}</time><span title={log.text}>{log.text}</span></li>
         ))}
       </ol>
+      {children && <div className="dock-console">{children}</div>}
       {urls.length > 0 && <div className="live-links">{urls.map(({ target, label, url }) => <a key={target} href={url} target="_blank" rel="noopener noreferrer"><ExternalLink size={12} />{label} 열기</a>)}</div>}
     </footer>
   );

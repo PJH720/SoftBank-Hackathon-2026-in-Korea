@@ -57,7 +57,7 @@ def test_token_required_on_deploy_routes(monkeypatch):
 
 def test_token_required_on_fleet_and_projects(monkeypatch):
     client = _client(monkeypatch, "s3cret", client=REMOTE)
-    for path in ("/fleet", "/fleet/app/scale/2", "/projects"):
+    for path in ("/fleet", "/fleet/app/scale/2", "/projects", "/incidents"):
         assert client.get(path).status_code == 401, path
         # past the guard -> whatever the route says (404/405 until #13/#17 add these routes)
         assert client.get(path, headers={"X-API-Token": "s3cret"}).status_code != 401, path
@@ -69,3 +69,14 @@ def test_unprotected_paths_bypass_guard(monkeypatch):
     guard_detail = "API token not configured; set CLOUDMORPH_API_TOKEN"
     for resp in (client.post("/webhook/github", content=b"{}"), client.get("/deployments-lookalike")):
         assert resp.json().get("detail") != guard_detail
+
+
+def test_incidents_and_drills(monkeypatch):
+    client = _client(monkeypatch, "s3cret")
+    auth = {"X-API-Token": "s3cret"}
+    assert client.post("/projects/nope/drill", json={"kind": "crash"}).status_code == 401
+    snapshot = client.get("/incidents", headers=auth).json()
+    assert snapshot["incidents"] == [] and snapshot["health"] == {}
+    assert snapshot["guard"]["running"] is False  # CLOUDMORPH_GUARD=0 in tests
+    assert client.post("/projects/nope/drill", json={"kind": "crash"}, headers=auth).status_code == 404
+    assert client.post("/projects/nope/drill", json={"kind": "meteor"}, headers=auth).status_code == 422

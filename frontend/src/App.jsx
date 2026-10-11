@@ -516,7 +516,10 @@ export default function App() {
               </Suspense>
             </SceneBoundary>}
           </div>
-          <ActivityDock run={run} project={currentProject} onPanel={setPanel} />
+          <ActivityDock run={run} project={currentProject} onPanel={setPanel}>
+            {/* the full pipeline log under the scene on tall screens; short ones keep the one-line key logs */}
+            <LogConsole logs={run.logs} running={run.status === 'running'} height="clamp(120px, 20vh, 260px)" />
+          </ActivityDock>
         </main>
       </div>
       <DetailsModal logsRequest={logsRequest} panel={panel} onPanel={setPanel} onClose={() => setPanel(null)}>

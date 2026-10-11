@@ -1,0 +1,13 @@
+/* One-touch screens. Kept apart from index.css so the dashboards can change independently. */
+@keyframes flow {
+  from { left: 0; opacity: 0.2; }
+  20% { opacity: 1; }
+  to { left: calc(100% - 7px); opacity: 0.2; }
+}
+@keyframes ping-soft {
+  0% { transform: scale(1); opacity: 0.6; }
+  80%, 100% { transform: scale(2.2); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  [class*='animate-'] { animation: none !important; }
+}

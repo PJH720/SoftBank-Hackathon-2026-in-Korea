@@ -968,6 +968,7 @@ def build_graph(
     emit: EmitFn | None = None,
     repair_fn: RepairFn | None = None,
     confirm_fn: ConfirmFn | None = None,
+    dockerfile_is_source: bool = False,
 ):
     llm_patch = llm_patch_fn or default_llm_patch
 
@@ -1033,7 +1034,12 @@ def build_graph(
             source=source,
         )
         _emit(PipelineEvent(type="heal_diff", stage="heal", payload=record.model_dump(mode="json")))
-        # A source edit goes out only after confirm_fn (main.py: PR + ask the user) says so.
+        # A source edit goes out only after confirm_fn (main.py: ask the user, then a PR) says so. A Dockerfile
+        # that came with the repo is the user's code too, so changing it needs the same consent; the one the
+        # analyzer generated is CloudMorph's build recipe and is patched without asking.
+        if confirm_fn and not source_diff and dockerfile_is_source and after != before:
+            Path(state["src_dir"], "Dockerfile").write_text(after)  # fixpr commits what is on disk
+            fix, source_diff = RepoFix(after, diff, rationale, ("Dockerfile",)), diff
         stop = confirm_fn(state["src_dir"], fix) if (confirm_fn and source_diff) else None
         return {
             "current_dockerfile": after,
@@ -1145,6 +1151,7 @@ def heal(
     suggest_fn: SourceSuggestFn | None = None,
     repair_fn: RepairFn | None = None,
     confirm_fn: ConfirmFn | None = None,
+    dockerfile_is_source: bool = False,
 ) -> HealReport:
     """Entry point for main.py: call after the first deploy failed.
 
@@ -1164,7 +1171,9 @@ def heal(
             stopped.append(stop)
         return stop
 
-    app = build_graph(deploy_fn, llm_patch_fn, emit, repair_fn, confirm if confirm_fn else None)
+    app = build_graph(
+        deploy_fn, llm_patch_fn, emit, repair_fn, confirm if confirm_fn else None, dockerfile_is_source
+    )
     initial: HealState = {
         "src_dir": src_dir,
         "target": target,

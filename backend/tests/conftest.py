@@ -6,6 +6,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _no_decision_models(monkeypatch):
+    """A developer's .env may point at a running clef-flash or carry a Jev key; unit tests use fakes."""
+    for name in ("CLEF_BASE_URL", "TYPESAFE_API_KEY", "ANALYZER_MODE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CLOUDMORPH_GUARD", "0")  # no background probing of real containers in tests
+
+
+@pytest.fixture(autouse=True)
 def _isolated_project_registry(tmp_path, monkeypatch):
     # env var survives importlib.reload(app.main) in tests that reload the module
     monkeypatch.setenv("CLOUDMORPH_PROJECTS_FILE", str(tmp_path / "projects.json"))

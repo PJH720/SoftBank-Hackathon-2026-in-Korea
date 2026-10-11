@@ -132,6 +132,34 @@ def test_users_only_see_their_own_projects_and_jobs(real):
     assert real.get(f"/deploy/{dep}", headers=ALICE).status_code == 200
 
 
+def test_other_users_cannot_stop_move_drill_or_answer_my_app(real):
+    """The dashboard endpoints added after the ownership model (stop, cancel, env, answer, resources,
+    move, drill, incidents) treat someone else's app like an unknown one."""
+    dep = real.post(
+        "/deploy", json={"source": REPO_URL, "targets": ["local"], "name": "shop"}, headers=ALICE
+    ).json()["deployment_id"]
+    real.app.state.guard.health["shop"] = {"local": {"ok": False}}
+
+    for path, body in [
+        ("/projects/shop/stop", None),
+        ("/projects/shop/resources", {"kind": "postgres", "mode": "new"}),
+        ("/projects/shop/move", {"to": "cloudrun"}),
+        ("/projects/shop/drill", {"kind": "crash"}),
+        (f"/deploy/{dep}/cancel", None),
+        (f"/deploy/{dep}/env", {"values": {}}),
+        (f"/deploy/{dep}/answer", {"question_id": "q", "choice": "continue"}),
+    ]:
+        assert real.post(path, json=body, headers=BOB).status_code == 404, path
+    assert real.get("/incidents", headers=BOB).json()["health"] == {}
+    assert "shop" in real.get("/incidents", headers=ALICE).json()["health"]
+    assert (
+        real.post(
+            f"/deploy/{dep}/answer", json={"question_id": "q", "choice": "stop"}, headers=ALICE
+        ).status_code
+        == 409
+    )
+
+
 # ---------- linking ----------
 
 
