@@ -1,13 +1,14 @@
 import React, { useEffect, useId, useMemo, useRef } from 'react';
-import { Cloud, ExternalLink, Eye, GitBranch, Network, RotateCw, ScrollText, Server, Zap } from 'lucide-react';
+import { Cloud, ExternalLink, Eye, GitBranch, Laptop, Network, RotateCw, ScrollText, Server, Zap } from 'lucide-react';
 import { Badge, Bar, CopyButton, StopButton } from './ui';
 import { fmtAgo } from '../lib/style';
 import { canStop } from '../lib/run';
 import { TARGET_STATE, appStatus, appTargets, canRedeploy, deployMeta, fleetAppFor, primaryUrl, replicaRows } from '../lib/operations';
 import MiniMap from './MiniMap';
 import { Buddy } from './Mascot';
+import { CdControl } from './OwnerPanels';
 
-const TARGET_ICON = { local: Server, cloudrun: Cloud, node: Network, function: Zap };
+const TARGET_ICON = { agent: Laptop, local: Server, cloudrun: Cloud, node: Network, function: Zap };
 const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
 
 function prefersReducedMotion() {
@@ -138,6 +139,8 @@ export default function AppCard({ project, fleet, isWatched, isHighlighted, isSt
             </ul>
           ) : <p className="ops-muted">아직 서비스 위치 정보가 없어요</p>}
         </section>
+
+        <CdControl project={project} />
 
         <CardActions
           project={project}
