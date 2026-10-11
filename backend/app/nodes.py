@@ -286,13 +286,35 @@ class Sidecar:
     data: str  # mount point of the volume
     secret_env: str
     url: str  # .format(scheme=, pw=, host=)
-    ready: str  # sh inside the container, exit 0 when it accepts the app's password
+    scheme: str  # default URL scheme (the app's own form, e.g. mysql+pymysql, comes from the analyzer)
+    port: int
+    # sh inside the container, exit 0 once the *real* server takes the app's password over the network
+    # (images first run a socket/localhost-only init server)
+    ready: str
     env: tuple[str, ...] = ()
+    entrypoint: str | None = None
     command: tuple[str, ...] = ()
     # sh that sets the password to $secret_env on a volume older than the container; None: cannot, so a
     # volume whose container is gone is refused (its password is lost with the container)
     reset: str | None = None
     ready_timeout: int = 90
+    user: str = "app"
+    database: str = "app"
+
+    def conn(self, password: str, host: str, scheme: str | None = None) -> dict[str, str]:
+        """Connection values by role (EnvRequirement.role): what the deployer fills into the app's env."""
+        values = {"host": host, "port": str(self.port), "user": self.user, "password": password}
+        values |= {"database": self.database}
+        values["url"] = self.url.format(scheme=scheme or self.scheme, pw=password, host=host)
+        if self.engine == "s3":
+            values |= {
+                "endpoint": values["url"],
+                "bucket": "app",
+                "access_key": self.user,
+                "secret_key": password,
+                "region": "us-east-1",
+            }
+        return values
 
 
 SIDECARS = {
@@ -305,19 +327,27 @@ SIDECARS = {
         secret_env="POSTGRES_PASSWORD",
         env=("POSTGRES_USER=app", "POSTGRES_DB=app"),
         url="{scheme}://app:{pw}@{host}:5432/app",
-        ready="pg_isready -U app -q",
+        scheme="postgresql",
+        port=5432,
+        ready="pg_isready -h 127.0.0.1 -U app -q",
         # the image trusts connections from inside the container, so this needs no old password
         reset="psql -U app -d app -qc \"ALTER USER app PASSWORD '$POSTGRES_PASSWORD'\"",
     ),
     "mysql": Sidecar(
         engine="mysql",
         image="mysql:8.4",
-        suffix="db",
-        volume="mysqldata",
+        # not `<app>-db` (Postgres): an app may use both. A new volume name too, so a MySQL sidecar made
+        # under the old `<app>-db` name never shares its data directory with this one.
+        suffix="mysql",
+        volume="mysql-data",
         data="/var/lib/mysql",
         secret_env="MYSQL_PASSWORD",
         env=("MYSQL_USER=app", "MYSQL_DATABASE=app", "MYSQL_RANDOM_ROOT_PASSWORD=yes"),
         url="{scheme}://app:{pw}@{host}:3306/app",
+        scheme="mysql",
+        port=3306,
+        # older drivers (node `mysql`, pymysql without cryptography) cannot do 8.x's caching_sha2 auth
+        command=("--mysql-native-password=ON", "--authentication-policy=mysql_native_password"),
         # over TCP: the first-boot init server listens on the socket only, then restarts
         ready='mysql -h127.0.0.1 -uapp -p"$MYSQL_PASSWORD" -e "SELECT 1" app >/dev/null 2>&1',
         ready_timeout=180,
@@ -331,8 +361,55 @@ SIDECARS = {
         secret_env="REDIS_PASSWORD",
         command=("sh", "-c", 'exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"'),
         url="{scheme}://:{pw}@{host}:6379/0",
+        scheme="redis",
+        port=6379,
         ready='redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG',
         reset="true",  # the password comes from the command line on every start, not from the data
+        user="",
+        database="0",
+    ),
+    "mongodb": Sidecar(
+        engine="mongodb",
+        image="mongo:7",
+        suffix="mongo",
+        volume="mongodata",
+        data="/data/db",
+        secret_env="MONGO_INITDB_ROOT_PASSWORD",
+        env=("MONGO_INITDB_ROOT_USERNAME=app",),
+        url="{scheme}://app:{pw}@{host}:27017/app?authSource=admin",
+        scheme="mongodb",
+        port=27017,
+        # the container's own address: the init server listens on localhost only
+        ready='mongosh --quiet "mongodb://app:$MONGO_INITDB_ROOT_PASSWORD@$(hostname -i):27017/?authSource=admin" '
+        "--eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1",
+        ready_timeout=120,
+    ),
+    "s3": Sidecar(
+        # SeaweedFS S3 gateway (minio/minio left Docker Hub). One identity, access key "app", secret = the
+        # sidecar password; requests without it are refused. Bucket "app" is created once the filer is up.
+        engine="s3",
+        image="chrislusf/seaweedfs",
+        suffix="s3",
+        volume="s3data",
+        data="/data",
+        secret_env="S3_SECRET_KEY",
+        url="{scheme}://{host}:8333",
+        scheme="http",
+        port=8333,
+        entrypoint="sh",
+        command=(
+            "-c",
+            (
+                'printf \'{"identities":[{"name":"app","credentials":[{"accessKey":"app","secretKey":"%s"}],'
+                '"actions":["Admin","Read","Write","List","Tagging"]}]}\' "$S3_SECRET_KEY" > /tmp/s3.json '
+                "&& exec weed server -s3 -dir=/data -s3.config=/tmp/s3.json"
+            ),
+        ),
+        ready="echo 's3.bucket.create -name app' | weed shell >/dev/null 2>&1; "
+        "echo s3.bucket.list | weed shell 2>/dev/null | grep -qw app && "
+        "wget -q -S --spider http://127.0.0.1:8333/ 2>&1 | grep -q HTTP/",
+        reset="true",  # the key is written from the env on every start
+        database="",
     ),
 }
 
@@ -346,6 +423,7 @@ def sidecar_script(sc: Sidecar, app: str, password: str) -> str:
             f"docker run -d --restart unless-stopped --name {q(name)} --network {q(net)}",
             f"-e {q(f'{sc.secret_env}={password}')}",
             *(f"-e {q(e)}" for e in sc.env),
+            f"--entrypoint {q(sc.entrypoint)}" if sc.entrypoint else "",
             f"-v {q(f'{volume}:{sc.data}')} {q(sc.image)}",
             *(q(c) for c in sc.command),
         ]
@@ -360,7 +438,11 @@ def sidecar_script(sc: Sidecar, app: str, password: str) -> str:
     # (connect fails harmlessly when it is already there).
     return (
         f"{_network_sh(net)}"
-        f"fresh=; if docker inspect {q(name)} >/dev/null 2>&1; then docker start {q(name)} >/dev/null; "
+        f"fresh=; if docker inspect {q(name)} >/dev/null 2>&1; then "
+        # a container of that name running another image is someone else's data: never start or reuse it
+        f"img=$(docker inspect -f '{{{{.Config.Image}}}}' {q(name)}); [ \"$img\" = {q(sc.image)} ] || "
+        f'{{ echo {q(name)} runs "$img", not {q(sc.image)} >&2; exit 3; }}; '
+        f"docker start {q(name)} >/dev/null; "
         f"docker network connect {q(net)} {q(name)} >/dev/null 2>&1 || true; "
         f"else {orphan}{run} >/dev/null && fresh=1; fi; "
         f"ok=; for i in $(seq 1 {sc.ready_timeout}); do docker exec {q(name)} sh -c {q(sc.ready)} && ok=1 && break; sleep 1; done; "
@@ -377,9 +459,9 @@ def orphan_volume_message(sc: Sidecar, app: str) -> str:
     )
 
 
-def ensure_sidecar(node: Node, app: str, engine: str, *, scheme: str | None = None) -> str:
-    """Start (or reuse) the `engine` sidecar on the app's network on the node; return its URL.
-    Data lives in a named volume, so redeploys of the app keep their rows."""
+def ensure_sidecar(node: Node, app: str, engine: str, *, scheme: str | None = None) -> dict[str, str]:
+    """Start (or reuse) the `engine` sidecar on the app's network on the node; return its connection
+    values by role (Sidecar.conn). Data lives in a named volume, so redeploys of the app keep their rows."""
     import secrets
 
     sc = SIDECARS[engine]
@@ -391,11 +473,11 @@ def ensure_sidecar(node: Node, app: str, engine: str, *, scheme: str | None = No
         raise RuntimeError(f"ssh {node.name}: {engine} sidecar failed rc={cp.returncode}: {err[-800:]}")
     out = cp.stdout.decode(errors="replace").strip()
     password = out.splitlines()[-1] if out else ""
-    return sc.url.format(scheme=scheme or engine, pw=password, host=f"{app}-{sc.suffix}")
+    return sc.conn(password, f"{app}-{sc.suffix}", scheme)
 
 
 def ensure_postgres(node: Node, app: str) -> str:
-    return ensure_sidecar(node, app, "postgres", scheme="postgresql")
+    return ensure_sidecar(node, app, "postgres")["url"]
 
 
 def drop_sidecar(node: Node, container: str, volume: str, dump: str | None, dest: Path | None) -> None:
