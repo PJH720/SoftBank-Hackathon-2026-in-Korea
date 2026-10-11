@@ -471,7 +471,7 @@ export default function App() {
   return (
     <div ref={shell} className="dashboard-shell">
       <div className="dashboard-page" inert={panel ? true : undefined}>
-        <DashboardHeader scene={activeScene} onScene={selectScene} healthy={healthy} onPanel={setPanel} fullscreen={fullscreen} onFullscreen={toggleFullscreen} demoMode={demoMode} onToggleDemo={onToggleDemo} user={me.user} onLogout={token ? onLogout : null} />
+        <DashboardHeader scene={activeScene} onScene={selectScene} healthy={healthy} onPanel={setPanel} fullscreen={fullscreen} onFullscreen={toggleFullscreen} demoMode={demoMode} onToggleDemo={onToggleDemo} user={me.user} admin={me.admin} onLogout={token ? onLogout : null} />
         <main className="dashboard-stage">
           <RunHUD run={run} now={now} notice={notice} onPanel={setPanel} onCancel={onCancel} cancelling={cancelling === run.id} celebrate={celebrate} onShowApp={canHandoff ? showInApps : null} />
           <div id="scene-view" className="scene-view" role="tabpanel" aria-labelledby={`scene-tab-${activeScene}`}>

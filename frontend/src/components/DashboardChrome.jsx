@@ -1,5 +1,5 @@
 import React from 'react';
-import { Boxes, Cloud, ExternalLink, LayoutGrid, LogOut, Maximize, Minimize, MousePointerClick, Play, Rocket, Settings2, Sparkles, Square } from 'lucide-react';
+import { Boxes, Cloud, ExternalLink, LayoutGrid, LogOut, Maximize, Minimize, MousePointerClick, Play, Rocket, Settings2, ShieldCheck, Sparkles, Square } from 'lucide-react';
 import { TARGET_META, stepStatus } from '../lib/run';
 import { activeStepLabel, liveEndpoints, pendingInput } from '../lib/dashboard';
 import { fmtDur } from '../lib/style';
@@ -18,7 +18,7 @@ function rovingIndex(key, index, count) {
   return (index + step + count) % count;
 }
 
-export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, onFullscreen, demoMode, onToggleDemo, user, onLogout }) {
+export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, onFullscreen, demoMode, onToggleDemo, user, admin, onLogout }) {
   return (
     <header className="dashboard-header">
       <div className="dashboard-brand"><Cloud size={25} /><h1>CloudMorph</h1></div>
@@ -51,6 +51,7 @@ export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, 
           <Dot tone={healthy ? 'emerald' : healthy === false ? 'rose' : 'slate'} /><span>백엔드 {healthy ? '연결됨' : healthy === false ? '끊김' : '확인 중'}</span>
         </span>
         {user && <span className="connection-status" title="로그인한 사용자">{user}</span>}
+        {admin && <a className="dashboard-button" href="#/admin" title="모든 사용자와 앱 관리"><ShieldCheck size={14} aria-hidden="true" /><span>관리자</span></a>}
         {onLogout && <button type="button" className="dashboard-button" onClick={onLogout}><LogOut size={14} />로그아웃</button>}
         <button className="dashboard-button primary" onClick={() => onPanel('deploy')}><Play size={14} />새 배포</button>
         <button className="dashboard-button" aria-label="배포 상세" onClick={() => onPanel('details')}><Settings2 size={15} /><span>배포 상세</span></button>

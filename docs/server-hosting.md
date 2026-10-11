@@ -56,6 +56,7 @@ gcloud projects add-iam-policy-binding <PROJECT> --member serviceAccount:cloudmo
 - 서버가 x86이라 Cloud Run용 amd64 빌드가 교차 빌드 없이 빠르다.
 - 토큰은 서버에 항상 설정되어 있다(대시보드에서 입력). `CLOUDMORPH_API_TOKEN`은 관리자, 팀원·사용자별 토큰은 `~/cloudmorph-server.env`에 `CLOUDMORPH_USERS=alice:<토큰>,bob:<토큰>`으로 넣고 백엔드를 재시작한다. 사용자는 자기 프로젝트만 보고 바꾼다.
 - 대시보드에서 아이디·비밀번호로 회원가입과 로그인을 할 수 있다(`backend/app/users.py`). 로그인하면 사용자별 토큰이 발급되어 위의 토큰과 똑같이 동작한다. 공개 서버에서는 `~/cloudmorph-server.env`에 `CLOUDMORPH_SIGNUP_CODE=<가입 코드>`를 넣어서, 코드를 아는 사람만 가입하게 한다. 이 값이 없으면 누구나 가입해서 배포할 수 있다. 계정은 `backend/.cloudmorph/accounts.json`(권한 600)에 저장되며, 비밀번호는 scrypt 해시로, 세션 토큰은 sha256 해시로만 남는다. 로그인 실패는 접속 IP별로 센다. 한 IP에서 같은 아이디로 5번, 아이디와 무관하게 20번 틀리면 그 IP만 5분 동안 막히므로, 다른 곳에서 일부러 틀려서 계정 주인을 잠글 수는 없다. 백엔드는 Caddy·cloudflared 뒤(루프백)에 있으므로 `X-Forwarded-For`의 마지막 값을 접속 IP로 쓴다.
+- 관리자 계정: `~/cloudmorph-server.env`에 `CLOUDMORPH_ADMIN_PASSWORD=<8자 이상>`을 넣고 백엔드를 재시작하면, 로그인 화면에서 아이디 `admin`과 이 비밀번호로 관리자 로그인을 할 수 있다(API 토큰 입력 없이). 비밀번호는 백엔드가 시작할 때 계정 파일에 반영되므로, 값을 바꾸면 기존 관리자 로그인이 모두 끝나고, 값을 지우면 관리자 계정도 사라진다. 관리자는 대시보드 헤더의 `관리자` 버튼(`#/admin`)에서 모든 사용자와 모든 앱을 본다. 회원의 비밀번호 재설정, 모든 기기에서 로그아웃, 계정 삭제와 아무 앱이나 중지할 수 있다. 계정을 삭제해도 그 사용자의 앱은 남고(관리자가 중지할 수 있음), 그 아이디는 앱 소유자로 계속 예약된다. `/admin/*` API는 관리자 토큰 외에는 403으로 거절한다.
 - push 자동 배포는 프로젝트마다 연결한다(대시보드 프로젝트 목록 → "push 자동 배포 연결"). 프로젝트별 웹훅 URL·비밀값을 쓴다. 자세한 것은 [cd-github-webhook.md](cd-github-webhook.md).
 - 자동 확장 감시 루프가 백엔드 안에서 상시 돈다(`CLOUDMORPH_FLEET_WATCH=1`).
 

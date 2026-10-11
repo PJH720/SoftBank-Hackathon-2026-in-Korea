@@ -110,7 +110,7 @@ _LOCAL_SOURCE_DENY_ROOTS = tuple(
 _logger = logging.getLogger(__name__)
 # API token guard: every path under these prefixes needs a token (admin or per-user, see accounts.py).
 # /health and the GitHub webhooks (HMAC-verified on their own) stay open.
-PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects", "/incidents", "/agent")
+PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects", "/incidents", "/agent", "/admin")
 # "testclient" is Starlette TestClient's client host; ASGI servers only ever report IPs here.
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 _PROXY_HEADERS = ("cf-connecting-ip", "x-forwarded-for", "forwarded")
@@ -244,6 +244,12 @@ class AuthRequest(BaseModel):
     username: str = Field(max_length=64)
     password: str = Field(max_length=256)
     code: str | None = Field(default=None, max_length=256, description="invite code (CLOUDMORPH_SIGNUP_CODE)")
+
+
+class PasswordReset(BaseModel):
+    """POST /admin/users/{name}/password body."""
+
+    password: str = Field(max_length=256)
 
 
 # One deployment per app name at a time: two quick pushes would otherwise race on the same Cloud Run
@@ -744,6 +750,7 @@ def _publish(job: Job, event: PipelineEvent | None) -> None:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="CloudMorph", version="0.2.0")
+    users.sync_account(accounts.ADMIN, os.getenv("CLOUDMORPH_ADMIN_PASSWORD"))
     origins = [
         x.strip()
         for x in os.getenv("CLOUDMORPH_CORS_ORIGINS", "http://localhost:5173,http://localhost:5174").split(
@@ -777,6 +784,8 @@ def create_app() -> FastAPI:
         user = accounts.identify(supplied)
         if user is None:
             return JSONResponse({"detail": "missing or invalid X-API-Token"}, status_code=401)
+        if request.url.path.startswith("/admin") and not user.admin:
+            return JSONResponse({"detail": "admin only"}, status_code=403)
         request.state.user = user
         return await call_next(request)
 
@@ -829,6 +838,55 @@ def create_app() -> FastAPI:
     async def auth_config() -> dict:
         """What the login screen needs to know: whether sign-up asks for an invite code."""
         return {"signup_code": bool(os.getenv("CLOUDMORPH_SIGNUP_CODE"))}
+
+    # --- admin console. The guard above lets only admin through /admin; admin already sees and stops every
+    # project through /projects, so these routes are about the people. ------------------------------------
+    @app.get("/admin/users")
+    async def admin_users() -> dict:
+        """Everyone who can own apps: ID/password accounts, API-token users, admin, and owners left from
+        before accounts existed. `kind` says which; `apps`/`live` count the projects they own/serve."""
+        found: dict[str, dict] = {
+            a["name"]: {**a, "kind": "admin" if a["name"] == accounts.ADMIN else "account"}
+            for a in users.list_accounts()
+        }
+        for name in accounts.user_tokens():
+            found.setdefault(name, {"name": name, "kind": "token"})
+        found.setdefault(accounts.ADMIN, {"name": accounts.ADMIN, "kind": "admin"})
+        for p in _projects.values():
+            owner = p.get("owner", accounts.ADMIN)
+            entry = found.setdefault(owner, {"name": owner, "kind": "owner"})
+            entry["apps"] = entry.get("apps", 0) + 1
+            entry["live"] = entry.get("live", 0) + (1 if p.get("live") else 0)
+        listed = [{"apps": 0, "live": 0, "sessions": 0, **u} for u in found.values()]
+        return {"users": sorted(listed, key=lambda u: (u["kind"] != "admin", u["name"]))}
+
+    def _managed_account(name: str) -> str:
+        if name == accounts.ADMIN:
+            raise HTTPException(status_code=409, detail="admin is managed by CLOUDMORPH_ADMIN_PASSWORD")
+        return name
+
+    async def _account_call(fn, *args):
+        try:
+            return await asyncio.to_thread(fn, *args)
+        except users.AuthError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+
+    @app.post("/admin/users/{name}/password")
+    async def admin_reset_password(name: str, body: PasswordReset) -> dict:
+        """New password for an account; its current logins end."""
+        await _account_call(users.set_password, _managed_account(name), body.password)
+        return {"name": name}
+
+    @app.post("/admin/users/{name}/logout")
+    async def admin_logout_user(name: str) -> dict:
+        return {"name": name, "ended": await _account_call(users.revoke_sessions, _managed_account(name))}
+
+    @app.post("/admin/users/{name}/delete")
+    async def admin_delete_user(name: str) -> dict:
+        """Remove the account and its logins. Its apps stay (admin can stop them) and keep the id reserved,
+        so nobody signs up as this id and inherits them."""
+        await _account_call(users.delete, _managed_account(name))
+        return {"name": name}
 
     @app.get("/health")
     async def health() -> dict[str, str]:
