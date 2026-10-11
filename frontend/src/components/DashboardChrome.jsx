@@ -33,7 +33,7 @@ export function DashboardHeader({ scene, onScene, healthy, onPanel, fullscreen, 
         ))}
       </div>
       <div className="header-actions">
-        <a className="dashboard-button" href="#/one-touch/deploy" title="원터치 배포 · 서버 지도 · 장애 대응">
+        <a className="dashboard-button" href="#/deploy" title="원터치 배포 · 서버 지도 · 장애 대응">
           <MousePointerClick size={14} aria-hidden="true" />
           <span>원터치</span>
         </a>

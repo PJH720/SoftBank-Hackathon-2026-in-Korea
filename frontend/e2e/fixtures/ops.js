@@ -82,7 +82,7 @@ export async function setupOps(page, { projects, fleet, lookup = 200 } = {}) {
     return route.fulfill({ json: { name, stopped: ['local', 'cloudrun'], failed: {} } });
   });
 
-  await page.goto('/');
+  await page.goto('/#/3d'); // the 3D dashboard; "/" is the one-touch front door
   await expect(page.getByRole('img', { name: /배포 여정: 소스/ })).toBeVisible();
   return sent;
 }

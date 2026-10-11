@@ -17,11 +17,11 @@ const TABS = [
   { id: 'apps', label: '내 앱' },
   { id: 'incidents', label: '장애 대응' },
 ];
-// The team's 3D dashboard stays at "#/" (main.jsx); these screens live under "#/one-touch/<tab>".
-const tabFromHash = () => TABS.find((t) => window.location.hash === `#/one-touch/${t.id}`)?.id || 'deploy';
+// These screens are the front door ("#/<tab>", default 배포하기); the 3D dashboard lives at "#/3d" (Root.jsx).
+const tabFromHash = () => TABS.find((t) => window.location.hash === `#/${t.id}`)?.id || 'deploy';
 
-/** The one-touch experience at "#/one-touch": deploy in one click, see every app on a map, and watch the
- * incident guard. The team's 3D dashboard (App) stays the default at "#/", one link away. */
+/** The one-touch experience, CloudMorph's front door: deploy in one click, see every app on a map, and watch
+ * the incident guard. The team's 3D dashboard (App) is one link away at "#/3d". */
 export default function Shell() {
   const [tab, setTab] = useState(tabFromHash);
   const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', place: 'auto' });
@@ -44,7 +44,7 @@ export default function Shell() {
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
-  const go = (id) => { window.location.hash = `#/one-touch/${id}`; setTab(id); };
+  const go = (id) => { window.location.hash = `#/${id}`; setTab(id); };
 
   useEffect(() => {
     if (run.status !== 'running') return undefined;
@@ -197,7 +197,7 @@ function Nav({ tab, go, healthy, token, showToken, setShowToken, saveToken }) {
           ))}
         </div>
         <div className="flex items-center gap-2 text-[12px]">
-          <a href="#/" className="flex items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-slate-300 hover:text-white" title="팀의 3D 대시보드로 돌아가요">
+          <a href="#/3d" className="flex items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-slate-300 hover:text-white" title="3D 대시보드에서 배포 여정과 노드 풀을 볼 수 있어요">
             <Box className="h-3.5 w-3.5" /> 3D 대시보드
           </a>
           <span className="flex items-center gap-1.5 text-slate-400">

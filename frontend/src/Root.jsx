@@ -2,15 +2,16 @@ import { useEffect, useState } from 'react'
 import App from './App.jsx'
 import Shell from './Shell.jsx'
 
-// "#/one-touch/..." opens the one-touch screens (Shell); everything else is the 3D dashboard (App).
-const oneTouch = () => window.location.hash.startsWith('#/one-touch')
+// The one-touch screens are the front door ("/", "#/deploy", "#/apps", "#/incidents").
+// "#/3d" opens the team's 3D dashboard (App), full screen and unchanged.
+const dashboard = () => window.location.hash.startsWith('#/3d')
 
 export default function Root() {
-  const [route, setRoute] = useState(oneTouch)
+  const [is3d, setIs3d] = useState(dashboard)
   useEffect(() => {
-    const onHash = () => setRoute(oneTouch())
+    const onHash = () => setIs3d(dashboard())
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
-  return route ? <Shell /> : <App />
+  return is3d ? <App /> : <Shell />
 }

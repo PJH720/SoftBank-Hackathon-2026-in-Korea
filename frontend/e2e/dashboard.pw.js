@@ -33,7 +33,7 @@ async function setup(page, { noGPU = false, fleetAvailable = true } = {}) {
   await page.route('**/projects', (route) => route.fulfill({ json: { projects: [] } }));
   await page.route('**/deploy', (route) => route.fulfill({ json: { deployment_id: 'test-run' } }));
   await page.route('**/deploy/**', (route) => route.fulfill({ json: { accepted: true } }));
-  await page.goto('/?fleetDemo=200');
+  await page.goto('/?fleetDemo=200#/3d');
   if (noGPU) await expect(page.getByText('3D 화면을 사용할 수 없습니다.', { exact: false })).toBeVisible();
   else await expect(page.getByRole('img', { name: /배포 여정: 소스/ })).toBeVisible();
 }
