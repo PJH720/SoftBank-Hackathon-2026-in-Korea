@@ -54,6 +54,7 @@ from pathlib import Path
 
 from app import nodes as nodepool
 from app.schemas import DeployResult, DeployTarget
+from app.storage import write_json
 
 TAIL = 6000  # max chars kept per captured stream
 STATE_DIR = ".deployer"  # written inside src_dir: last outcome + tunnel logs
@@ -318,16 +319,20 @@ def http_status(url: str, timeout: float = 5.0) -> tuple[int | None, str]:
 def wait_up(
     base_url: str, health_path: str, timeout: int, *, is_dead=None, interval: float = 2.0
 ) -> tuple[bool, str]:
-    """App is 'up' when health_path (or "/" as fallback) answers with a status < 500."""
+    """Require HTTP 2xx. Only a missing health route (404/405) may fall back to '/'.
+
+    Authentication failures and server errors on a health endpoint must not be hidden
+    by a successful home page. Redirects are followed by urlopen before this check.
+    """
     deadline = time.time() + timeout
     last = "not attempted"
     while time.time() < deadline:
         for path in (health_path, "/") if health_path != "/" else ("/",):
             status, last = http_status(base_url + path)
-            if status is not None and status < 500:
+            if status is not None and 200 <= status < 300:
                 return True, last
-            if status is not None and status >= 500:
-                break  # server answered with an error: don't bother with the fallback path this round
+            if status not in (404, 405):
+                break
         if is_dead and is_dead():
             return False, f"process exited (last probe: {last})"
         time.sleep(interval)
@@ -376,7 +381,7 @@ def gcloud_default_project() -> str | None:
 def _write_state(src_dir: Path, outcome: Outcome) -> None:
     state = src_dir / STATE_DIR
     state.mkdir(exist_ok=True)
-    (state / "last_result.json").write_text(json.dumps(asdict(outcome), ensure_ascii=False, indent=2))
+    write_json(state / "last_result.json", asdict(outcome))
 
 
 def _read_handles(src_dir: Path) -> dict:
@@ -2375,6 +2380,26 @@ def teardown(target: str, handles: dict, *, drop_database: bool = False) -> list
     drop_database=True also deletes the app's databases, each only after a backup succeeded."""
     if target == "local":
         return cleanup_local(handles, drop_database=drop_database)
+    if target == "function":
+        cfg = Config.from_env()
+        name = handles["function"]
+        cmd = [
+            "gcloud",
+            "functions",
+            "delete",
+            name,
+            "--project",
+            handles.get("project") or str(cfg.project),
+            "--region",
+            handles.get("region") or cfg.region,
+            "--quiet",
+        ]
+        cp = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=300)
+        if cp.returncode == 0:
+            return [f"deleted function {name}"]
+        if "NOT_FOUND" in cp.stderr or "could not be found" in cp.stderr:
+            return []
+        raise RuntimeError(f"gcloud functions delete {name} failed: {cp.stderr.strip()[-500:]}")
     if target == "cloudrun":
         cfg = Config.from_env()
         cfg.project, cfg.region = handles.get("project") or cfg.project, handles.get("region") or cfg.region
