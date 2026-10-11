@@ -11,6 +11,8 @@ WorkingDirectory=/home/cloudmorph/cloudmorph/backend
 EnvironmentFile=/home/cloudmorph/cloudmorph/.env
 EnvironmentFile=/home/cloudmorph/cloudmorph-server.env
 Environment=PATH=/home/cloudmorph/.local/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
+# user apps on cloudrun/function run as this no-role account (cloudsql.client only), never the VM's own
+Environment=DEPLOYER_APP_SERVICE_ACCOUNT=cloudmorph-apps
 ExecStart=/home/cloudmorph/.local/bin/uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 Restart=always
 RestartSec=3

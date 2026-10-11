@@ -28,15 +28,30 @@ jobs:
     env:
       SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
+      # CI runs can finish out of order; deploying an older commit after a newer one would roll the server back
+      - name: Skip unless this is still the tip of main
+        id: tip
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tip=$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)
+          if [ "$tip" != "$SHA" ]; then
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            echo "main is now at $tip; skipping $SHA (the newer commit's run deploys it)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/checkout@v4
+        if: steps.tip.outputs.skip != '1'
         with:
           ref: ${{ env.SHA }}
       - uses: actions/setup-node@v4
+        if: steps.tip.outputs.skip != '1'
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: SSH key
+        if: steps.tip.outputs.skip != '1'
         env:
           SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SERVER_KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
@@ -45,6 +60,7 @@ jobs:
           printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$SERVER_KNOWN_HOSTS" > ~/.ssh/known_hosts
       - name: Deploy
+        if: steps.tip.outputs.skip != '1'
         env:
           CLOUDMORPH_SERVER: ${{ vars.CLOUDMORPH_SERVER }}
           CLOUDMORPH_DOMAIN: ${{ vars.CLOUDMORPH_DOMAIN }}
