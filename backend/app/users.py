@@ -3,6 +3,11 @@
     CLOUDMORPH_ACCOUNTS_FILE   JSON store (default backend/.cloudmorph/accounts.json, written with mode 600)
     CLOUDMORPH_SIGNUP_CODE     when set, signing up needs this invite code (set it on a public server)
     CLOUDMORPH_SESSION_DAYS    how long a login lasts (default 7)
+    CLOUDMORPH_ADMIN_PASSWORD  password of the "admin" account (accounts.ADMIN); unset -> no admin login
+
+The admin account is kept in step with CLOUDMORPH_ADMIN_PASSWORD at startup (sync_account): changing the
+password logs admin out everywhere, and removing it removes the account. Admin manages the other accounts
+(list_accounts, set_password, revoke_sessions, delete).
 
 A login hands out a random session token that accounts.identify() maps to the user, exactly like a
 per-user API token, so ownership of projects/deployments works the same for both.
@@ -174,6 +179,8 @@ def login(name: str, password: str, client: str = "") -> str:
     with _lock:
         _failures.pop(keys[0], None)  # the per-IP count stays: logging into your own id must not reset it
         data = _read()
+        if name in data["users"]:
+            data["users"][name]["last_login"] = now
         token = _new_session(data, name)
         _write(data)
     return token
@@ -194,3 +201,90 @@ def user_for(token: str) -> str | None:
     if not session or session["expires"] <= time.time():
         return None
     return session["user"]
+
+
+def _drop_sessions(data: dict, name: str) -> int:
+    before = len(data["sessions"])
+    data["sessions"] = {k: s for k, s in data["sessions"].items() if s["user"] != name}
+    return before - len(data["sessions"])
+
+
+def sync_account(name: str, password: str | None) -> None:
+    """Make `name` log in with `password` (None or "": no such account). Used for the env-managed admin."""
+    if password and not MIN_PASSWORD <= len(password) <= MAX_PASSWORD:
+        raise ValueError(f"the {name} password must be {MIN_PASSWORD}-{MAX_PASSWORD} characters")
+    with _lock:
+        data = _read()
+        user = data["users"].get(name)
+        if not password:
+            if user is None:
+                return
+            del data["users"][name]
+            _drop_sessions(data, name)
+        elif user and hmac.compare_digest(
+            _hash_password(password, bytes.fromhex(user["salt"])), bytes.fromhex(user["hash"])
+        ):
+            return  # unchanged: keep the sessions
+        else:
+            salt = secrets.token_bytes(16)
+            created = user["created_at"] if user else time.time()
+            data["users"][name] = {
+                "salt": salt.hex(),
+                "hash": _hash_password(password, salt).hex(),
+                "created_at": created,
+            }
+            _drop_sessions(data, name)
+        _write(data)
+
+
+def list_accounts() -> list[dict]:
+    """Every account without its secrets: name, created_at, last_login, live session count."""
+    data, now = _cached(), time.time()
+    live: dict[str, int] = {}
+    for s in data["sessions"].values():
+        if s["expires"] > now:
+            live[s["user"]] = live.get(s["user"], 0) + 1
+    return [
+        {
+            "name": name,
+            "created_at": u.get("created_at"),
+            "last_login": u.get("last_login"),
+            "sessions": live.get(name, 0),
+        }
+        for name, u in sorted(data["users"].items())
+    ]
+
+
+def set_password(name: str, password: str) -> None:
+    """Admin reset: new password, and every existing login of that account ends."""
+    if not MIN_PASSWORD <= len(password) <= MAX_PASSWORD:
+        raise AuthError(422, f"password must be {MIN_PASSWORD}-{MAX_PASSWORD} characters")
+    salt = secrets.token_bytes(16)
+    digest = _hash_password(password, salt)
+    with _lock:
+        data = _read()
+        if name not in data["users"]:
+            raise AuthError(404, "unknown account")
+        data["users"][name].update(salt=salt.hex(), hash=digest.hex())
+        _drop_sessions(data, name)
+        _write(data)
+
+
+def revoke_sessions(name: str) -> int:
+    """Log the account out everywhere; returns how many sessions ended."""
+    with _lock:
+        data = _read()
+        if name not in data["users"]:
+            raise AuthError(404, "unknown account")
+        dropped = _drop_sessions(data, name)
+        _write(data)
+    return dropped
+
+
+def delete(name: str) -> None:
+    with _lock:
+        data = _read()
+        if data["users"].pop(name, None) is None:
+            raise AuthError(404, "unknown account")
+        _drop_sessions(data, name)
+        _write(data)

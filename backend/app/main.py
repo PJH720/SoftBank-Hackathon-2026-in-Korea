@@ -115,7 +115,7 @@ _LOCAL_SOURCE_DENY_ROOTS = tuple(
 _logger = logging.getLogger(__name__)
 # API token guard: every path under these prefixes needs a token (admin or per-user, see accounts.py).
 # /health and the GitHub webhooks (HMAC-verified on their own) stay open.
-PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects", "/incidents", "/agent", "/traffic")
+PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects", "/incidents", "/agent", "/admin", "/traffic")
 # "testclient" is Starlette TestClient's client host; ASGI servers only ever report IPs here.
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 _PROXY_HEADERS = ("cf-connecting-ip", "x-forwarded-for", "forwarded")
@@ -251,6 +251,12 @@ class AuthRequest(BaseModel):
     code: str | None = Field(default=None, max_length=256, description="invite code (CLOUDMORPH_SIGNUP_CODE)")
 
 
+class PasswordReset(BaseModel):
+    """POST /admin/users/{name}/password body."""
+
+    password: str = Field(max_length=256)
+
+
 # One deployment per app name at a time: two quick pushes would otherwise race on the same Cloud Run
 # service (candidate tag / promotion) and the same local container name. Later pushes wait their turn.
 _app_locks: dict[str, threading.Lock] = {}
@@ -328,6 +334,23 @@ def _is_sensitive_source_path(parts: tuple[str, ...]) -> bool:
         or name.endswith(SENSITIVE_FILE_SUFFIXES)
         or ("service-account" in name and name.endswith(".json"))
     )
+
+
+SAMPLE_APPS = REPO_ROOT / "sample-apps"
+
+
+def _source_allowed(source: str, user: accounts.User) -> bool:
+    """Paths on the server are the operator's: a user may name a Git URL or one of the bundled sample apps,
+    never an arbitrary directory (another user's checkout, the server's own config, ...)."""
+    if user.admin or source.startswith("https://"):
+        return True
+    path = Path(source)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    try:
+        return SAMPLE_APPS.resolve() in path.resolve(strict=True).parents
+    except OSError:
+        return False
 
 
 def _validate_local_source(path: Path) -> Path:
@@ -749,6 +772,7 @@ def _publish(job: Job, event: PipelineEvent | None) -> None:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="CloudMorph", version="0.2.0")
+    users.sync_account(accounts.ADMIN, os.getenv("CLOUDMORPH_ADMIN_PASSWORD"))
     traffic_monitor = TrafficMonitor()
     traffic_collector: CaddyLogCollector | None = None
     traffic_analysis_service: TrafficAnalysisService | None = None
@@ -798,6 +822,8 @@ def create_app() -> FastAPI:
         user = accounts.identify(supplied)
         if user is None:
             return JSONResponse({"detail": "missing or invalid X-API-Token"}, status_code=401)
+        if request.url.path.startswith("/admin") and not user.admin:
+            return JSONResponse({"detail": "admin only"}, status_code=403)
         request.state.user = user
         return await call_next(request)
 
@@ -850,6 +876,55 @@ def create_app() -> FastAPI:
     async def auth_config() -> dict:
         """What the login screen needs to know: whether sign-up asks for an invite code."""
         return {"signup_code": bool(os.getenv("CLOUDMORPH_SIGNUP_CODE"))}
+
+    # --- admin console. The guard above lets only admin through /admin; admin already sees and stops every
+    # project through /projects, so these routes are about the people. ------------------------------------
+    @app.get("/admin/users")
+    async def admin_users() -> dict:
+        """Everyone who can own apps: ID/password accounts, API-token users, admin, and owners left from
+        before accounts existed. `kind` says which; `apps`/`live` count the projects they own/serve."""
+        found: dict[str, dict] = {
+            a["name"]: {**a, "kind": "admin" if a["name"] == accounts.ADMIN else "account"}
+            for a in users.list_accounts()
+        }
+        for name in accounts.user_tokens():
+            found.setdefault(name, {"name": name, "kind": "token"})
+        found.setdefault(accounts.ADMIN, {"name": accounts.ADMIN, "kind": "admin"})
+        for p in _projects.values():
+            owner = p.get("owner", accounts.ADMIN)
+            entry = found.setdefault(owner, {"name": owner, "kind": "owner"})
+            entry["apps"] = entry.get("apps", 0) + 1
+            entry["live"] = entry.get("live", 0) + (1 if p.get("live") else 0)
+        listed = [{"apps": 0, "live": 0, "sessions": 0, **u} for u in found.values()]
+        return {"users": sorted(listed, key=lambda u: (u["kind"] != "admin", u["name"]))}
+
+    def _managed_account(name: str) -> str:
+        if name == accounts.ADMIN:
+            raise HTTPException(status_code=409, detail="admin is managed by CLOUDMORPH_ADMIN_PASSWORD")
+        return name
+
+    async def _account_call(fn, *args):
+        try:
+            return await asyncio.to_thread(fn, *args)
+        except users.AuthError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+
+    @app.post("/admin/users/{name}/password")
+    async def admin_reset_password(name: str, body: PasswordReset) -> dict:
+        """New password for an account; its current logins end."""
+        await _account_call(users.set_password, _managed_account(name), body.password)
+        return {"name": name}
+
+    @app.post("/admin/users/{name}/logout")
+    async def admin_logout_user(name: str) -> dict:
+        return {"name": name, "ended": await _account_call(users.revoke_sessions, _managed_account(name))}
+
+    @app.post("/admin/users/{name}/delete")
+    async def admin_delete_user(name: str) -> dict:
+        """Remove the account and its logins. Its apps stay (admin can stop them) and keep the id reserved,
+        so nobody signs up as this id and inherits them."""
+        await _account_call(users.delete, _managed_account(name))
+        return {"name": name}
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -1051,6 +1126,7 @@ def create_app() -> FastAPI:
         """Nodes (with live load), apps, replicas and recent scale events — for the dashboard."""
         reg = nodepool.load_registry()
         state = fleetmod.load_state()
+        user = _user(request)
         metrics = await asyncio.to_thread(
             lambda: nodepool.metrics_dict([nodepool.probe(n) for n in reg.nodes])
         )
@@ -1068,15 +1144,22 @@ def create_app() -> FastAPI:
                     "url": f"http://{a.hostname}",
                     "image": a.image,
                     "replicas": [
-                        {"node": r.node, "upstream": r.upstream, "cpu": r.last_cpu} for r in a.replicas
+                        {
+                            "node": r.node,
+                            "provider": fleetmod.provider_of(reg, r),
+                            "upstream": r.upstream,
+                            "cpu": r.last_cpu,
+                        }
+                        for r in a.replicas
                     ],
                     "events": a.events[-10:],
                 }
                 for a in state.apps.values()
                 # nodes are shared infrastructure; apps on them are private to their owner
-                if _user(request).owns(_projects.get(a.name, {}))
+                if user.owns(_projects.get(a.name, {}))
             ],
-            "watch": list(fleet_events)[-20:],
+            # the watcher's rows name apps too: same rule
+            "watch": [e for e in fleet_events if user.owns(_projects.get(e.get("app", ""), {}))][-20:],
         }
 
     @app.post("/fleet/{app_name}/scale/{n}")
@@ -1188,7 +1271,7 @@ def create_app() -> FastAPI:
         def _run_locked() -> None:
             with prepare_source(source, ref) as source_dir:
                 emit(PipelineEvent(type="stage", stage="analyze"))
-                # clef-flash picks the service in under a second; the dashboard shows it before the analysis ends
+                # Jev or clef-flash picks the service in under a second; the dashboard shows it before the analysis ends
                 if decision := analyzer.quick_decision(source_dir):
                     emit(PipelineEvent(type="log", stage="analyze", payload={"kind": "decision", **decision}))
                 analysis = analyzer.analyze(source_dir)
@@ -1434,6 +1517,11 @@ def create_app() -> FastAPI:
 
     @app.post("/deploy")
     async def start_deploy(req: DeployRequest, request: Request) -> dict[str, str]:
+        if not _source_allowed(req.source, _user(request)):
+            raise HTTPException(
+                status_code=403,
+                detail="only an https Git URL or a bundled sample app (sample-apps/...) can be deployed",
+            )
         return {
             "deployment_id": app.state.launch(
                 req.source,

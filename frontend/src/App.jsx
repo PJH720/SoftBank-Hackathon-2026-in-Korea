@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { answerQuestion, cancelDeploy, getDeployment, getFleet, getHealth, getMe, getProjects, getToken, getTrafficShadow, logOut, setToken, startDeploy, stopProject, submitEnv, subscribe } from './api';
+import { answerQuestion, cancelDeploy, getAgents, getDeployment, getFleet, getHealth, getMe, getProjects, getToken, getTrafficShadow, logOut, setToken, startDeploy, stopProject, submitEnv, subscribe } from './api';
 import AuthScreen from './components/AuthScreen';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
@@ -8,6 +8,7 @@ import { AnalysisCard, Endpoints, PatchList, QuestionCard } from './components/R
 import AppsBoard from './components/AppsBoard';
 import { DashboardHeader, RunHUD, ActivityDock } from './components/DashboardChrome';
 import DetailsModal from './components/DetailsModal';
+import { AgentPanel } from './components/OwnerPanels';
 import { pendingInput } from './lib/dashboard';
 import SceneBoundary from './components/3d/SceneBoundary';
 import { shouldCelebrate } from './lib/victory';
@@ -58,6 +59,7 @@ export default function App() {
     records: [],
   }));
   const [healthy, setHealthy] = useState(null);
+  const [agents, setAgents] = useState([]); // the caller's on-premises agents ("내 PC" target)
   const [token, setTokenState] = useState(getToken());
   const [me, setMe] = useState(null);
   const [meChecked, setMeChecked] = useState(false); // false until the first /projects/me answer
@@ -255,10 +257,11 @@ export default function App() {
     const poll = async () => {
       if (fetching) return;
       fetching = true;
-      const [h, p] = await Promise.all([getHealth(), refreshProjects()]);
+      const [h, p, a] = await Promise.all([getHealth(), refreshProjects(), getAgents().catch(() => [])]);
       fetching = false;
       if (!alive) return;
       setHealthy(h);
+      setAgents(a);
       if (p) {
         // auto-follow deployments started by a GitHub push
         const prev = seenDeployments.current;
@@ -509,7 +512,7 @@ export default function App() {
   return (
     <div ref={shell} className="dashboard-shell">
       <div className="dashboard-page" inert={panel ? true : undefined}>
-        <DashboardHeader scene={activeScene} onScene={selectScene} healthy={healthy} onPanel={setPanel} fullscreen={fullscreen} onFullscreen={toggleFullscreen} demoMode={demoMode} onToggleDemo={onToggleDemo} user={me.user} onLogout={token ? onLogout : null} />
+        <DashboardHeader scene={activeScene} onScene={selectScene} healthy={healthy} onPanel={setPanel} fullscreen={fullscreen} onFullscreen={toggleFullscreen} demoMode={demoMode} onToggleDemo={onToggleDemo} user={me.user} admin={me.admin} onLogout={token ? onLogout : null} />
         <main className="dashboard-stage">
           <RunHUD run={run} now={now} notice={notice} onPanel={setPanel} onCancel={onCancel} cancelling={cancelling === run.id} celebrate={celebrate} onShowApp={canHandoff ? showInApps : null} />
           <div id="scene-view" className="scene-view" role="tabpanel" aria-labelledby={`scene-tab-${activeScene}`}>
@@ -559,7 +562,8 @@ export default function App() {
       </div>
       <DetailsModal panel={panel} onPanel={setPanel} onClose={() => setPanel(null)}>
         <div className="modal-section" id="modal-section-deploy" role="region" aria-labelledby="modal-menu-deploy" hidden={panel !== 'deploy'}>
-          <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={starting || runRunning || !!redeploying || stopping.has(form.name.trim())} fleetAvailable={!!fleet} />
+          <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={starting || runRunning || !!redeploying || stopping.has(form.name.trim())} fleetAvailable={!!fleet} agentOnline={agents.some((x) => x.online)} />
+          <AgentPanel agents={agents} token={token} />
         </div>
         <div className="modal-section" id="modal-section-details" role="region" aria-labelledby="modal-menu-details" hidden={panel !== 'details'}>
           {run.envRequest && <EnvRequestCard key={`env-${run.id}`} request={run.envRequest} onSubmit={(values) => submitEnv(run.id, values)} />}

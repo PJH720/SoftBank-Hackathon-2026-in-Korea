@@ -25,6 +25,7 @@ export default defineConfig({
       '/traffic': route,
       '/projects': route,
       '/incidents': route,
+      '/admin': route, // admin console API (the backend refuses non-admin tokens)
       '/auth': { target: backend, changeOrigin: true }, // sign-up/login: open routes, never gets our token
       '/agent': route, // on-premises agent: status, script, long-poll (docs/onprem-agent.md)
       '/webhook': { target: backend, changeOrigin: true }, // GitHub push webhook: signed, never gets our token

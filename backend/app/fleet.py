@@ -13,6 +13,7 @@ CLI:
     python -m app.fleet status                 apps, replicas, node metrics
     python -m app.fleet watch [--interval 10]  monitor + auto scale-out (blocking)
     python -m app.fleet scale <app> <n>        manual scale to n replicas
+    python -m app.fleet spread <app>           one replica per cloud provider in the pool
     python -m app.fleet remove <app>
     python -m app.fleet stress <app> [--seconds 60] [--concurrency 32]   demo load generator
 """
@@ -25,6 +26,7 @@ import os
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -51,6 +53,7 @@ class Replica:
     container: str
     host: str
     port: int
+    provider: str = "unknown"  # gcp / aws / oci ...: which company's machine serves this replica
     created_at: float = field(default_factory=time.time)
     last_cpu: float | None = None  # average CPU% (of one core) over the last sampling interval
     last_usage_usec: int | None = None
@@ -143,27 +146,26 @@ def render_caddy_config(reg: Registry, state: State) -> dict:
         if not app.replicas:
             continue
         access_log_hosts[app.hostname] = "traffic_access"
-        routes.append(
-            {
-                "match": [{"host": [app.hostname]}],
-                "handle": [
-                    {
-                        "handler": "reverse_proxy",
-                        "upstreams": [{"dial": r.upstream} for r in app.replicas],
-                        "load_balancing": {
-                            "selection_policy": {"policy": "round_robin"},
-                            "try_duration": "5s",
-                        },
-                        "headers": {
-                            "response": {
-                                "set": {"X-Cloudmorph-Upstream": ["{http.reverse_proxy.upstream.hostport}"]}
-                            }
-                        },
-                    }
-                ],
-                "terminal": True,
-            }
-        )
+        proxy = {
+            "handler": "reverse_proxy",
+            "upstreams": [{"dial": r.upstream} for r in app.replicas],
+            "load_balancing": {
+                "selection_policy": {"policy": "round_robin"},
+                "try_duration": "5s",
+            },
+            "headers": {
+                "response": {"set": {"X-Cloudmorph-Upstream": ["{http.reverse_proxy.upstream.hostport}"]}}
+            },
+        }
+        if len(app.replicas) > 1:
+            # A replica that refuses connections (its node or its whole cloud is down) is skipped for a while
+            # and the request retried on another one. Only with several replicas: with one, marking it down
+            # would turn a slow moment into "no upstreams" for everyone. Failed connections only, not 5xx,
+            # so an app's own error page does not take a replica out of rotation.
+            proxy["health_checks"] = {"passive": {"fail_duration": "15s", "max_fails": 3}}
+            # a powered-off node drops packets instead of refusing: give up on it quickly and retry elsewhere
+            proxy["transport"] = {"protocol": "http", "dial_timeout": "2s"}
+        routes.append({"match": [{"host": [app.hostname]}], "handle": [proxy], "terminal": True})
     routes.append(
         {
             "handle": [
@@ -277,29 +279,58 @@ def register(
 
 
 def scale_out(app: App, reg: Registry, state: State, reason: str) -> Replica | None:
+    """Run one more replica of `app` on another node, preferring a cloud it is not on yet, and route to it
+    once it answers. Same image, env (read back from the primary replica) and limits as the first one."""
+    if app.stateful:
+        # its database lives next to the first replica; a copy elsewhere would serve different data
+        app.events.append(
+            {
+                "ts": time.time(),
+                "type": "scale_out_blocked",
+                "reason": f"{reason}; stateful (database sidecar)",
+            }
+        )
+        save_state(state)
+        return None
     used = {r.node for r in app.replicas}
     try:
-        node, metrics = nodepool.select_node(reg, exclude=used)
+        node, metrics = nodepool.select_node(
+            reg, exclude=used, spread_from={provider_of(reg, r) for r in app.replicas}
+        )
     except RuntimeError as e:
         app.events.append({"ts": time.time(), "type": "scale_out_blocked", "reason": f"{reason}; {e}"})
         save_state(state)
         return None
-    src = reg.get(app.replicas[0].node)
+    primary = app.replicas[0]
+    src = reg.get(primary.node)
+    env = nodepool.container_env(src, primary.container)
     secs = nodepool.relay_image(src, node, app.image)  # via this machine; nodes hold no SSH keys
     log.info("image %s available on %s (%.0fs)", app.image, node.name, secs)
     port = nodepool.free_port_on(node)
     cname = f"{app.name}-r{len(app.replicas) + 1}-{int(time.time())}"
-    nodepool.run_container(node, app.image, cname, port, app.container_port, limits=app.limits)
-    rep = Replica(node=node.name, container=cname, host=node.host, port=port)
-    # only route to it once it answers
-    for _ in range(30):
-        try:
-            with urllib.request.urlopen(f"http://{rep.host}:{rep.port}/", timeout=3) as resp:
-                if resp.status < 500:
-                    break
-        except Exception as e:  # noqa: BLE001 — not up yet
-            log.debug("replica %s not ready: %s", rep.upstream, e)
-        time.sleep(2)
+    nodepool.run_container(
+        node,
+        app.image,
+        cname,
+        port,
+        app.container_port,
+        env,
+        limits=app.limits,
+        network=nodepool.app_network(app.name),
+    )
+    rep = Replica(node=node.name, container=cname, host=node.host, port=port, provider=node.provider)
+    if not _wait_ready(rep):
+        nodepool.remove_container(node, cname)
+        app.events.append(
+            {
+                "ts": time.time(),
+                "type": "scale_out_failed",
+                "node": node.name,
+                "reason": f"{reason}; not ready",
+            }
+        )
+        save_state(state)
+        return None
     app.replicas.append(rep)
     app.hot_streak = 0
     app.events.append(
@@ -307,6 +338,7 @@ def scale_out(app: App, reg: Registry, state: State, reason: str) -> Replica | N
             "ts": time.time(),
             "type": "scale_out",
             "node": node.name,
+            "provider": node.provider,
             "upstream": rep.upstream,
             "reason": reason,
             "candidates": nodepool.metrics_dict(metrics),
@@ -316,6 +348,35 @@ def scale_out(app: App, reg: Registry, state: State, reason: str) -> Replica | N
     save_state(state)
     log.info("scale-out %s -> %s (%s)", app.name, node.name, reason)
     return rep
+
+
+def provider_of(reg: Registry, rep: Replica) -> str:
+    """The replica's cloud; replicas recorded before providers were, take it from nodes.json."""
+    if rep.provider != "unknown":
+        return rep.provider
+    try:
+        return reg.get(rep.node).provider
+    except KeyError:
+        return rep.provider
+
+
+READY_TRIES, READY_INTERVAL = 30, 2.0
+
+
+def _wait_ready(rep: Replica) -> bool:
+    """True once the replica answers on its node without a server error; never routed to before that."""
+    for _ in range(READY_TRIES):
+        try:
+            with urllib.request.urlopen(f"http://{rep.upstream}/", timeout=3) as resp:
+                if resp.status < 500:
+                    return True
+        except urllib.error.HTTPError as e:
+            if e.code < 500:  # 404 on "/" still means the server is up and serving
+                return True
+        except Exception as e:  # noqa: BLE001 — not up yet
+            log.debug("replica %s not ready: %s", rep.upstream, e)
+        time.sleep(READY_INTERVAL)
+    return False
 
 
 def scale_in(app: App, reg: Registry, state: State, reason: str) -> None:
@@ -341,13 +402,21 @@ def scale(app_name: str, n: int) -> App:
     return app
 
 
+def spread(app_name: str) -> App:
+    """One replica per cloud provider in the pool (manual scale to the number of providers)."""
+    providers = {n.provider for n in nodepool.load_registry().nodes}
+    return scale(app_name, len(providers))
+
+
 def remove(app_name: str) -> None:
     reg, state = nodepool.load_registry(), load_state()
     app = state.apps.pop(app_name, None)
     push_config(reg, state)
     save_state(state)
     for r in app.replicas if app else []:
-        nodepool.remove_container(reg.get(r.node), r.container)
+        node = reg.get(r.node)
+        nodepool.remove_container(node, r.container)
+        nodepool.remove_network(node, nodepool.app_network(app.name))  # kept while a sidecar uses it
 
 
 # --------------------------------------------------------------------------- #
@@ -430,7 +499,10 @@ def tick(emit=None) -> list[dict]:
         row = {
             "app": app.name,
             "hostname": app.hostname,
-            "replicas": [{"node": r.node, "upstream": r.upstream, "cpu": r.last_cpu} for r in app.replicas],
+            "replicas": [
+                {"node": r.node, "provider": provider_of(reg, r), "upstream": r.upstream, "cpu": r.last_cpu}
+                for r in app.replicas
+            ],
             "replica_count_before_action": replica_count_before_action,
             "sampled_cpu_percentages": [cpu for _, cpu in samples],
             "hot_streak": app.hot_streak,
@@ -478,6 +550,7 @@ def stress(app_name: str, seconds: int = 60, concurrency: int = 32, path: str = 
     state = load_state()
     host = state.apps[app_name].hostname
     reg = nodepool.load_registry()
+    cloud_of = {r.upstream: provider_of(reg, r) for r in state.apps[app_name].replicas}
     port = reg.router.public_port if reg.router else 80
     counts: dict[str, int] = {}
     lock, deadline, total, errors, latencies = threading.Lock(), time.time() + seconds, [0], [0], []
@@ -513,7 +586,8 @@ def stress(app_name: str, seconds: int = 60, concurrency: int = 32, path: str = 
         time.sleep(5)
         with lock:
             print(
-                f"  {total[0]:>7} req  ({(total[0] - last) / 5:.0f} rps)  by upstream: {counts}  errors={errors[0]}",
+                f"  {total[0]:>7} req  ({(total[0] - last) / 5:.0f} rps)  by cloud: {_by_cloud(counts, cloud_of)}"
+                f"  errors={errors[0]}",
                 flush=True,
             )
             last = total[0]
@@ -525,8 +599,17 @@ def stress(app_name: str, seconds: int = 60, concurrency: int = 32, path: str = 
         "requests": total[0],
         "errors": errors[0],
         "by_upstream": counts,
+        "by_cloud": _by_cloud(counts, cloud_of),
         "p95_ms": round(p95) if p95 else None,
     }
+
+
+def _by_cloud(counts: dict[str, int], cloud_of: dict[str, str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for upstream, n in counts.items():
+        cloud = cloud_of.get(upstream, upstream)
+        out[cloud] = out.get(cloud, 0) + n
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -542,6 +625,8 @@ def _main(argv: list[str]) -> int:
     s = sub.add_parser("scale")
     s.add_argument("app")
     s.add_argument("n", type=int)
+    sp = sub.add_parser("spread")
+    sp.add_argument("app")
     rm = sub.add_parser("remove")
     rm.add_argument("app")
     st = sub.add_parser("stress")
@@ -569,6 +654,9 @@ def _main(argv: list[str]) -> int:
     elif a.cmd == "scale":
         app = scale(a.app, a.n)
         print(app.name, "->", [r.upstream for r in app.replicas])
+    elif a.cmd == "spread":
+        app = spread(a.app)
+        print(app.name, "->", [f"{r.provider}:{r.node}:{r.upstream}" for r in app.replicas])
     elif a.cmd == "remove":
         remove(a.app)
         print("removed", a.app)
