@@ -69,6 +69,15 @@ DEFAULT_PORT = 8080  # Cloud Run injects PORT=8080 by default
 # --------------------------------------------------------------------------- #
 ERROR_PATTERNS: list[tuple[ErrorCategory, re.Pattern[str]]] = [
     (
+        # deployer (docker OOMKilled), Cloud Run, JVM, Python. Before the rest: an OOM-killed app often
+        # also logs a refused connection or a traceback, and only more memory fixes it.
+        ErrorCategory.OUT_OF_MEMORY,
+        re.compile(
+            r"OOMKilled|Memory limit of \d+ ?MiB exceeded|java\.lang\.OutOfMemoryError|^MemoryError\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
         ErrorCategory.MISSING_DEPENDENCY,
         re.compile(
             # Shared objects only from the raised error or the loader: optional "Could not load dynamic
@@ -657,7 +666,34 @@ def _patch_unresolvable_pin(dockerfile: str, error_log: str) -> tuple[str, str] 
     return "\n".join([*lines[:idx], line, *lines[idx:]]) + "\n", rationale
 
 
+# deployer reads LABEL cloudmorph.memory as the instance memory (docs/interfaces.md); double it per attempt
+_MEMORY_LABEL = re.compile(r"(cloudmorph\.memory\s*=\s*)[\"']?(\d+)\s*(Mi|Gi)[\"']?", re.IGNORECASE)
+_MEMORY_LIMIT_IN_LOG = re.compile(r"memory limit of (\d+) ?(MiB|Mi|GiB|Gi)", re.IGNORECASE)
+_MEMORY_IN_HEADER = re.compile(r"^\[deployer\] instance .*\bmemory=(\d+)(Mi|Gi)\b", re.MULTILINE)
+MAX_MEMORY_MIB = 8192
+
+
+def _mib(n: str, unit: str) -> int:
+    return int(n) * (1024 if unit.lower().startswith("g") else 1)
+
+
+def _patch_memory(dockerfile: str, error_log: str) -> tuple[str, str] | None:
+    label = _MEMORY_LABEL.search(dockerfile)
+    seen = _MEMORY_LIMIT_IN_LOG.search(error_log) or _MEMORY_IN_HEADER.search(error_log)
+    current = _mib(*label.group(2, 3)) if label else _mib(*seen.group(1, 2)) if seen else 512
+    if current >= MAX_MEMORY_MIB:
+        return None  # more memory is not the answer any more: let the LLM / a human look
+    new = min(current * 2, MAX_MEMORY_MIB)
+    value = f"{new // 1024}Gi" if new % 1024 == 0 else f"{new}Mi"
+    if label:
+        after = dockerfile[: label.start()] + f'{label.group(1)}"{value}"' + dockerfile[label.end() :]
+    else:
+        after = _insert_before_cmd(dockerfile, f'LABEL cloudmorph.memory="{value}"')
+    return after, f"ran out of memory at {current}Mi: raise the instance memory to {value}"
+
+
 RULE_PATCHES: dict[ErrorCategory, Callable[[str, str], tuple[str, str] | None]] = {
+    ErrorCategory.OUT_OF_MEMORY: _patch_memory,
     ErrorCategory.MISSING_DEPENDENCY: _patch_missing_dependency,
     ErrorCategory.PORT_BINDING: _patch_port_binding,
     ErrorCategory.BUILD_FAILURE: _patch_unresolvable_pin,
@@ -978,17 +1014,22 @@ def build_graph(
 
     def classify(state: HealState) -> HealState:
         error_log = state.get("error_log", "")
-        update: HealState = {"error_category": classify_error(error_log)}
+        category = classify_error(error_log)
+        update: HealState = {"error_category": category}
+        # Out of memory is fixed by more memory (rule patch), not a stop: an OOM-killed app ends with
+        # SIGKILL and often a traceback or a refused connection, which would otherwise read as a stop.
+        oom = category == ErrorCategory.OUT_OF_MEMORY
         # The permission rule fixes a traceback that would otherwise read as an app-code error.
         app_stop = (
             not repair_fn
+            and not oom
             and _stops_on_app_code(error_log)
             and _patch_permission(state.get("current_dockerfile", ""), error_log) is None
         )
         # needs_human_stop applies even with the repo agent: it must not invent secrets or a DB.
         if (
             _unhealable(error_log)
-            or needs_human_stop(error_log, state["src_dir"], state["current_dockerfile"])
+            or (not oom and needs_human_stop(error_log, state["src_dir"], state["current_dockerfile"]))
             or app_stop
         ):
             update["status"] = "gave_up"  # no Dockerfile patch can fix it: skip LLM + redeploy

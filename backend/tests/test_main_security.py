@@ -553,7 +553,7 @@ def test_two_jobs_names_api_status_and_sse(m, tmp_path, monkeypatch):
     )
     paths = []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **_options):
         paths.append(Path(directory))
         return DeployResult(success=True, target=target, exit_code=0, url="https://example.invalid")
 
@@ -623,7 +623,7 @@ def test_cloudrun_workspace_is_removed_after_heal_finishes(m, tmp_path, monkeypa
     )
     deploy_attempts = []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **_options):
         assert Path(directory).exists()
         assert (Path(directory) / "app.py").read_text() == "dummy"
         deploy_attempts.append(dockerfile)
@@ -697,7 +697,7 @@ def test_failed_deploy_heals_and_preserves_sse_contract(m, tmp_path, monkeypatch
     )
     deploy_attempts = []
 
-    def fake_deploy(directory, attempted_dockerfile, target):
+    def fake_deploy(directory, attempted_dockerfile, target, **_options):
         deploy_attempts.append(attempted_dockerfile)
         if len(deploy_attempts) == 1:
             return DeployResult(
@@ -773,7 +773,7 @@ def test_stop_takes_down_every_live_target_once(m, tmp_path, monkeypatch):
     monkeypatch.setattr(
         m.deployer,
         "deploy",
-        lambda directory, dockerfile, target: DeployResult(
+        lambda directory, dockerfile, target, **_options: DeployResult(
             success=True, target=target, exit_code=0, url=f"https://{target}.invalid"
         ),
     )
@@ -898,7 +898,7 @@ def test_cancel_kills_the_build_and_skips_the_remaining_targets(m, tmp_path, mon
     building, released = threading.Event(), threading.Event()
     calls, killed = [], []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **_options):
         calls.append(target)
         building.set()
         assert released.wait(5)
@@ -948,7 +948,7 @@ def test_cancel_kills_the_build_and_skips_the_remaining_targets(m, tmp_path, mon
 def test_cancel_stops_the_healer_before_its_next_redeploy(m, tmp_path, monkeypatch):
     calls = []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **_options):
         calls.append(target)
         if len(calls) == 2:  # healer's first redeploy is in flight when the user cancels
             next(iter(m._jobs.values())).cancel.set()
@@ -1183,7 +1183,7 @@ def test_without_ask_env_nothing_is_asked_or_injected(m, tmp_path, monkeypatch):
         return await routes["/deploy/{deployment_id}"](deployment_id, ADMIN)
 
     assert asyncio.run(scenario())["status"] == "completed"
-    assert calls == [{}]
+    assert calls == [{"db_owner": m._source_identity(str(source))}]  # no env values, only whose DB it is
 
 
 def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
@@ -1376,6 +1376,18 @@ def test_resources_become_deployer_options(m):
     assert m._apply_resources("gb", project, {}) == {"database": None}  # not a fresh DB in its place
 
 
+def test_detaching_redis_or_mysql_keeps_the_deployer_from_adding_its_own(m):
+    """The deployer attaches Redis/MySQL sidecars by itself; a detach on the dashboard must win over that."""
+    project = {"analysis": {"stores": {"redis": "REDIS_URL", "mysql": "DATABASE_URL"}}}
+    project["resources"] = {"redis": {"mode": "none"}}
+    assert m._apply_resources("q", project, {"env": {"REDIS_URL": "redis://old"}}) == {"cache": False}
+    project["resources"] = {"mysql": {"mode": "none"}}
+    assert m._apply_resources("q", project, {}) == {"database": None}
+    m._resource_secrets.clear()
+    project["resources"] = {"redis": {"mode": "url"}}  # the user's own Redis address was lost
+    assert m._apply_resources("q", project, {}) == {"cache": False}
+
+
 def _dashboard(m, monkeypatch, project):
     m._projects[project["name"]] = project
     launched = []
@@ -1468,3 +1480,17 @@ def test_move_takes_the_old_place_down_only_after_the_new_one_is_up(m, tmp_path,
     assert list(m._projects["gb"]["live"]) == ["cloudrun"] and "local" not in m._projects["gb"]["urls"]
     lines = [d["payload"].get("line", "") for e, d in _events(routes, deployment_id) if e == "log"]
     assert any(line.startswith("move: local 내림") for line in lines)
+
+
+def test_provisioned_env_follows_the_targets(tmp_path):
+    from app import deployer
+
+    (tmp_path / "app.py").write_text("import os\nos.environ['DATABASE_URL']\nos.environ['REDIS_URL']\n")
+    (tmp_path / "requirements.txt").write_text("pymysql\nredis\n")
+    cfg = deployer.Config()
+    # MySQL and Redis come from sidecars: promised on local/node only
+    assert deployer.provisioned_env(tmp_path, ["local", "node"], cfg) == {"DATABASE_URL", "REDIS_URL"}
+    assert deployer.provisioned_env(tmp_path, ["local", "cloudrun"], cfg) == set()
+    (tmp_path / "requirements.txt").write_text("psycopg\n")
+    assert deployer.provisioned_env(tmp_path, ["cloudrun"], cfg) == {"DATABASE_URL"}
+    assert deployer.provisioned_env(tmp_path, ["function"], cfg) == set()
