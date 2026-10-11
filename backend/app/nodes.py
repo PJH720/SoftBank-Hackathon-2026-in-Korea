@@ -217,11 +217,20 @@ NETWORK = "cloudmorph"  # app <-> sidecar (postgres) traffic stays on this docke
 
 
 def run_container(
-    node: Node, image: str, name: str, host_port: int, container_port: int, env: dict[str, str] | None = None
+    node: Node,
+    image: str,
+    name: str,
+    host_port: int,
+    container_port: int,
+    env: dict[str, str] | None = None,
+    *,
+    limits: list[str] | None = None,
 ) -> str:
+    """`limits`: docker run flags such as ["--cpus", "1", "--memory", "512m"] (deployer.Size.docker_flags)."""
     env_flags = " ".join(
         f"-e {shlex.quote(f'{k}={v}')}" for k, v in {**(env or {}), "PORT": str(container_port)}.items()
     )
+    env_flags += "".join(f" {shlex.quote(flag)}" for flag in limits or [])
     cmd = (
         f"docker network inspect {NETWORK} >/dev/null 2>&1 || docker network create {NETWORK} >/dev/null; "
         f"docker rm -f {shlex.quote(name)} >/dev/null 2>&1; "
@@ -245,6 +254,11 @@ def ensure_postgres(node: Node, app: str, *, timeout: int = 120) -> str:
     )
     ssh_text(node, cmd, timeout=timeout)
     return f"postgresql://app:app@{db}:5432/app"
+
+
+def container_oom_killed(node: Node, name: str) -> bool:
+    cp = ssh(node, f"docker inspect -f '{{{{.State.OOMKilled}}}}' {shlex.quote(name)}", timeout=20)
+    return cp.returncode == 0 and cp.stdout.decode().strip() == "true"
 
 
 def container_status(node: Node, name: str) -> tuple[str, int]:

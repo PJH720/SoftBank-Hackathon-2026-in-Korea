@@ -101,6 +101,8 @@ class Outcome:
         if self.ok:
             return "\n".join(self.warnings)
         parts = [f"[deployer] stage={self.stage} kind={self.kind} target={self.target}"]
+        if size := self.handles.get("size"):  # healer sizes its memory patch from this
+            parts.append("[deployer] instance " + " ".join(f"{k}={v}" for k, v in size.items()))
         if self.diagnosis:
             parts.append(self.diagnosis)
         if self.error:
@@ -160,6 +162,15 @@ class Config:
     # metadata server, so on a shared server this must be an account with no roles beyond cloudsql.client.
     app_service_account: str | None = None
     db_owner: str | None = None  # where the code comes from (main._source_identity): isolates shared DB names
+    # instance size. cpu in vCPUs ("1", "2"), memory like "512Mi"/"1Gi"; None -> platform default.
+    # Precedence: detected from dependencies < cpu/memory (env or override) < Dockerfile LABEL cloudmorph.*
+    cpu: str | None = None
+    memory: str | None = None
+    min_instances: int | None = None  # cloudrun/function; None -> inherit (first deploy: 0)
+    max_instances: int | None = None
+    concurrency: int | None = None  # requests per instance
+    request_timeout: int | None = None  # seconds
+    db_max_instances: int = 4  # max_instances when a Cloud SQL database is attached and none is set
 
     def runtime_account(self) -> str | None:
         sa = self.app_service_account
@@ -182,7 +193,19 @@ class Config:
             database=env.get("DEPLOYER_DATABASE", "auto") or None,
             cloudsql_instance=env.get("CLOUDSQL_INSTANCE", "cloudmorph-pg"),
             app_service_account=env.get("DEPLOYER_APP_SERVICE_ACCOUNT") or None,
+            cpu=env.get("DEPLOYER_CPU") or None,
+            memory=env.get("DEPLOYER_MEMORY") or None,
+            min_instances=_int_env("DEPLOYER_MIN_INSTANCES"),
+            max_instances=_int_env("DEPLOYER_MAX_INSTANCES"),
+            concurrency=_int_env("DEPLOYER_CONCURRENCY"),
+            request_timeout=_int_env("DEPLOYER_REQUEST_TIMEOUT"),
+            db_max_instances=_int_env("DEPLOYER_DB_MAX_INSTANCES") or 4,
         )
+
+
+def _int_env(name: str) -> int | None:
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else None
 
 
 class StepError(Exception):
@@ -739,6 +762,201 @@ def ensure_cloudsql_database(
 
 
 # --------------------------------------------------------------------------- #
+# instance size: cpu / memory / instance counts
+# --------------------------------------------------------------------------- #
+_MEMORY = re.compile(r"^(\d+(?:\.\d+)?)\s*(Mi|Gi|M|G|MB|GB)?$", re.IGNORECASE)
+_LABEL_SIZE = re.compile(r"\bcloudmorph\.(cpu|memory)\s*=\s*[\"']?([\w.]+)", re.IGNORECASE)
+CLOUDRUN_MAX_MIB = 32 * 1024
+
+
+def memory_mib(value: str) -> int:
+    m = _MEMORY.match(str(value).strip())
+    if not m or float(m.group(1)) <= 0:
+        raise ValueError(f"memory must look like 512Mi or 1Gi, got {value!r}")
+    n = float(m.group(1))
+    return int(n * 1024) if (m.group(2) or "Mi").lower().startswith("g") else int(n)
+
+
+def format_mib(mib: int) -> str:
+    return f"{mib // 1024}Gi" if mib % 1024 == 0 else f"{mib}Mi"
+
+
+def _format_cpu(cpu: float) -> str:
+    return str(int(cpu)) if cpu == int(cpu) else str(cpu)
+
+
+# Dependencies that need more than the platform default (Cloud Run: 1 vCPU / 512Mi) just to start.
+# Heaviest first; matched in dependency manifests only.
+_SIZE_RULES = (
+    (
+        re.compile(
+            r"\b(torch|tensorflow(?:-cpu)?|transformers|sentence-transformers|onnxruntime|ultralytics|diffusers"
+            r"|@tensorflow/tfjs-node|@xenova/transformers)\b",
+            re.IGNORECASE,
+        ),
+        {"cpu": "2", "memory": "4Gi"},
+    ),
+    (re.compile(r"\b(playwright|puppeteer|selenium)\b", re.IGNORECASE), {"cpu": "1", "memory": "2Gi"}),
+    (
+        re.compile(
+            r"\b(pandas|numpy|scipy|scikit-learn|polars|opencv-python(?:-headless)?)\b", re.IGNORECASE
+        ),
+        {"memory": "1Gi"},
+    ),
+)
+_SIZE_MANIFESTS = re.compile(r"^(requirements.*\.txt|pyproject\.toml|Pipfile|package\.json)$")
+_JVM_MANIFESTS = {"pom.xml", "build.gradle", "build.gradle.kts"}
+
+
+def detect_size(src_dir: Path) -> tuple[dict[str, str], str]:
+    """(size, evidence) the app's dependencies call for; ({}, ...) when the platform default will do."""
+    best: tuple[int, dict[str, str], str] | None = None
+    for p in sorted(src_dir.rglob("*")):
+        if not p.is_file() or _SCAN_SKIP.intersection(p.parts):
+            continue
+        rel = p.relative_to(src_dir).as_posix()
+        if p.name in _JVM_MANIFESTS and (best is None or best[0] > len(_SIZE_RULES)):
+            best = (len(_SIZE_RULES), {"memory": "1Gi"}, f"{rel}: JVM")
+            continue
+        if not _SIZE_MANIFESTS.match(p.name):
+            continue
+        try:
+            text = p.read_text(errors="ignore")[:200_000]
+        except OSError:
+            continue
+        for rank, (rx, size) in enumerate(_SIZE_RULES):
+            if (best is None or rank < best[0]) and (m := rx.search(text)):
+                best = (rank, size, f"{rel}: {m.group(0)}")
+    return (best[1], best[2]) if best else ({}, "")
+
+
+def dockerfile_size(src_dir: Path) -> dict[str, str]:
+    """`LABEL cloudmorph.memory="1Gi" cloudmorph.cpu="2"` in the Dockerfile: the app's own request, and
+    where healer raises the memory after an out-of-memory crash (the change shows up in its diff)."""
+    try:
+        text = (src_dir / "Dockerfile").read_text(errors="ignore")
+    except OSError:
+        return {}
+    found: dict[str, str] = {}
+    for line in text.splitlines():
+        if line.strip().upper().startswith("LABEL"):
+            found |= {k.lower(): v for k, v in _LABEL_SIZE.findall(line)}
+    return found
+
+
+@dataclass
+class Size:
+    cpu: float | None = None
+    memory_mib: int | None = None
+
+    @property
+    def memory(self) -> str | None:
+        return format_mib(self.memory_mib) if self.memory_mib else None
+
+    def as_dict(self) -> dict[str, str]:
+        return {k: v for k, v in (("cpu", self.cpu and _format_cpu(self.cpu)), ("memory", self.memory)) if v}
+
+    def docker_flags(self) -> list[str]:
+        """docker run limits (local and node targets)."""
+        flags = ["--cpus", _format_cpu(self.cpu)] if self.cpu else []
+        return flags + (["--memory", f"{self.memory_mib}m"] if self.memory_mib else [])
+
+
+def size_for(src_dir: Path, cfg: Config, r: Runner) -> Size:
+    """cpu/memory for this deploy: dependencies < Config (env/override) < Dockerfile LABEL; recorded as a step."""
+    picked: dict[str, tuple[str, str]] = {}
+    detected, evidence = detect_size(src_dir)
+    layers = (
+        (evidence, detected),
+        ("config", {"cpu": cfg.cpu, "memory": cfg.memory}),
+        ("Dockerfile", dockerfile_size(src_dir)),
+    )
+    for origin, values in layers:
+        for key in ("cpu", "memory"):
+            if values.get(key):
+                picked[key] = (str(values[key]), origin)
+    size = Size()
+    try:
+        if "cpu" in picked:
+            size.cpu = float(picked["cpu"][0])
+            if size.cpu <= 0:
+                raise ValueError(f"cpu must be positive, got {picked['cpu'][0]!r}")
+        if "memory" in picked:
+            size.memory_mib = memory_mib(picked["memory"][0])
+    except ValueError as e:
+        raise StepError("deploy", "user_action_required", f"invalid instance size: {e}") from None
+    shown = [
+        f"cpu={_format_cpu(size.cpu)} ({picked['cpu'][1]})" if size.cpu else "",
+        f"memory={size.memory} ({picked['memory'][1]})" if size.memory_mib else "",
+    ]
+    r.steps.append(Step("instance size", " ".join(filter(None, shown)) or "platform default", 0, 0.0, "", ""))
+    return size
+
+
+def fit_cloudrun(size: Size) -> tuple[Size, list[str]]:
+    """Cloud Run only takes some cpu/memory pairs: >4Gi needs 2 vCPU, >8Gi 4, >16Gi 6, >24Gi 8;
+    4+ vCPU need 2Gi+, 6+ need 4Gi+; below 1 vCPU allows no concurrency. Round up instead of failing."""
+    cpu, mib, notes = size.cpu, size.memory_mib, []
+    if mib and mib > CLOUDRUN_MAX_MIB:
+        raise StepError(
+            "deploy", "user_action_required", f"Cloud Run allows at most 32Gi (asked {format_mib(mib)})"
+        )
+    if cpu is not None and cpu < 1:
+        cpu = 1.0
+        notes.append("cpu raised to 1 (Cloud Run needs 1 vCPU to serve concurrent requests)")
+    if mib:
+        need = next(
+            c
+            for limit, c in ((4096, 1), (8192, 2), (16384, 4), (24576, 6), (CLOUDRUN_MAX_MIB, 8))
+            if mib <= limit
+        )
+        if (cpu or 1) < need:
+            cpu = float(need)
+            notes.append(f"cpu raised to {need} (Cloud Run needs it for {format_mib(mib)})")
+    if cpu and cpu > 8:
+        raise StepError("deploy", "user_action_required", f"Cloud Run allows at most 8 vCPU (asked {cpu})")
+    floor = 4096 if cpu and cpu >= 6 else 2048 if cpu and cpu >= 4 else 0
+    if floor and (mib or 512) < floor:
+        mib = floor
+        notes.append(f"memory raised to {format_mib(floor)} (Cloud Run needs it for {_format_cpu(cpu)} vCPU)")
+    return Size(cpu, mib), notes
+
+
+def scaling_flags(cfg: Config, *, database: bool = False) -> list[str]:
+    """--min/--max-instances, --concurrency, --timeout for cloudrun and function.
+    With a Cloud SQL database the instance count is capped: every instance holds its own connections and a
+    small instance (db-f1-micro: 25 connections) runs out long before Cloud Run's default of 100 instances."""
+    max_instances = (
+        cfg.max_instances if cfg.max_instances is not None else (cfg.db_max_instances if database else None)
+    )
+    flags = []
+    for flag, value in (
+        ("--min-instances", cfg.min_instances),
+        ("--max-instances", max_instances),
+        ("--concurrency", cfg.concurrency),
+        ("--timeout", cfg.request_timeout),
+    ):
+        if value is not None:
+            flags += [flag, f"{value}s" if flag == "--timeout" else str(value)]
+    return flags
+
+
+def oom_note(killed: bool, size: Size) -> str:
+    """Wording healer recognises as an out-of-memory crash (it raises LABEL cloudmorph.memory)."""
+    if not killed:
+        return ""
+    limit = f" of {size.memory}" if size.memory_mib else ""
+    return f" (OOMKilled: the container ran out of memory and exceeded its memory limit{limit})"
+
+
+def container_oom_killed(name: str) -> bool:
+    cp = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.OOMKilled}}", name], capture_output=True, text=True, check=False
+    )
+    return cp.returncode == 0 and cp.stdout.strip() == "true"
+
+
+# --------------------------------------------------------------------------- #
 # build / push
 # --------------------------------------------------------------------------- #
 def build_image(src_dir: Path, image: str, platform: str | None, cfg: Config, r: Runner) -> None:
@@ -889,7 +1107,9 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         ]
         for k, v in env.items():
             run_cmd += ["-e", f"{k}={v}"]
-        run_cmd += ["-p", f"{host_port}:{cfg.container_port}", image]
+        size = size_for(src_dir, cfg, r)
+        out.handles["size"] = size.as_dict()
+        run_cmd += [*size.docker_flags(), "-p", f"{host_port}:{cfg.container_port}", image]
         cp = r.run("docker run", run_cmd, stage="deploy")
         out.handles["container_id"] = cp.stdout.strip()
 
@@ -903,10 +1123,11 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         if not ok:
             status, code = container_state(cname)
             logs = container_logs(cname)
+            oom = oom_note(code == 137 and container_oom_killed(cname), size)
             raise StepError(
                 "verify",
                 "runtime_error",
-                f"container status={status} exit_code={code}; {why}",
+                f"container status={status} exit_code={code}{oom}; {why}",
                 app_logs=logs,
                 diagnosis=diagnose_not_reachable(cfg.container_port, why, logs, exited=status != "running"),
             )
@@ -1081,6 +1302,20 @@ def tagged_url(service: str, tag: str, revision: str, cfg: Config, wait: int = 3
 CANDIDATE_TAG = "candidate"
 
 
+def _cloud_size_flags(
+    src_dir: Path, cfg: Config, r: Runner, out: Outcome, *, database: bool = False
+) -> list[str]:
+    """--cpu/--memory (fitted to what Cloud Run accepts) and the scaling flags; flags left out are inherited
+    from the previous revision, so a size set once sticks until it is changed."""
+    size, notes = fit_cloudrun(size_for(src_dir, cfg, r))
+    for note in notes:
+        r.steps.append(Step("instance size", note, 0, 0.0, "", ""))
+    out.handles["size"] = size.as_dict()
+    flags = ["--cpu", _format_cpu(size.cpu)] if size.cpu else []
+    flags += ["--memory", str(size.memory)] if size.memory_mib else []
+    return flags + scaling_flags(cfg, database=database)
+
+
 def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     """Blue/green: new revision gets 0% traffic and a tag URL; traffic moves only after it passes verify."""
     name = slug(src_dir.name)
@@ -1111,6 +1346,7 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         out.handles.update(database="cloudsql", cloudsql_connection=conn)
     if label:
         cmd += ["--update-labels", f"{OWNER_LABEL}={label}"]
+    cmd += _cloud_size_flags(src_dir, cfg, r, out, database="cloudsql_connection" in out.handles)
     if env:
         cmd += [
             "--set-env-vars",
@@ -1297,8 +1533,12 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         ):  # the user's own DB wins
             env["DATABASE_URL"] = nodepool.ensure_postgres(node, name)
             out.handles.update(database="postgres", db_container=f"{name}-db")
+        size = size_for(src_dir, cfg, r)
+        out.handles["size"] = size.as_dict()
         host_port = nodepool.free_port_on(node)
-        cid = nodepool.run_container(node, image, cname, host_port, cfg.container_port, env)
+        cid = nodepool.run_container(
+            node, image, cname, host_port, cfg.container_port, env, limits=size.docker_flags()
+        )
     except RuntimeError as e:
         r.steps.append(
             Step("docker run (remote)", f"ssh {node.name} docker run ...", 1, time.time() - t0, "", str(e))
@@ -1327,11 +1567,12 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     if not ok:
         status, code = nodepool.container_status(node, cname)
         logs = nodepool.container_logs(node, cname)
+        oom = oom_note(code == 137 and nodepool.container_oom_killed(node, cname), size)
         nodepool.remove_container(node, cname)
         raise StepError(
             "verify",
             "runtime_error",
-            f"container on {node.name} status={status} exit_code={code}; {why}",
+            f"container on {node.name} status={status} exit_code={code}{oom}; {why}",
             app_logs=logs,
             diagnosis=diagnose_not_reachable(cfg.container_port, why, logs, exited=status != "running"),
         )
@@ -1349,6 +1590,7 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
                 fleet.Replica(node=node.name, container=cname, host=node.host, port=host_port),
                 str(src_dir),
                 stateful=out.handles.get("database") is not None,
+                limits=size.docker_flags(),
             )
             r.steps.append(
                 Step("router register", f"caddy route {public} -> {node_url}", 0, time.time() - t0, "", "")
@@ -1509,6 +1751,7 @@ def deploy_function(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         cmd.append("--allow-unauthenticated")
     if sa := cfg.runtime_account():
         cmd += ["--service-account", sa]
+    cmd += _cloud_size_flags(src_dir, cfg, r, out)  # gen2 functions run on Cloud Run: same size rules
     if cfg.env:
         cmd += ["--set-env-vars", "^|^" + "|".join(f"{k}={v}" for k, v in cfg.env.items())]
     cp = r.run("gcloud functions deploy", cmd, timeout=cfg.deploy_timeout, check=False, stage="deploy")

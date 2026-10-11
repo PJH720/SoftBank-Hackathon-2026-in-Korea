@@ -36,7 +36,9 @@ POST /deploy ─▶ analyzer.analyze(src_dir) ──AnalysisResult──▶ depl
 
 **HealState** (LangGraph) — `src_dir`, `target`, `error_log`, `error_category`, `current_dockerfile`, `diff`, `history[PatchRecord]`, `retry_count`, `status` (`healing|healed|gave_up`), `last_result`
 
-**ErrorCategory** — `port_binding` · `missing_dependency` · `bad_entrypoint` · `build_failure` · `unknown`
+**ErrorCategory** — `port_binding` · `missing_dependency` · `bad_entrypoint` · `build_failure` · `out_of_memory` · `unknown`
+
+**인스턴스 사양** — deployer는 cpu/memory를 의존성(`detect_size`: torch·transformers → 2 vCPU/4Gi, playwright·puppeteer → 2Gi, numpy·pandas·JVM → 1Gi) < `DEPLOYER_CPU`/`DEPLOYER_MEMORY`(또는 `deploy(..., cpu=, memory=)`) < Dockerfile `LABEL cloudmorph.cpu="2" cloudmorph.memory="1Gi"` 순으로 정한다. cloudrun/function은 `--cpu`/`--memory`(Cloud Run이 받는 조합으로 올려 맞춤), local/node는 `docker run --cpus/--memory`. 실패한 배포의 `stderr`에는 `[deployer] instance cpu=… memory=…` 줄이 붙는다. healer는 `out_of_memory`(OOMKilled, Cloud Run `Memory limit of … exceeded`, `java.lang.OutOfMemoryError`, `MemoryError`)를 만나면 `LABEL cloudmorph.memory`를 두 배로 올려(최대 8Gi) 재배포한다
 
 > 이슈 #7 실패 유형은 enum을 늘리지 않고 기존 카테고리에 흡수했다: 공유 라이브러리 누락(`cannot open shared object file`) → `missing_dependency`, 비root `USER`의 쓰기 권한 → `unknown` + WORKDIR 내부의 안전한 경로에만 적용하는 chown 규칙, 필수 환경변수 누락 · 외부 서비스(DB) 접속 불가 · 로그 없는 크래시 → `unknown` + 고정 summary 접두어의 중단(`CONFIG_STOP` / `SERVICE_STOP` / `CRASH_STOP`, repo agent가 켜져 있어도 LLM 전에 멈춤). `Connection refused`는 더 이상 `port_binding`이 아니다. 별도 카테고리 후보(`permission` · `config_missing` · `system_dependency`)는 팀 합의 후 추가.
 

@@ -94,6 +94,7 @@ class ErrorCategory(str, Enum):
     MISSING_DEPENDENCY = "missing_dependency"
     BAD_ENTRYPOINT = "bad_entrypoint"
     BUILD_FAILURE = "build_failure"
+    OUT_OF_MEMORY = "out_of_memory"
     UNKNOWN = "unknown"
 
 
