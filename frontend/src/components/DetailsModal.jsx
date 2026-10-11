@@ -4,12 +4,12 @@ import { FileText, Rocket, Settings2, Sparkles, X } from 'lucide-react';
 // 프로젝트 and 노드 live on the 앱 관리 scene tab now.
 const TABS = [
   { id: 'deploy', title: '새 배포', description: '소스와 배포 타깃을 선택하고 앱을 올려보세요.', Icon: Rocket },
-  { id: 'details', title: '배포 상세', description: '분석 결과부터 서비스 주소와 로그까지, 한곳에서 확인하세요.', Icon: FileText },
+  { id: 'details', title: '배포 상세', description: '분석 결과와 서비스 주소, 자가치유 패치를 한곳에서 확인하세요.', Icon: FileText },
   { id: 'settings', title: '설정', description: '서버 연결에 필요한 인증 정보를 관리하세요.', Icon: Settings2 },
 ];
 const FOCUSABLE = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex="0"]';
 
-export default function DetailsModal({ panel, onPanel, onClose, logsRequest, children }) {
+export default function DetailsModal({ panel, onPanel, onClose, children }) {
   const dialog = useRef(null);
   const body = useRef(null);
   const close = useRef(null);
@@ -48,17 +48,6 @@ export default function DetailsModal({ panel, onPanel, onClose, logsRequest, chi
   useLayoutEffect(() => {
     if (panel) body.current.scrollTop = 0;
   }, [panel]);
-
-  useEffect(() => {
-    if (panel !== 'details' || !logsRequest) return undefined;
-    const frame = requestAnimationFrame(() => {
-      const container = body.current;
-      const logs = container?.querySelector('[data-deployment-logs]');
-      if (!logs) return;
-      container.scrollTop += logs.getBoundingClientRect().top - container.getBoundingClientRect().top;
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [panel, logsRequest]);
 
   const outside = (e) => {
     const bounds = dialog.current.getBoundingClientRect();
