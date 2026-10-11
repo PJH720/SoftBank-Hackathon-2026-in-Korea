@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Cloud, KeyRound } from 'lucide-react';
-import App from './App';
+import { Box, Cloud, KeyRound } from 'lucide-react';
 import {
   answerQuestion, cancelDeploy, drill, getDeployment, getHealth, getIncidents, getProjects, getToken, moveProject,
   setResource, setToken, startDeploy, stopProject, submitAnswers, subscribe,
@@ -17,12 +16,12 @@ const TABS = [
   { id: 'deploy', label: '배포하기' },
   { id: 'apps', label: '내 앱' },
   { id: 'incidents', label: '장애 대응' },
-  { id: 'classic', label: '자세히 보기' },
 ];
-const tabFromHash = () => TABS.find((t) => window.location.hash === `#/${t.id}`)?.id || 'deploy';
+// The team's 3D dashboard stays at "#/" (main.jsx); these screens live under "#/one-touch/<tab>".
+const tabFromHash = () => TABS.find((t) => window.location.hash === `#/one-touch/${t.id}`)?.id || 'deploy';
 
-/** The one-touch experience: deploy in one click, see every app on a map, and watch the incident guard.
- * The original operator dashboard (App) stays one tab away, unchanged. */
+/** The one-touch experience at "#/one-touch": deploy in one click, see every app on a map, and watch the
+ * incident guard. The team's 3D dashboard (App) stays the default at "#/", one link away. */
 export default function Shell() {
   const [tab, setTab] = useState(tabFromHash);
   const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', place: 'auto' });
@@ -45,7 +44,7 @@ export default function Shell() {
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
-  const go = (id) => { window.location.hash = `#/${id}`; setTab(id); };
+  const go = (id) => { window.location.hash = `#/one-touch/${id}`; setTab(id); };
 
   useEffect(() => {
     if (run.status !== 'running') return undefined;
@@ -158,14 +157,6 @@ export default function Shell() {
   const cloudReady = !!projects?.some((p) => p.live?.cloudrun);
   const saveToken = (v) => { setToken(v); setTokenState(v); };
 
-  if (tab === 'classic') {
-    return (
-      <>
-        <Nav tab={tab} go={go} healthy={healthy} token={token} showToken={showToken} setShowToken={setShowToken} saveToken={saveToken} />
-        <App />
-      </>
-    );
-  }
   return (
     <div className="min-h-screen bg-[#0a0d14] text-slate-100">
       <Nav tab={tab} go={go} healthy={healthy} token={token} showToken={showToken} setShowToken={setShowToken} saveToken={saveToken} />
@@ -206,6 +197,9 @@ function Nav({ tab, go, healthy, token, showToken, setShowToken, saveToken }) {
           ))}
         </div>
         <div className="flex items-center gap-2 text-[12px]">
+          <a href="#/" className="flex items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-slate-300 hover:text-white" title="팀의 3D 대시보드로 돌아가요">
+            <Box className="h-3.5 w-3.5" /> 3D 대시보드
+          </a>
           <span className="flex items-center gap-1.5 text-slate-400">
             <span className={`h-2 w-2 rounded-full ${healthy ? 'bg-emerald-400' : healthy === false ? 'bg-rose-400' : 'bg-slate-500'}`} />
             {healthy ? '연결됨' : healthy === false ? '서버와 끊겼어요' : '확인 중'}
