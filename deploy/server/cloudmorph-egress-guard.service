@@ -1,8 +1,11 @@
 # Keep user containers away from the GCE metadata server. Apps deployed to the "local" target run in this
 # VM's Docker; without this rule they can fetch the VM service account's token (run/sql/secret/storage admin)
 # from 169.254.169.254. DOCKER-USER only filters forwarded container traffic, so the backend itself is unaffected.
+# On GCE the same address is also the VM's DNS resolver, and containers on the default bridge (every
+# `docker build` RUN step) use it directly: only DNS (port 53) may pass, or `pip install` cannot resolve PyPI.
+# The token is served over HTTP, so rejecting every other TCP port keeps it out of reach.
 [Unit]
-Description=CloudMorph: block containers from the GCE metadata server
+Description=CloudMorph: block containers from the GCE metadata server (DNS still allowed)
 After=docker.service
 Requires=docker.service
 PartOf=docker.service
@@ -10,8 +13,10 @@ PartOf=docker.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -d 169.254.169.254/32 -j REJECT 2>/dev/null || iptables -I DOCKER-USER -d 169.254.169.254/32 -j REJECT'
-ExecStop=-/usr/sbin/iptables -D DOCKER-USER -d 169.254.169.254/32 -j REJECT
+# the first version rejected the whole address, DNS included; drop it (and any duplicates) before adding ours
+ExecStartPre=/bin/sh -c 'while iptables -D DOCKER-USER -d 169.254.169.254/32 -j REJECT 2>/dev/null; do :; done'
+ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -d 169.254.169.254/32 -p tcp ! --dport 53 -j REJECT --reject-with tcp-reset 2>/dev/null || iptables -I DOCKER-USER -d 169.254.169.254/32 -p tcp ! --dport 53 -j REJECT --reject-with tcp-reset'
+ExecStop=-/usr/sbin/iptables -D DOCKER-USER -d 169.254.169.254/32 -p tcp ! --dport 53 -j REJECT --reject-with tcp-reset
 
 [Install]
 WantedBy=multi-user.target docker.service

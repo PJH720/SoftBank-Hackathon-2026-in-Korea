@@ -18,7 +18,7 @@ SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=
 "${SSH[@]}" 'set -e
 sudo systemctl daemon-reload
 sudo systemctl enable --now cloudmorph-egress-guard.service >/dev/null
-sudo iptables -C DOCKER-USER -d 169.254.169.254/32 -j REJECT
+sudo iptables -C DOCKER-USER -d 169.254.169.254/32 -p tcp ! --dport 53 -j REJECT --reject-with tcp-reset
 # legacy shared network: drop it when no container is attached any more (fails harmlessly otherwise)
 docker network rm cloudmorph >/dev/null 2>&1 || true
 echo "metadata blocked for containers; networks: $(docker network ls --format "{{.Name}}" | grep -c "^cm-") per-app"'
@@ -26,6 +26,11 @@ echo "metadata blocked for containers; networks: $(docker network ls --format "{
 # check from inside a throwaway container: the metadata server must refuse
 if "${SSH[@]}" 'docker run --rm busybox wget -q -T 3 -O- http://169.254.169.254/ >/dev/null 2>&1'; then
   echo "FAILED: a container on $TARGET can still reach the metadata server" >&2
+  exit 1
+fi
+# ...but it must still resolve names: on GCP the metadata address is the DNS server too (image builds need it)
+if ! "${SSH[@]}" 'docker run --rm busybox nslookup pypi.org >/dev/null 2>&1'; then
+  echo "FAILED: a container on $TARGET cannot resolve DNS names" >&2
   exit 1
 fi
 echo "ok: $TARGET"
