@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { answerQuestion, cancelDeploy, getDeployment, getFleet, getHealth, getMe, getProjects, getToken, logOut, setToken, startDeploy, stopProject, submitEnv, subscribe } from './api';
+import { answerQuestion, cancelDeploy, getAgents, getDeployment, getFleet, getHealth, getMe, getProjects, getToken, logOut, setToken, startDeploy, stopProject, submitEnv, subscribe } from './api';
 import AuthScreen from './components/AuthScreen';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
@@ -9,6 +9,7 @@ import { AnalysisCard, Endpoints, PatchList, QuestionCard } from './components/R
 import AppsBoard from './components/AppsBoard';
 import { DashboardHeader, RunHUD, ActivityDock } from './components/DashboardChrome';
 import DetailsModal from './components/DetailsModal';
+import { AgentPanel } from './components/OwnerPanels';
 import { pendingInput } from './lib/dashboard';
 import SceneBoundary from './components/3d/SceneBoundary';
 import { shouldCelebrate } from './lib/victory';
@@ -54,6 +55,7 @@ export default function App() {
   const mounted = useRef(true);
   const [fleet, setFleet] = useState(null);
   const [healthy, setHealthy] = useState(null);
+  const [agents, setAgents] = useState([]); // the caller's on-premises agents ("내 PC" target)
   const [token, setTokenState] = useState(getToken());
   const [me, setMe] = useState(null);
   const [meChecked, setMeChecked] = useState(false); // false until the first /projects/me answer
@@ -252,10 +254,11 @@ export default function App() {
     const poll = async () => {
       if (fetching) return;
       fetching = true;
-      const [h, p] = await Promise.all([getHealth(), refreshProjects()]);
+      const [h, p, a] = await Promise.all([getHealth(), refreshProjects(), getAgents().catch(() => [])]);
       fetching = false;
       if (!alive) return;
       setHealthy(h);
+      setAgents(a);
       if (p) {
         // auto-follow deployments started by a GitHub push
         const prev = seenDeployments.current;
@@ -517,14 +520,16 @@ export default function App() {
             </SceneBoundary>}
           </div>
           <ActivityDock run={run} project={currentProject} onPanel={setPanel}>
-            {/* the full pipeline log under the scene on tall screens; short ones keep the one-line key logs */}
-            <LogConsole logs={run.logs} running={run.status === 'running'} height="clamp(120px, 20vh, 260px)" />
+            {/* the full pipeline log under the 3D scenes on tall screens; short ones, and the 앱 관리 board (it needs
+                the height for its cards), keep the one-line key logs */}
+            {!showBoard && <LogConsole logs={run.logs} running={run.status === 'running'} height="clamp(120px, 20vh, 260px)" />}
           </ActivityDock>
         </main>
       </div>
       <DetailsModal logsRequest={logsRequest} panel={panel} onPanel={setPanel} onClose={() => setPanel(null)}>
         <div className="modal-section" id="modal-section-deploy" role="region" aria-labelledby="modal-menu-deploy" hidden={panel !== 'deploy'}>
-          <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={starting || runRunning || !!redeploying || stopping.has(form.name.trim())} fleetAvailable={!!fleet} />
+          <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={starting || runRunning || !!redeploying || stopping.has(form.name.trim())} fleetAvailable={!!fleet} agentOnline={agents.some((x) => x.online)} />
+          <AgentPanel agents={agents} token={token} />
         </div>
         <div className="modal-section" id="modal-section-details" role="region" aria-labelledby="modal-menu-details" hidden={panel !== 'details'}>
           {run.envRequest && <EnvRequestCard key={`env-${run.id}`} request={run.envRequest} onSubmit={(values) => submitEnv(run.id, values)} />}
