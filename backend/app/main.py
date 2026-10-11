@@ -1373,10 +1373,13 @@ def create_app() -> FastAPI:
             app_name, {"name": app_name, "source": source, "ref": ref, "history": [], "owner": owner}
         )
         project.setdefault("owner", owner)
+        # A guard failover stands in on another target for a while; the app's own targets (what the next
+        # push and the dashboard deploy to) stay as the user chose them. A user's move changes them.
+        failover = trigger == "guard"
         project.update(
             source=source,
             ref=ref,
-            targets=targets,
+            **({} if failover else {"targets": targets}),
             last_deployment_id=deployment_id,
             last_status="running",
             trigger=trigger,
@@ -1473,7 +1476,8 @@ def create_app() -> FastAPI:
                 overrides = _apply_resources(app_name, project, _env_overrides(analysis.required_env, values))
                 for t in run_targets:  # targets=[] (CloudMorph picks): the job learns its targets only now
                     job.targets.setdefault(t, {"success": None, "url": None})
-                project["targets"] = run_targets
+                if not failover:
+                    project["targets"] = run_targets
                 # a provisioned database belongs to the app *and* its source, like the saved env values
                 overrides["db_owner"] = _source_identity(source)
                 # Separate target workspaces because deployer writes Dockerfile and may leave background

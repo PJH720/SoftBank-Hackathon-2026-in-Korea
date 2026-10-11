@@ -216,3 +216,39 @@ def test_outage_with_nowhere_to_go_is_escalated_at_once(world):
     (i,) = g.incidents
     assert i.status == "escalated" and len(i.verdicts) == 1 and world["docker"] == []  # no futile restarts
     assert "옮길 곳" in i.timeline[-1]["text"]
+
+
+def test_failover_deploy_keeps_the_apps_own_targets(monkeypatch, tmp_path):
+    """A guard failover runs one target; the next push must still go to every target the user chose."""
+    import asyncio
+    import contextlib
+
+    from app import main
+    from app.schemas import AnalysisResult
+
+    @contextlib.contextmanager
+    def source(*_):
+        yield str(tmp_path)
+
+    monkeypatch.setattr(main, "prepare_source", source)
+    monkeypatch.setattr(main.analyzer, "quick_decision", lambda _: None)
+    analysis = AnalysisResult(target="local", language="python", dockerfile="FROM x\n")
+    monkeypatch.setattr(main.analyzer, "analyze", lambda _: analysis)
+    monkeypatch.setattr(main, "run_pipeline", lambda *a, **kw: False)  # every target fails fast, nothing runs
+    app = main.create_app()
+
+    async def deploy(targets, trigger):
+        dep = app.state.launch("https://github.com/acme/gb.git", targets, name="gb", trigger=trigger)
+        right_after = list(main._projects["gb"]["targets"])
+        while main._jobs[dep].state in ("queued", "running"):
+            await asyncio.sleep(0.01)
+        return right_after, main._projects["gb"]["targets"]
+
+    async def run():
+        everywhere = ["local", "cloudrun", "node"]
+        assert await deploy(everywhere, "github-push") == (everywhere, everywhere)
+        assert await deploy(["cloudrun"], "guard") == (everywhere, everywhere)
+        # a user's move does change them
+        assert await deploy(["cloudrun"], "move") == (["cloudrun"], ["cloudrun"])
+
+    asyncio.run(run())

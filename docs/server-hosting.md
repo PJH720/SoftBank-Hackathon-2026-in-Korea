@@ -39,7 +39,7 @@ GitHub 환경 `production`(배포 브랜치 main만)에 둔다. 다른 브랜치
 | 타깃 | 사용자 앱이 닿는 계정 | 장치 |
 |---|---|---|
 | cloudrun, function | `cloudmorph-apps@…` — `cloudsql.client`만 | `DEPLOYER_APP_SERVICE_ACCOUNT=cloudmorph-apps` (`cloudmorph-backend.service`) |
-| local (서버 Docker) | 없음 | `cloudmorph-egress-guard.service`: `DOCKER-USER` 체인에서 컨테이너 → 메타데이터 서버 차단. 백엔드 자신은 영향 없음 |
+| local (서버 Docker) | 없음 | `cloudmorph-egress-guard.service`: `DOCKER-USER` 체인에서 컨테이너 → 메타데이터 서버 차단(DNS 53번만 허용: GCE에서는 같은 주소가 DNS 서버라서, 막으면 이미지 빌드의 `pip install`이 실패한다). 백엔드 자신은 영향 없음 |
 | node | 노드 VM의 기본 계정, 범위 `devstorage.read_only` | (노드에도 같은 차단을 넣으면 더 좋다) |
 
 이 설정이 없으면 cloudrun 앱은 프로젝트 기본 Compute 계정(**편집자**)으로, local 앱은 `cloudmorph-control`(run·sql·secret·storage 관리자)로 돈다.
