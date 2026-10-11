@@ -15,7 +15,8 @@ Design notes
   without importing deployer.py, and tests can use a fake deployer.
 - With ANTHROPIC_API_KEY the fallback is a repo agent: it reads the whole source tree, may edit
   source files in `src_dir` (main.py's per-target copy, never the user's checkout), and returns
-  the Dockerfile. App-code crashes are then repaired instead of stopping.
+  the Dockerfile. App-code crashes are then repaired instead of stopping. LLM_PROVIDER pointing at
+  another provider (e.g. sglang for an on-prem server) turns the agent off, so that provider answers.
 - Failures only a human can fix (missing env var, unreachable DB/service, silent native crash) stop
   before any LLM or redeploy, with or without the repo agent: see needs_human_stop.
 """
@@ -1196,13 +1197,15 @@ def heal(
 ) -> HealReport:
     """Entry point for main.py: call after the first deploy failed.
 
-    Policy: with the repo agent (default when ANTHROPIC_API_KEY is set and no `llm_patch_fn` is
-    injected) the Dockerfile and the source in `src_dir` are both patched; a source edit is
-    redeployed only if `confirm_fn` (when given) does not stop it. Without the agent only the
-    Dockerfile is patched; a crash in the app's own code stops at once, and for import-time crashes
-    a source fix is suggested as a diff in the summary, never applied.
+    Policy: with the repo agent (default when Claude is the selected provider, i.e. ANTHROPIC_API_KEY
+    is set and LLM_PROVIDER does not pick another one, and no `llm_patch_fn` is injected) the
+    Dockerfile and the source in `src_dir` are both patched; a source edit is redeployed only if
+    `confirm_fn` (when given) does not stop it. Without the agent only the Dockerfile is patched; a
+    crash in the app's own code stops at once, and for import-time crashes a source fix is suggested
+    as a diff in the summary, never applied.
     """
-    if repair_fn is None and llm_patch_fn is None and os.environ.get("ANTHROPIC_API_KEY"):
+    # The agent is Claude-only (tool use); with LLM_PROVIDER=sglang etc. the forced provider answers instead
+    if repair_fn is None and llm_patch_fn is None and _configured_providers()[:1] == ["anthropic"]:
         repair_fn = default_repo_repair
     stopped: list[str] = []
 

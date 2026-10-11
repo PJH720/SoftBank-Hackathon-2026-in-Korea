@@ -66,7 +66,7 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
 | `ANTHROPIC_API_KEY` | analyzer 필수 · healer 선택 | - | `healer`, `analyzer` | Anthropic(Claude) API 키. analyzer는 이 키가 없으면 분석하지 않습니다. |
 | `OPENAI_API_KEY` | 선택 | - | `healer.py` | OpenAI API 키. 로컬 서버가 키를 요구하면 그 키를 넣습니다. |
 | `OPENAI_BASE_URL` | 선택 | - | `healer.py` | 로컬/호환 서버 엔드포인트(vLLM, SGLang, Ollama, llama.cpp 등). 예: `http://localhost:8000/v1` |
-| `LLM_PROVIDER` | 선택 | 자동 | `healer.py` | 제공자 고정: `anthropic`/`openai`/`local`/`vllm`/`sglang`/`ollama`/`llamacpp`. 비우면 Claude → OpenAI → 로컬 순서로 시도 |
+| `LLM_PROVIDER` | 선택 | 자동 | `healer.py` | 제공자 고정: `anthropic`/`openai`/`local`/`vllm`/`sglang`/`ollama`/`llamacpp`. 비우면 Claude → OpenAI → 로컬 순서로 시도. Claude가 아닌 제공자로 고정하면 Claude repo agent를 끄고 그 제공자가 healer를 맡습니다 (analyzer는 계속 `ANTHROPIC_API_KEY` 사용) |
 | `HEALER_MODEL` | 선택 (로컬은 필수) | 제공자별 (`claude-haiku-5-5` / `gpt-4o`) | `healer.py` | healer 모델. 다른 제공자용 이름이면 무시하고 기본값 사용. 제공자별 지정: `HEALER_MODEL_ANTHROPIC` / `HEALER_MODEL_OPENAI` / `HEALER_MODEL_LOCAL` |
 | `ANALYZER_MODEL` | 선택 | `claude-haiku-5-5` | `analyzer.py` | 소스코드 정적 분석 및 위험 탐지에 사용할 AI 검사관 모델. |
 | `ANALYZER_MAX_LLM_CALLS` | 선택 | `6` | `analyzer.py` | 서버 전체에서 동시 실행 가능한 검사관 LLM 호출 수 상한(세마포어). |
