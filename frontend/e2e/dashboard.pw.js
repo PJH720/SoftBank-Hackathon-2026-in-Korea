@@ -59,7 +59,7 @@ for (const [width, height] of [[1920, 1080], [1366, 768], [375, 667], [375, 320]
     const view = await page.locator('#scene-view').boundingBox();
     expect(view.height).toBeGreaterThan(80);
     await expect(page.getByRole('button', { name: '새 배포', exact: true })).toBeInViewport();
-    await expect(page.getByRole('button', { name: '전체 로그 보기' })).toBeInViewport();
+    await expect(page.getByRole('region', { name: '파이프라인 로그' })).toBeInViewport();
     await page.screenshot({ path: test.info().outputPath('journey.png') });
     await page.getByRole('tab', { name: '노드 풀' }).click();
     await expect(page.getByLabel('노드 200개 3D 상태 그리드')).toBeVisible();
@@ -124,7 +124,7 @@ test('healing question, full stage celebration, modal-first Escape and return to
   await expect(victory).toBeVisible();
   await page.screenshot({ path: test.info().outputPath('victory.png') });
   await expect(page.getByRole('link', { name: 'Local Docker 열기' })).toBeVisible();
-  await page.getByRole('button', { name: '전체 로그 보기' }).click();
+  await page.getByRole('button', { name: '배포 상세' }).first().click();
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
   await expect(victory).toBeVisible();
@@ -178,24 +178,22 @@ test('fullscreen rejection keeps the viewport dashboard usable', async ({ page }
   await start(page);
 });
 
-test('opening logs follows the latest events without scrolling the modal or page', async ({ page }) => {
+test('docked pipeline log follows the latest events without scrolling the page', async ({ page }) => {
   await setup(page);
   await start(page);
   const append = () => page.evaluate(() => {
     for (let i = 0; i < 40; i++) window.testStreams.at(-1).emit('stage', {}, 'analyze');
   });
-  await append();
-  await page.getByRole('button', { name: '전체 로그 보기' }).click();
-  const box = page.getByRole('dialog').locator('.overflow-y-auto');
+  const dock = page.getByRole('region', { name: '파이프라인 로그' });
+  const box = dock.locator('.overflow-y-auto');
   const gap = () => box.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
+  await append();
+  await expect(dock).toBeInViewport();
   await expect.poll(gap).toBeLessThan(40);
-  await page.locator('.modal-body').evaluate((el) => { el.scrollTop = 0; });
   await append();
   await expect.poll(gap).toBeLessThan(40);
-  expect(await page.locator('.modal-body').evaluate((el) => el.scrollTop)).toBe(0);
+  await page.getByRole('button', { name: '배포 상세' }).first().click();
+  await expect(page.getByRole('dialog').locator('.overflow-y-auto')).toHaveCount(0);
   await page.keyboard.press('Escape');
-  await append();
-  await page.getByRole('button', { name: '전체 로그 보기' }).click();
-  await expect.poll(gap).toBeLessThan(40);
   expect(await page.evaluate(() => scrollY)).toBe(0);
 });

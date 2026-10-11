@@ -70,25 +70,10 @@ code, pre, .font-mono { font-family: var(--mono); }
 .scene-embedded { width: 100%; height: 100%; min-height: 0; }
 .scene-embedded [data-scene-label] { font-size: clamp(10px, 1.1vw, 15px); padding: 4px 9px; }
 .scene-message { display: flex; height: 100%; align-items: center; justify-content: center; padding: 20px; text-align: center; color: #a3a7bd; font-size: 14px; }
-.activity-dock { padding: 10px 28px 14px; background: linear-gradient(rgba(11, 13, 23, 0.75), rgba(11, 13, 23, 0.98)); border-top: 1px solid var(--line); z-index: 15; min-width: 0; }
-.dock-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; font-size: 10px; letter-spacing: 1.5px; color: #8a8ea6; }
-.dock-heading > span { display: inline-flex; gap: 6px; align-items: center; }
-.dock-heading button { border: 0; background: transparent; font-size: 11px; color: var(--gold); cursor: pointer; letter-spacing: 0; }
-.key-logs { padding: 0; margin: 0; list-style: none; }
-/* Pipeline log at the bottom of the main screen: only where there is height for it, so the 3D scene and the
-   one-screen layout survive on short windows and phones (there the one-line key logs stay). */
-.dock-console { display: none; min-width: 0; }
-@media (min-height: 760px) and (min-width: 768px) {
-  .activity-dock.has-console .dock-console { display: block; }
-  .activity-dock.has-console .key-logs { display: none; }
-}
-.key-logs li { display: flex; gap: 12px; align-items: center; font-size: 12px; line-height: 21px; min-width: 0; color: #cbd5e1; }
-.key-logs time { font: 10px ui-monospace, monospace; color: #8a8ea6; flex-shrink: 0; }
-.key-logs li > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.key-logs li[data-kind="error"] { color: #ff9a9d; }
-.key-logs li[data-kind="heal"] { color: #ffc768; }
-.key-logs li[data-kind="success"] { color: #6fdc93; }
-.key-logs .empty-log { color: #8a8ea6; }
+.activity-dock { --dock-log-height: clamp(72px, 18dvh, 200px); padding: 8px 28px 10px; background: linear-gradient(rgba(11, 13, 23, 0.75), rgba(11, 13, 23, 0.98)); border-top: 1px solid var(--line); z-index: 15; min-width: 0; }
+.activity-dock > section > header { padding: 6px 14px; }
+.activity-dock > section > div { padding: 0; }
+.activity-dock > section > div > footer { padding: 4px 14px; }
 .live-links { display: flex; gap: 8px; margin-top: 7px; overflow-x: auto; }
 .live-links a { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; padding: 4px 10px; border: 1.5px solid rgba(61, 189, 106, 0.35); background: rgba(61, 189, 106, 0.12); border-radius: 999px; color: #6fdc93; text-decoration: none; font-size: 11px; }
 .victory-embedded { display: flex; flex-direction: column; height: 100%; min-height: 0; background: radial-gradient(ellipse at center, rgba(169, 126, 224, 0.2), transparent 70%); }
@@ -151,8 +136,8 @@ code, pre, .font-mono { font-family: var(--mono); }
   .run-actions { gap: 6px; }
   .run-progress { margin-top: 8px; }
   .compact-steps { width: 100%; justify-content: space-between; gap: 6px; }
-  .activity-dock { padding: 8px 14px 12px; }
-  .key-logs li { font-size: 11px; }
+  .activity-dock { padding: 6px 10px 8px; }
+  .activity-dock > section > header h2 { display: none; }
   .details-modal { width: calc(100% - 24px); max-height: calc(100dvh - 24px); }
   .modal-header { padding: 16px; gap: 8px; }
   .modal-heading { gap: 10px; }
@@ -169,9 +154,9 @@ code, pre, .font-mono { font-family: var(--mono); }
 @media (max-height: 600px) {
   .run-hud { padding-top: 7px; padding-bottom: 4px; }
   .run-progress, .run-identity { display: none; }
-  .activity-dock { padding-top: 5px; padding-bottom: 7px; }
-  .key-logs li:not(:last-child) { display: none; }
-  .dock-heading { margin-bottom: 2px; }
+  .activity-dock { --dock-log-height: 44px; padding-top: 4px; padding-bottom: 5px; }
+  .activity-dock > section > header { display: none; }
+  .activity-dock > section > div > footer { display: none; }
   .hud-message { margin-top: 3px; }
   .victory-heading { padding: 2px 12px; }
 }
