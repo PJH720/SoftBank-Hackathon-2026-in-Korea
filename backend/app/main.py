@@ -651,20 +651,21 @@ def _apply_resources(name: str, project: dict, overrides: dict) -> dict:
     for kind, setting in resources.items():
         var = stores.get(kind) or STORE_ENV[kind]
         mode = setting.get("mode")
+        # what turns the deployer's own provisioning off for this kind (a sidecar/Cloud SQL it would add)
+        off = {"cache": False} if kind == "redis" else {"database": None}
         if mode == "url":
             if url := _resource_secrets.get(name, {}).get(var) or env.get(var):
                 env[var] = url
-            elif kind == "postgres":
+            else:
                 # the user's own address is gone (restart without Secret Manager): never quietly swap in a new DB
-                overrides["database"] = None
+                overrides.update(off)
         elif mode == "new":
             env.pop(var, None)  # the deployer makes one and injects DATABASE_URL
             if kind == "postgres":
                 overrides["database"] = "postgres"
         elif mode == "none":
             env.pop(var, None)
-            if kind == "postgres":
-                overrides["database"] = None
+            overrides.update(off)
     if env:
         overrides["env"] = env
     else:
@@ -1077,6 +1078,8 @@ def create_app() -> FastAPI:
                 for t in run_targets:  # targets=[] (CloudMorph picks): the job learns its targets only now
                     job.targets.setdefault(t, {"success": None, "url": None})
                 project["targets"] = run_targets
+                # a provisioned database belongs to the app *and* its source, like the saved env values
+                overrides["db_owner"] = _source_identity(source)
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
@@ -1197,11 +1200,10 @@ def create_app() -> FastAPI:
             """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
             `auto` marks what the deployer provisions when left blank, so the card can say so honestly.
             Returns (values, targets the user picked or None)."""
-            postgres = deployer.wants_database(Path(source_dir), deployer.Config.from_env()) == "postgres"
-            job.required_env = [
-                e.model_copy(update={"auto": True}) if postgres and e.name == "DATABASE_URL" else e
-                for e in items
-            ]
+            # targets=[]: the user picks on this card, so promise only what every place provisions
+            places = targets or ["local", "cloudrun", "node"]
+            auto = deployer.provisioned_env(Path(source_dir), places, deployer.Config.from_env())
+            job.required_env = [e.model_copy(update={"auto": True}) if e.name in auto else e for e in items]
             payload = {
                 "items": [e.model_dump() for e in job.required_env],
                 "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,
@@ -1495,9 +1497,11 @@ def create_app() -> FastAPI:
         return {"ok": True, "deployment_id": deployment_id, "name": project["name"], "sha": info.sha}
 
     @app.post("/projects/{name}/stop")
-    async def stop_project(name: str, request: Request) -> dict:
-        """Take down every target this app is serving (container + tunnel, Cloud Run service, node replicas)."""
+    async def stop_project(name: str, request: Request, drop_database: bool = False) -> dict:
+        """Take down every target this app is serving (container + tunnel, Cloud Run service, node replicas).
+        `?drop_database=true` also deletes its databases, each after a backup (deployer.teardown)."""
         project = _own_project(request, name)
+        options = {"drop_database": True} if drop_database else {}
         lock = _app_locks.setdefault(name, threading.Lock())
         if not lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="a deployment of this app is in progress")
@@ -1507,7 +1511,7 @@ def create_app() -> FastAPI:
             serving = project.get("live") or {}
             for target, handles in serving.items():
                 try:
-                    stopped[target] = await asyncio.to_thread(deployer.teardown, target, handles)
+                    stopped[target] = await asyncio.to_thread(deployer.teardown, target, handles, **options)
                 except Exception as exc:  # noqa: BLE001 — report per target, keep the others going
                     failed[target] = f"{type(exc).__name__}: {exc}"
             project["live"] = {t: h for t, h in serving.items() if t in failed}

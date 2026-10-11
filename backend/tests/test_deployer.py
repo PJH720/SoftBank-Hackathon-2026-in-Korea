@@ -195,14 +195,18 @@ def test_users_own_database_url_skips_provisioning(tmp_path, monkeypatch, given,
     runs = _record_runs(monkeypatch)
     made = []
     monkeypatch.setattr(
-        deployer, "ensure_local_postgres", lambda app, r: made.append(app) or "postgresql://sidecar/app"
+        deployer,
+        "ensure_local_sidecar",
+        lambda app, engine, r, scheme=None: made.append(app) or "postgresql://sidecar/app",
     )
     monkeypatch.setattr(deployer, "build_image", lambda *args: None)
     monkeypatch.setattr(deployer, "cleanup_local", lambda handles, **kw: [])
     monkeypatch.setattr(deployer, "wait_up", lambda *args, **kw: (True, ""))
     cfg = deployer.Config(tunnel=False, env=dict(given))
     deployer.deploy_local(tmp_path, cfg, deployer.Runner(), deployer.Outcome(target="local"))
-    run_cmd = next(cmd for cmd, _ in runs if cmd[:2] == ["docker", "run"])
+    run_cmd, run_env = next((cmd, env) for cmd, env in runs if cmd[:2] == ["docker", "run"])
     expected = "postgresql://sidecar/app" if provisioned else given["DATABASE_URL"]
-    assert f"DATABASE_URL={expected}" in run_cmd
+    # the value goes through docker's own env, not the command line (it may hold a password)
+    assert "DATABASE_URL" in run_cmd and not any(expected in part for part in run_cmd)
+    assert run_env["DATABASE_URL"] == expected
     assert bool(made) is provisioned

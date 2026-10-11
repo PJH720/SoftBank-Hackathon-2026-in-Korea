@@ -7,10 +7,6 @@ export function pendingInput(run) {
   return null
 }
 
-export function recentKeyLogs(logs, limit = 3) {
-  return logs.filter((l) => l.kind !== 'info' && l.kind !== 'note').slice(-limit)
-}
-
 export function liveEndpoints(run, project) {
   return run.targets.flatMap((target) => {
     const state = run.targetState[target]

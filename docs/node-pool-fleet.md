@@ -60,11 +60,35 @@ uv run python -m app.fleet status
 앱이 `DATABASE_URL`을 읽거나 Postgres 드라이버를 쓰면(`detect_database`) deployer가 타깃에 맞는 DB를 만들어 주입한다.
 SQLite 경로를 하드코딩한 앱은 대상이 아니다(읽지도 않는 URL을 넣는 것은 눈속임이므로). 그런 앱은 analyzer/healer가 코드를 고칠 영역.
 
+엔진은 드라이버·URL 스킴·ORM provider 설정으로 정한다(`scan_database`, 판단 근거는 배포 로그의 `database` 단계에 남는다).
+
+- Postgres 근거(`psycopg`, `asyncpg`, npm `pg`, `postgresql://`, prisma `provider = "postgresql"` …)가 있으면 Postgres, 없고 MySQL 근거(`pymysql`, `mysql2`, `mysql://` …)가 있으면 MySQL이다.
+- ORM만 있는 경우(`sqlalchemy`, `prisma`)는 근거가 아니다. 엔진을 알 수 없기 때문이다.
+- `DATABASE_URL`만 읽는 앱은 Postgres를 받는다. 다만 SQLite로 fallback하거나(`sqlite:///`), 의존성 파일(`requirements.txt`, `package.json` …)에 드라이버가 없으면 DB를 만들지 않는다. 드라이버 없이 URL만 넣으면 앱이 시작하다 죽는다.
+- lock 파일과 `node_modules`, `.venv`는 보지 않는다.
+
+Cloud SQL의 DB·계정 이름은 앱 이름과 소스(`main._source_identity`)의 해시로 만든다(`db_identifier`: `<앱>_<해시 8자>`, 최대 32자).
+같은 이름으로 다른 저장소를 배포해도 서로의 데이터를 받지 않는다(env_store와 같은 규칙). 서비스에는 `cloudmorph-owner=<해시>` 라벨을 남긴다.
+이 규칙 이전에 만든 서비스(라벨 없음)나 같은 소유자의 서비스가 예전 이름(`<앱>`)의 DB로 서비스 중이면 그 DB를 계속 쓴다. 업그레이드해도 데이터가 끊기지 않는다.
+재배포 때는 서비스 중인 리비전의 비밀번호를 그대로 쓴다(PR #25). 검증 전에 비밀번호를 바꾸면 기존 리비전과 롤백 대상이 DB에 접속하지 못한다.
+
 | 타깃 | DB | 방법 | 데이터 보존 |
 |---|---|---|---|
-| local | `postgres:16-alpine` 사이드카 `<app>-db` | docker network `cloudmorph`, 볼륨 `<app>-dbdata` | 재배포(healer 재시도) 후에도 유지. `cleanup`에서만 삭제 |
-| node | 같은 방식을 노드에서 SSH로 | 노드마다 사이드카 | 앱이 `stateful`로 표시되어 **자동 확장 제외** |
-| cloudrun | Cloud SQL 인스턴스 `cloudmorph-pg`(공유) | `gcloud sql databases/users create` → `--add-cloudsql-instances` + `DATABASE_URL=postgresql://u:p@/db?host=/cloudsql/<conn>` | 관리형 |
+| local | 사이드카: Postgres `postgres:16-alpine` / MySQL `mysql:8.4` → `<app>-db`, Redis `redis:7-alpine` → `<app>-redis` | docker network `cloudmorph`, 볼륨 `<app>-dbdata` / `<app>-mysqldata` / `<app>-redisdata` | 재배포(healer 재시도) 후에도 유지. `cleanup`에서만 삭제 |
+| node | 같은 방식을 노드에서 SSH로 (`nodes.sidecar_script` 하나를 local·node가 같이 씀) | 노드마다 사이드카 | 앱이 `stateful`로 표시되어 **자동 확장 제외** |
+| cloudrun | Cloud SQL 인스턴스 `cloudmorph-pg`(공유), Postgres만 | `gcloud sql databases/users create` → `--add-cloudsql-instances` + `DATABASE_URL=postgresql://u:p@/db?host=/cloudsql/<conn>` (비밀번호는 Secret Manager `cloudmorph-db-<db>`에도 보관) | 관리형 |
+
+- 사이드카 비밀번호는 사이드카마다 무작위 값이고, 컨테이너 자신의 env에만 있다. 재배포는 `docker inspect`로 그 값을 읽어 쓴다(예전 `app` 비밀번호 사이드카도 그대로 동작). 같은 `cloudmorph` 네트워크의 다른 앱은 비밀번호 없이 접속하지 못한다.
+- 컨테이너가 지워지고 볼륨만 남은 Postgres는 새 컨테이너가 컨테이너 안 소켓(trust)으로 새 비밀번호를 설정한다. MySQL은 그렇게 할 수 없어서 `user_action_required`로 멈춘다(볼륨을 지우거나 컨테이너를 되살린다).
+- MySQL URL 스킴은 코드에 적힌 것을 따른다(`mysql+pymysql://` 등, 없으면 `mysql://`). Redis는 앱이 `REDIS_URL`을 읽을 때만 붙는다(`DEPLOYER_CACHE=0`이면 끔).
+- cloudrun에서 MySQL 앱은 `user_action_required`로 멈춘다(MySQL 서버의 `DATABASE_URL`을 주거나 local/node로 배포). Redis는 경고만 남긴다(Memorystore는 VPC 커넥터가 필요하다).
+- Cloud SQL 비밀번호는 Secret Manager에도 보관한다(CloudMorph만 읽는다). 다른 머신에서 배포하거나 리비전 env에서 읽을 수 없어도 비밀번호를 바꾸지 않는다(`DEPLOYER_DB_SECRET=0`이면 보관하지 않음).
+- 앱에는 기본적으로 env 변수로 넣는다. `DEPLOYER_DB_SECRET_MOUNT=1`이면 secret을 `--set-secrets`로 마운트하고 런타임 서비스 계정에 그 secret의 `roles/secretmanager.secretAccessor`를 준다. 앱마다 서비스 계정이 따로 있을 때만 켠다: 모든 앱이 `DEPLOYER_APP_SERVICE_ACCOUNT` 하나를 같이 쓰면 앱끼리 서로의 DB secret을 읽을 수 있다. 서비스 계정은 `DEPLOYER_APP_SERVICE_ACCOUNT`를 따르고(마이그레이션 job도 같음), 없으면 서비스의 계정, 그다음 기본 compute 계정이다.
+- 대시보드에서 Redis·MySQL을 떼어 내면(`mode=none`, 또는 저장한 주소를 잃은 `url`) deployer가 사이드카를 스스로 붙이지 않는다(`cache=False` / `database=None`).
+- 인스턴스가 없으면 기본은 `user_action_required`로 멈춘다. `CLOUDSQL_AUTOCREATE=1`이면 `POSTGRES_16`, `ENTERPRISE`, `db-f1-micro`(`CLOUDSQL_TIER`)로 만든다(약 10분, 있는 동안 과금).
+- 마이그레이션: DB가 붙은 앱에 `alembic.ini`, Django `manage.py`, `prisma/migrations`가 있으면 새 이미지로 한 번 실행한 뒤 앱을 띄운다(`DEPLOYER_MIGRATE=0`이면 끔). local/node는 `docker run --rm --entrypoint <도구>`, cloudrun은 Cloud Run job `<서비스>-migrate`(`--execute-now --wait`, 서비스와 같은 DB·서비스 계정). 실패하면 새 버전을 띄우지 않고(cloudrun은 트래픽도 그대로) 출력이 `runtime_error`로 남는다.
+- 삭제: `POST /projects/{name}/stop?drop_database=true`(또는 `teardown(..., drop_database=True)`, `cleanup`)는 앱을 내린 뒤 DB를 덤프하고 지운다. 사이드카는 `backend/.cloudmorph/backups/<컨테이너>-<시각>.sql`(0600, node는 이 머신으로 가져옴)에 덤프한 뒤 컨테이너와 볼륨을 지운다. Cloud SQL은 `CLOUDSQL_BACKUP_BUCKET`으로 `gcloud sql export`한 뒤 DB·계정·secret을 지운다. 버킷이 없거나 덤프가 실패하면 아무것도 지우지 않는다. Redis는 캐시로 보고 덤프 없이 지운다.
+- env 값은 명령줄에 쓰지 않는다: local은 `docker run -e NAME`(값은 docker 프로세스 env), cloudrun/function은 0600 임시 파일 `--env-vars-file`. env가 없으면 `--clear-env-vars`로 이전 리비전의 값을 지운다.
 
 실측(sample-apps/guestbook): local 9.7초, cloudrun 44초(앱별 DB·계정 생성 포함), node 20초. 세 곳 모두 글 쓰기 → 읽기 확인, local은 재배포 후 데이터 유지 확인.
 Cloud SQL 생성 시 `--edition=ENTERPRISE`를 줘야 `db-f1-micro`를 쓸 수 있고, Cloud Run 서비스 계정에 `roles/cloudsql.client`가 필요하다.
