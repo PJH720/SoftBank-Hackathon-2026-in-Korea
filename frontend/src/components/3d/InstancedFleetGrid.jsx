@@ -19,6 +19,7 @@ import {
   phaseFor,
   pulseAt,
 } from '../../lib/fleetStatus';
+import usePrefersReducedMotion from './usePrefersReducedMotion';
 
 const SPACING = 1.4;
 const RACK = RACK_SIZE;
@@ -34,7 +35,6 @@ const MAX_POLAR = Math.PI * 0.44;
 const AUTO_ROTATE_SPEED = 0.35;
 // Keep drei's tooltip below app overlays (modals use z-50).
 const TOOLTIP_Z = [30, 0];
-const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
 
 const WHITE = new THREE.Color('white');
 const BLACK = new THREE.Color('black');
@@ -42,17 +42,6 @@ const BLACK = new THREE.Color('black');
 const HIGHLIGHT_LIGHTNESS = 0.08;
 const HIGHLIGHT_GAIN = 2;
 
-function usePrefersReducedMotion() {
-  const [reduced, setReduced] = useState(() => typeof window !== 'undefined' && !!window.matchMedia?.(REDUCED_MOTION_QUERY).matches);
-  useEffect(() => {
-    const mq = window.matchMedia?.(REDUCED_MOTION_QUERY);
-    if (!mq) return undefined;
-    const onChange = (e) => setReduced(e.matches);
-    mq.addEventListener('change', onChange);
-    return () => mq.removeEventListener('change', onChange);
-  }, []);
-  return reduced;
-}
 
 function FleetInstances({ nodes, positions, reduced, hovered, setHovered }) {
   const refs = useRef([]);

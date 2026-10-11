@@ -16,7 +16,7 @@ import time
 from enum import Enum
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, field_validator, model_validator
 
 # Upper bound on heal -> redeploy cycles. Caps API cost and prevents infinite loops.
 MAX_RETRIES = 3
@@ -180,10 +180,36 @@ class PipelineEvent(BaseModel):
     ts: float = Field(default_factory=time.time)
 
 
+class LlmConfig(BaseModel):
+    """Per-deployment model selection; credentials stay on the server."""
+
+    provider: Literal["anthropic", "openai", "local"]
+    model: str | None = None
+    base_url: str | None = None
+
+    @field_validator("model")
+    @classmethod
+    def trim_optional(cls, value: str | None) -> str | None:
+        return (value.strip() or None) if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_provider(self) -> LlmConfig:
+        if self.provider == "local":
+            if not self.model or not self.base_url:
+                raise ValueError("local requires model and an http/https base_url")
+            TypeAdapter(HttpUrl).validate_python(self.base_url)
+        elif self.base_url is not None:
+            raise ValueError("base_url is only allowed for local")
+        return self
+
+
 class DeployRequest(BaseModel):
     """POST /deploy body."""
 
     source: str = Field(description="Git URL or server-side path of the uploaded source")
+    llm_config: LlmConfig | None = Field(
+        default=None, description="Optional model selection; None preserves server environment settings"
+    )
     targets: list[DeployTarget] = Field(
         default_factory=lambda: ["local", "cloudrun"],
         description="[] = let CloudMorph pick (the analyzer's target). With `ask_env` the dashboard is asked "

@@ -42,13 +42,14 @@ TARGETS = {2: "cloudrun", 5: "cloudrun", 4: "local"}
 SERVICE_MODELS = {2: "caas", 3: "paas", 1: "faas", 4: "iaas"}
 
 
-def analyze(src_dir: str) -> AnalysisResult:
+def analyze(src_dir: str, model_name: str | None = None) -> AnalysisResult:
     """Analyze `src_dir` and return the deploy decision + initial Dockerfile.
 
     ANALYZER_MODE: auto (기본) — Jev 키가 있거나 로컬 clef-flash가 켜져 있으면 빠른 분석(app/quick.py, 몇 초),
-    아니면 Claude 검사관. fast — 빠른 분석만. full — Claude 검사관만 (저장소를 직접 다 읽는다)."""
+    아니면 Claude 검사관. fast — 빠른 분석만. full — Claude 검사관만 (저장소를 직접 다 읽는다).
+    model_name을 명시하면 빠른 분석 대신 그 Claude 모델로 분석한다."""
     mode = (os.environ.get("ANALYZER_MODE") or "auto").strip().lower()
-    if mode != "full":
+    if mode != "full" and not model_name:
         from app import quick
 
         if mode == "fast" or quick.ready():
@@ -58,7 +59,7 @@ def analyze(src_dir: str) -> AnalysisResult:
                 if mode == "fast" or not os.environ.get("ANTHROPIC_API_KEY"):
                     raise
                 # 빠른 분석이 못 만드는 저장소(템플릿 없는 언어 등)나 판단 모델이 멈춘 때는 Claude 검사관이 본다
-    model = load_model(src_dir)
+    model = load_model(src_dir, model_name=model_name) if model_name else load_model(src_dir)
     if not model:
         raise ValueError("ANTHROPIC_API_KEY가 없어 분석할 수 없습니다 (analyzer는 AI 검사관으로 판정합니다)")
     return analyze_with(
@@ -1060,13 +1061,15 @@ class RepoReader:
         raise RuntimeError("ANALYZER_MAX_TURNS 안에 결론을 내지 못했습니다")
 
 
-def load_model(repo: str | None = None):
-    """ANTHROPIC_API_KEY가 있으면 ANALYZER_MODEL(기본 claude-haiku-5-5)에 저장소 읽기 도구를 붙여 돌려준다. 없으면 None."""
+def load_model(repo: str | None = None, model_name: str | None = None):
+    """선택 모델 > ANALYZER_MODEL > 기본 모델. ANTHROPIC_API_KEY가 없으면 None."""
     if not repo or not os.environ.get("ANTHROPIC_API_KEY"):
         return None
     import anthropic
 
-    return RepoReader(anthropic.Anthropic(), os.environ.get("ANALYZER_MODEL") or DEFAULT_MODEL, repo)
+    return RepoReader(
+        anthropic.Anthropic(), model_name or os.environ.get("ANALYZER_MODEL") or DEFAULT_MODEL, repo
+    )
 
 
 # ---------- Dockerfile ----------

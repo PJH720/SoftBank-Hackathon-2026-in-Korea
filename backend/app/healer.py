@@ -13,7 +13,8 @@ Design notes
   and it keeps cost inside the team budget.
 - The deployer is injected (`deploy_fn`) so healer owns the retry loop
   without importing deployer.py, and tests can use a fake deployer.
-- With ANTHROPIC_API_KEY the fallback is a repo agent: it reads the whole source tree, may edit
+- With ANTHROPIC_API_KEY the fallback is a repo agent unless the request selects OpenAI/local:
+  it reads the whole source tree, may edit
   source files in `src_dir` (main.py's per-target copy, never the user's checkout), and returns
   the Dockerfile. App-code crashes are then repaired instead of stopping. LLM_PROVIDER pointing at
   another provider (e.g. sglang for an on-prem server) turns the agent off, so that provider answers.
@@ -31,6 +32,7 @@ import posixpath
 import re
 import time
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import NamedTuple
 
@@ -44,6 +46,7 @@ from app.schemas import (
     ErrorCategory,
     HealReport,
     HealState,
+    LlmConfig,
     PatchRecord,
     PipelineEvent,
 )
@@ -809,27 +812,36 @@ def _call_anthropic(system: str, user: str, model: str, timeout: float = LLM_TIM
 
 
 def _call_openai_compatible(
-    system: str, user: str, model: str, provider: str, timeout: float = LLM_TIMEOUT_S
+    system: str,
+    user: str,
+    model: str,
+    provider: str,
+    timeout: float = LLM_TIMEOUT_S,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> str | None:
     from langchain_openai import ChatOpenAI  # lazy: keep import cost off the rule path
 
     kwargs: dict = {"model": model, "temperature": 0, "timeout": timeout, "max_retries": 0}
     if provider == "local":
-        base_url = _base_url()
+        base_url = base_url or _base_url()
         if not base_url:
             logger.warning("Local provider selected but no base_url configured; skipping")
             return None
         kwargs["base_url"] = base_url
-        kwargs["api_key"] = os.environ.get("OPENAI_API_KEY") or "EMPTY"  # local servers ignore the key
+        kwargs["api_key"] = api_key or os.environ.get("OPENAI_API_KEY") or "EMPTY"
     else:
         kwargs["api_key"] = os.environ.get("OPENAI_API_KEY")
+        if base_url:
+            kwargs["base_url"] = base_url
     content = ChatOpenAI(**kwargs).invoke([("system", system), ("user", user)]).content
     return str(content).strip()
 
 
-def _ask_llm(system: str, user: str, fence_langs: str) -> str | None:
+def _ask_llm(system: str, user: str, fence_langs: str, llm_config: LlmConfig | None = None) -> str | None:
     """One LLM round trip over the configured providers; returns the fenced (or bare) body, or None."""
-    providers = _configured_providers()
+    providers = [llm_config.provider] if llm_config else _configured_providers()
     if not providers:
         logger.info(
             "No LLM configured (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENAI_BASE_URL); rule patches only"
@@ -841,7 +853,7 @@ def _ask_llm(system: str, user: str, fence_langs: str) -> str | None:
         if remaining <= 0:
             logger.warning("Overall LLM deadline exceeded; skipping provider %s", provider)
             break
-        model = _model_for(provider)
+        model = (llm_config.model if llm_config else None) or _model_for(provider)
         if not model:
             logger.warning("LLM provider %s needs HEALER_MODEL (served model name); skipping", provider)
             continue
@@ -850,7 +862,20 @@ def _ask_llm(system: str, user: str, fence_langs: str) -> str | None:
             if provider == "anthropic":
                 text = _call_anthropic(system, user, model, timeout=timeout)
             else:
-                text = _call_openai_compatible(system, user, model, provider, timeout=timeout)
+                if llm_config:
+                    # A hosted OpenAI selection must not inherit a local endpoint from the server env.
+                    base_url = llm_config.base_url if provider == "local" else "https://api.openai.com/v1"
+                    text = _call_openai_compatible(
+                        system,
+                        user,
+                        model,
+                        provider,
+                        timeout=timeout,
+                        base_url=base_url,
+                        api_key="EMPTY" if provider == "local" else None,
+                    )
+                else:
+                    text = _call_openai_compatible(system, user, model, provider, timeout=timeout)
         except Exception:  # network / auth / quota / timeout / bad model id must not crash the pipeline
             logger.exception("LLM call failed (provider=%s, model=%s)", provider, model)
             continue
@@ -861,17 +886,21 @@ def _ask_llm(system: str, user: str, fence_langs: str) -> str | None:
     return None
 
 
-def default_llm_patch(dockerfile: str, error_log: str, category: ErrorCategory) -> str | None:
+def default_llm_patch(
+    dockerfile: str, error_log: str, category: ErrorCategory, *, llm_config: LlmConfig | None = None
+) -> str | None:
     user = (
         f"Error category: {category.value}\n\nstderr:\n{_llm_context(error_log)}\n\nDockerfile:\n{dockerfile}"
     )
-    return _ask_llm(LLM_SYSTEM_PROMPT, user, "dockerfile|Dockerfile")
+    return _ask_llm(LLM_SYSTEM_PROMPT, user, "dockerfile|Dockerfile", llm_config)
 
 
-def default_source_suggestion(path: str, source: str, traceback: str) -> str | None:
+def default_source_suggestion(
+    path: str, source: str, traceback: str, *, llm_config: LlmConfig | None = None
+) -> str | None:
     """Proposed full replacement for `path`. Reported as a diff only; healer never applies it."""
     user = f"File: {path}\n\nTraceback:\n{traceback}\n\nSource:\n{source}"
-    return _ask_llm(SOURCE_SYSTEM_PROMPT, user, "python|py")
+    return _ask_llm(SOURCE_SYSTEM_PROMPT, user, "python|py", llm_config)
 
 
 # --------------------------------------------------------------------------- #
@@ -944,7 +973,12 @@ def repo_edit_tool(root: Path):
 
 
 def default_repo_repair(
-    src_dir: str, dockerfile: str, error_log: str, category: ErrorCategory
+    src_dir: str,
+    dockerfile: str,
+    error_log: str,
+    category: ErrorCategory,
+    *,
+    model_name: str | None = None,
 ) -> RepoFix | None:
     import anthropic
 
@@ -953,7 +987,9 @@ def default_repo_repair(
     root = Path(src_dir).resolve()
     edit_file, originals = repo_edit_tool(root)
     reader = RepoReader(
-        anthropic.Anthropic(timeout=REPAIR_TIMEOUT_S, max_retries=0), _model_for("anthropic"), str(root)
+        anthropic.Anthropic(timeout=REPAIR_TIMEOUT_S, max_retries=0),
+        model_name or _model_for("anthropic"),
+        str(root),
     )
     reader.tools.append(edit_file)
     reader.specs.append(
@@ -1194,19 +1230,31 @@ def heal(
     repair_fn: RepairFn | None = None,
     confirm_fn: ConfirmFn | None = None,
     dockerfile_is_source: bool = False,
+    llm_config: LlmConfig | None = None,
 ) -> HealReport:
     """Entry point for main.py: call after the first deploy failed.
 
     Policy: with the repo agent (default when Claude is the selected provider, i.e. ANTHROPIC_API_KEY
-    is set and LLM_PROVIDER does not pick another one, and no `llm_patch_fn` is injected) the
-    Dockerfile and the source in `src_dir` are both patched; a source edit is redeployed only if
-    `confirm_fn` (when given) does not stop it. Without the agent only the Dockerfile is patched; a
-    crash in the app's own code stops at once, and for import-time crashes a source fix is suggested
-    as a diff in the summary, never applied.
+    is set and LLM_PROVIDER does not pick another one, and no `llm_patch_fn` is injected, unless
+    `llm_config` selects OpenAI/local) the Dockerfile and the source in `src_dir` are both patched;
+    a source edit is redeployed only if `confirm_fn` (when given) does not stop it. Without the
+    agent only the Dockerfile is patched; a crash in the app's own code stops at once, and for
+    import-time crashes a source fix is suggested as a diff in the summary, never applied.
+    Request configuration is bound to this call only; omitted configuration retains the environment-driven behavior.
     """
-    # The agent is Claude-only (tool use); with LLM_PROVIDER=sglang etc. the forced provider answers instead
-    if repair_fn is None and llm_patch_fn is None and _configured_providers()[:1] == ["anthropic"]:
-        repair_fn = default_repo_repair
+    # The agent is Claude-only (tool use); with LLM_PROVIDER=sglang etc. or non-anthropic llm_config, the forced provider answers instead
+    use_repo_agent = (
+        llm_config.provider == "anthropic" if llm_config else _configured_providers()[:1] == ["anthropic"]
+    ) and bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if repair_fn is None and llm_patch_fn is None and use_repo_agent:
+        repair_fn = (
+            partial(default_repo_repair, model_name=llm_config.model) if llm_config else default_repo_repair
+        )
+    if llm_config:
+        if llm_patch_fn is None:
+            llm_patch_fn = partial(default_llm_patch, llm_config=llm_config)
+        if suggest_fn is None:
+            suggest_fn = partial(default_source_suggestion, llm_config=llm_config)
     stopped: list[str] = []
 
     def confirm(src: str, fix: RepoFix) -> str | None:

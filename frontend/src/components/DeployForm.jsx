@@ -3,6 +3,7 @@ import { Zap, Cloud, FolderGit2, Laptop, Loader2, Network, Play, Server, Tag } f
 import { TARGET_META } from '../lib/run';
 import { Card } from './ui';
 import { TONE } from '../lib/style';
+import { normalizeLlmConfig } from '../lib/llmConfig';
 
 const ICONS = { agent: Laptop, local: Server, cloudrun: Cloud, node: Network, function: Zap };
 const PRESETS = [
@@ -15,6 +16,12 @@ const PRESETS = [
 export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailable, agentOnline }) {
   const toggle = (t) => setForm((f) => ({ ...f, targets: { ...f.targets, [t]: !f.targets[t] } }));
   const selected = Object.keys(form.targets).filter((t) => form.targets[t]);
+  const llm = form.llmConfig || { provider: 'server', model: '', base_url: '' };
+  const updateLlm = (values) => setForm((f) => ({ ...f, llmConfig: { ...llm, ...values } }));
+  let llmConfig;
+  let llmError;
+  try { llmConfig = normalizeLlmConfig(llm); } catch (error) { llmError = error.message; }
+  const llmInputClass = 'w-full rounded-xl border border-[rgba(150,160,215,0.22)] bg-[#0e1122]/90 px-3 py-2 text-[13px] text-slate-100 placeholder:text-slate-600 focus:border-[#FFE27A] focus:outline-none focus:ring-2 focus:ring-[#FFE27A]/20';
   return (
     <Card title="새 배포" icon={Play}>
       <div className="space-y-4">
@@ -72,7 +79,33 @@ export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailab
           </div>
         </div>
 
-        <button type="button" onClick={onDeploy} disabled={busy || !form.source || selected.length === 0}
+        <div className="space-y-2">
+          <label htmlFor="deploy-llm-provider" className="block text-xs font-semibold text-slate-300">자가치유 AI</label>
+          <select id="deploy-llm-provider" value={llm.provider} disabled={busy}
+            onChange={(e) => updateLlm({ provider: e.target.value, model: '', base_url: '' })}
+            className={llmInputClass}>
+            <option value="server">서버 설정 사용 (기본)</option>
+            <option value="anthropic">Claude (Anthropic)</option>
+            <option value="openai">OpenAI</option>
+            <option value="local">로컬 AI (OpenAI 호환)</option>
+          </select>
+          {llm.provider !== 'server' && <>
+            <label htmlFor="deploy-llm-model" className="block text-xs font-semibold text-slate-300">모델명 {llm.provider === 'local' ? '(필수)' : '(선택 · 비우면 기본 모델)'}</label>
+            <input id="deploy-llm-model" value={llm.model} disabled={busy} required={llm.provider === 'local'}
+              onChange={(e) => updateLlm({ model: e.target.value })} className={llmInputClass}
+              aria-invalid={llm.provider === 'local' && !llm.model?.trim()} aria-describedby={llmError ? 'deploy-llm-error' : undefined} />
+          </>}
+          {llm.provider === 'local' && <>
+            <label htmlFor="deploy-llm-url" className="block text-xs font-semibold text-slate-300">로컬 AI 서버 URL (필수)</label>
+            <input id="deploy-llm-url" type="url" value={llm.base_url} disabled={busy} required
+              onChange={(e) => updateLlm({ base_url: e.target.value })} placeholder="http://localhost:11434/v1"
+              className={llmInputClass} aria-describedby="deploy-llm-note deploy-llm-error" />
+          </>}
+          <p id="deploy-llm-note" className="text-[11px] text-slate-400">Claude를 선택하면 분석에도 선택한 모델을 사용해요. OpenAI·로컬 AI 선택 시 분석은 서버 기본 설정을 사용해요. 로컬 URL은 서버에서 접근할 수 있어야 해요.</p>
+          {llmError && <p id="deploy-llm-error" role="alert" className="text-xs text-rose-300">{llmError}</p>}
+        </div>
+
+        <button type="button" onClick={() => { if (!llmError) onDeploy(llmConfig); }} disabled={busy || !form.source || selected.length === 0 || !!llmError}
           className="deploy-submit flex w-full items-center justify-center gap-2 rounded-xl bg-[#FFE27A] px-4 py-3 text-sm font-bold text-[#0b0d17] shadow-lg shadow-[#FFE27A]/15 transition hover:bg-[#ffeb99] disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500 disabled:shadow-none">
           {busy ? <><Loader2 className="h-4 w-4 animate-spin" /> 파이프라인 실행 중</> : <><Play className="h-4 w-4 fill-current" /> One Action Deploy · {selected.length}개 타깃</>}
         </button>

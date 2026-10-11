@@ -17,7 +17,15 @@ import pytest
 from fastapi import HTTPException
 
 from app.accounts import LOCAL_ADMIN
-from app.schemas import AnalysisResult, DeployRequest, DeployResult, EnvInput, EnvRequirement, Removal
+from app.schemas import (
+    AnalysisResult,
+    DeployRequest,
+    DeployResult,
+    EnvInput,
+    EnvRequirement,
+    HealReport,
+    Removal,
+)
 
 # handlers are called directly here, so pass the caller the auth middleware would have set
 ADMIN = SimpleNamespace(state=SimpleNamespace(user=LOCAL_ADMIN))
@@ -1577,3 +1585,97 @@ def test_only_stores_left_entirely_blank_go_to_the_deployer(m):
     # a value for one MySQL setting means the user's own server: none of MySQL is provisioned
     assert [e.name for e in options["stores"]] == ["REDIS_URL"]
     assert options["env"] == {"DB_HOST": "db.example", "API_KEY": "k"}
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        None,
+        {"provider": "anthropic", "model": "claude-selected"},
+        {"provider": "anthropic", "model": " "},
+        {"provider": "openai", "model": "gpt-selected"},
+        {"provider": "local", "model": "served", "base_url": "http://localhost:11434/v1"},
+    ],
+)
+def test_deployment_config_reaches_analyzer_and_each_healer(m, tmp_path, monkeypatch, config):
+    analysis = AnalysisResult(target="local", language="python", dockerfile="FROM scratch\n")
+    source, routes, _ = _pick_setup(m, tmp_path, monkeypatch, analysis, None)
+    analyzed, healed = [], []
+
+    def analyze(src, **kwargs):
+        analyzed.append(kwargs)
+        return analysis
+
+    def heal(src, target, failed, dockerfile, deploy_fn, **kwargs):
+        healed.append((target, kwargs.get("llm_config")))
+        return HealReport(success=True, target=target, attempts=1, final_dockerfile=dockerfile)
+
+    monkeypatch.setattr(m.analyzer, "analyze", analyze)
+    monkeypatch.setattr(
+        m.deployer,
+        "deploy",
+        lambda src, dockerfile, target, **kwargs: DeployResult(success=False, target=target, exit_code=1),
+    )
+    monkeypatch.setattr(m.healer, "heal", heal)
+    request = DeployRequest(source=str(source), targets=["local", "cloudrun"], llm_config=config)
+
+    async def scenario():
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        await _until(lambda: m._jobs[deployment_id].completed)
+        return m._jobs[deployment_id].state
+
+    assert asyncio.run(scenario()) == "completed"
+    expected_model = request.llm_config.model if config and config["provider"] == "anthropic" else None
+    assert analyzed == ([{"model_name": expected_model}] if expected_model else [{}])
+    assert healed == [("local", request.llm_config), ("cloudrun", request.llm_config)]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"provider": "local"},
+        {"provider": "local", "model": "served", "base_url": "ftp://localhost"},
+        {"provider": "anthropic", "base_url": "https://example.com"},
+        {"provider": "openai", "base_url": "http://localhost"},
+        {"provider": "unknown"},
+    ],
+)
+def test_invalid_llm_selection_returns_422_before_launch(m, monkeypatch, config):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(m.app.state, "launch", lambda *a, **k: pytest.fail("invalid config launched"))
+    response = TestClient(m.app).post("/deploy", json={"source": "demo", "llm_config": config})
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai", "local"])
+def test_direct_pipeline_propagates_llm_config(m, monkeypatch, provider):
+    from app.schemas import LlmConfig
+
+    config = LlmConfig(
+        provider=provider,
+        model="selected",
+        base_url="http://localhost:11434/v1" if provider == "local" else None,
+    )
+    calls = []
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda src, **kwargs: (
+            calls.append(kwargs)
+            or AnalysisResult(target="local", language="python", dockerfile="FROM scratch\n")
+        ),
+    )
+    healed = []
+    monkeypatch.setattr(
+        m.healer,
+        "heal",
+        lambda *args, **kwargs: (
+            healed.append(kwargs["llm_config"])
+            or HealReport(success=True, target="local", attempts=1, final_dockerfile="FROM scratch\n")
+        ),
+    )
+    deploy = lambda *args: DeployResult(success=False, target="local", exit_code=1)
+    assert m.run_pipeline("demo", "local", lambda _: None, deploy_fn=deploy, llm_config=config)
+    assert calls == ([{"model_name": "selected"}] if provider == "anthropic" else [{}])
+    assert healed == [config]
