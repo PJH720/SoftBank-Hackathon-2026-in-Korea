@@ -26,8 +26,10 @@ export function emptyRun(id = null, meta = {}) {
     targetState: Object.fromEntries(targets.map((t) => [t, freshTarget()])),
     logs: [],
     patches: [],
+    envRequest: null, // { items, timeoutSec } while the backend waits for POST /deploy/{id}/env
     seen: new Set(),
     error: null,
+    question: null, // healer fixed the source: { question_id, ask, pr_url, pr_error, rationale, diff, choice, reason }
   }
 }
 
@@ -67,15 +69,28 @@ export function applyEvent(prev, type, p, raw) {
   switch (type) {
     case 'log': {
       const line = p.line || ''
-      if (line.startsWith('analyzer: target=')) {
+      if (p.kind === 'question') {
+        run.question = { ...p, choice: null, reason: null }
+        const pr = p.pr_url ? `PR을 올렸어요 · ${p.pr_url}` : '소스를 고쳤어요 (PR 없음)'
+        push(run, { ts, kind: 'heal', stage: 'heal', target: run.currentTarget, text: `${pr} — ${p.rationale}` })
+      } else if (p.kind === 'answer') {
+        run.question = run.question && { ...run.question, choice: p.choice, reason: p.reason }
+        const why = { user: '사용자 선택', timeout: '응답 없음', 'github-push': 'push 배포' }[p.reason] || p.reason
+        push(run, { ts, kind: 'info', stage: 'heal', text: `${p.choice === 'continue' ? '고친 소스로 계속 배포' : '이번 배포는 여기서 중단'} (${why})` })
+      } else if (line.startsWith('analyzer: target=')) {
         run.analysis = parseSummary(line)
         const a = run.analysis
         push(run, { ts, kind: 'analyze', stage: 'analyze', text: `분석 완료 · 권장 타깃 ${a.target} · ${a.language}/${a.framework} · port ${a.port}` })
       } else if (line.startsWith('analyzer: ')) {
         run.notes.push(line.slice('analyzer: '.length))
         push(run, { ts, kind: 'note', stage: 'analyze', text: line.slice('analyzer: '.length) })
+      } else if (line.startsWith('env: ')) {
+        run.envRequest = null
+        push(run, { ts, kind: 'push', stage: 'analyze', text: `배포에 필요한 값 · ${line.slice(5)} → 배포를 이어갑니다` })
       } else if (line.startsWith('queue: ')) {
         push(run, { ts, kind: 'push', stage: 'queue', text: `대기 · 같은 앱의 이전 배포가 끝나면 시작합니다 (${line.slice(7)})` })
+      } else if (line.startsWith('cancel: ')) {
+        push(run, { ts, kind: 'error', stage: 'cancel', text: '중단 요청 · 진행 중인 빌드를 끊고 다음 단계에서 멈춥니다' })
       } else if (line.startsWith('github push')) {
         run.trigger = 'github-push'
         push(run, { ts, kind: 'push', stage: 'trigger', text: line })
@@ -106,6 +121,12 @@ export function applyEvent(prev, type, p, raw) {
       }
       break
     }
+    case 'input_required': {
+      const items = p.items || []
+      run.envRequest = { items, timeoutSec: p.timeout_sec }
+      push(run, { ts, kind: 'push', stage: 'analyze', text: `배포에 필요한 값 ${new Set(items.map((i) => i.name)).size}개를 기다리는 중 · ${[...new Set(items.map((i) => i.name))].join(', ')}` })
+      break
+    }
     case 'heal_diff': {
       const t = run.currentTarget
       run.patches.push({ ...p, target: t })
@@ -130,12 +151,20 @@ export function applyEvent(prev, type, p, raw) {
     case 'error': {
       const t = p.target
       const msg = p.message || p.summary || '실패'
-      if (t) {
+      if (p.cancelled) {
+        for (const k of run.targets) {
+          if (!['done', 'failed'].includes(run.targetState[k]?.phase)) run.targetState[k] = { ...run.targetState[k], phase: 'cancelled' }
+        }
+        run.status = 'cancelled'
+        run.finishedAt = Date.now()
+        push(run, { ts, kind: 'error', stage: 'cancel', text: '사용자가 배포를 중단했습니다' })
+      } else if (t) {
         ensure(run, t)
         run.targetState[t] = { ...run.targetState[t], phase: 'failed', message: msg }
         push(run, { ts, kind: 'error', stage: 'failed', target: t, text: msg })
       } else {
         run.error = msg
+        run.envRequest = null
         run.status = 'failed'
         run.finishedAt = Date.now()
         push(run, { ts, kind: 'error', stage: 'failed', text: msg })
@@ -160,6 +189,10 @@ export function stepStatus(run) {
   const healed = run.patches.length > 0
   const finished = run.status !== 'running' && run.status !== 'idle'
   const failed = run.status === 'failed'
+  if (run.status === 'cancelled') {
+    const up = phases.includes('done')
+    return { analyze: run.analysis ? 'done' : 'cancelled', deploy: up ? 'done' : 'cancelled', heal: healed ? 'done' : 'cancelled', live: up ? 'partial' : 'cancelled' }
+  }
   return {
     analyze: run.status === 'idle' ? 'idle' : run.analysis || anyStarted ? 'done' : failed ? 'failed' : 'active',
     deploy: !anyStarted ? (finished && failed ? 'failed' : 'idle') : phases.some((p) => p === 'deploying') ? 'active' : 'done',
@@ -167,3 +200,6 @@ export function stepStatus(run) {
     live: finished ? (run.status === 'failed' ? 'failed' : run.status === 'partial_failure' ? 'partial' : 'done') : 'idle',
   }
 }
+
+/** True when the backend still holds something it can take down for this project. */
+export const canStop = (project) => !!project && project.last_status !== 'running' && Object.keys(project.live || {}).length > 0;

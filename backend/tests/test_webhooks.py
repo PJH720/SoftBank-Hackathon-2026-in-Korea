@@ -154,6 +154,7 @@ def test_project_status_is_persisted_when_the_job_finishes(monkeypatch, tmp_path
                 "service_models": [],
                 "notes": [],
                 "dockerfile": "FROM x",
+                "required_env": [],
             },
         )(),
     )
@@ -200,6 +201,7 @@ def test_deployments_of_the_same_app_are_serialised(monkeypatch, tmp_path):
                 "service_models": [],
                 "notes": [],
                 "dockerfile": "FROM x",
+                "required_env": [],
             },
         )(),
     )

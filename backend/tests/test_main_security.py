@@ -14,9 +14,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 from app.accounts import LOCAL_ADMIN
-from app.schemas import AnalysisResult, DeployRequest, DeployResult
+from app.schemas import AnalysisResult, DeployRequest, DeployResult, EnvInput, EnvRequirement
 
 # handlers are called directly here, so pass the caller the auth middleware would have set
 ADMIN = SimpleNamespace(state=SimpleNamespace(user=LOCAL_ADMIN))
@@ -758,3 +759,455 @@ def test_failed_deploy_heals_and_preserves_sse_contract(m, tmp_path, monkeypatch
     assert decoded[4]["stage"] == "redeploy"
     assert decoded[5]["type"] == "done"
     assert decoded[5]["payload"]["success"] is True
+
+
+def test_stop_takes_down_every_live_target_once(m, tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(target="local", language="python", dockerfile="FROM scratch\n"),
+    )
+    monkeypatch.setattr(
+        m.deployer,
+        "deploy",
+        lambda directory, dockerfile, target: DeployResult(
+            success=True, target=target, exit_code=0, url=f"https://{target}.invalid"
+        ),
+    )
+    monkeypatch.setattr(m.deployer, "last_handles", lambda d: {"dir": Path(d).name})
+    torn = []
+    monkeypatch.setattr(m.deployer, "teardown", lambda t, h: torn.append((t, h["dir"])) or [f"down {t}"])
+    original_mkdtemp = m.tempfile.mkdtemp
+    monkeypatch.setattr(m.tempfile, "mkdtemp", lambda *a, **kw: original_mkdtemp(dir=tmp_path, **kw))
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+    stop = routes["/projects/{name}/stop"]
+
+    async def scenario():
+        response = await routes["/deploy"](DeployRequest(source=str(source), name="demo"), ADMIN)
+        deployment_id = response["deployment_id"]
+        while not m._jobs[deployment_id].completed:
+            await asyncio.sleep(0.001)
+        assert set(m._projects["demo"]["live"]) == {"local", "cloudrun"}
+        first = await stop("demo", ADMIN)
+        second = await stop("demo", ADMIN)
+        with pytest.raises(m.HTTPException) as unknown:
+            await stop("nope", ADMIN)
+        m._app_locks["demo"].acquire()
+        with pytest.raises(m.HTTPException) as busy:
+            await stop("demo", ADMIN)
+        m._app_locks["demo"].release()
+        return first, second, unknown.value.status_code, busy.value.status_code
+
+    first, second, unknown, busy = asyncio.run(scenario())
+    assert first == {
+        "name": "demo",
+        "stopped": {"local": ["down local"], "cloudrun": ["down cloudrun"]},
+        "failed": {},
+    }
+    assert sorted(torn) == [("cloudrun", "demo-cloudrun"), ("local", "demo-local")]
+    assert second["stopped"] == {}  # nothing left serving
+    assert (unknown, busy) == (404, 409)
+    project = m._projects["demo"]
+    assert project["last_status"] == "stopped" and project["live"] == {} and project["urls"] == {}
+
+
+def test_stop_keeps_targets_that_failed_to_come_down(m, monkeypatch):
+    m._projects["demo"] = {
+        "name": "demo",
+        "last_status": "completed",
+        "urls": {"local": "u1", "cloudrun": "u2"},
+        "live": {"local": {}, "cloudrun": {"service": "demo-cloudrun"}},
+    }
+
+    def teardown(target, handles):
+        if target == "cloudrun":
+            raise RuntimeError("permission denied")
+        return ["down"]
+
+    monkeypatch.setattr(m.deployer, "teardown", teardown)
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+    result = asyncio.run(routes["/projects/{name}/stop"]("demo", ADMIN))
+    assert result["failed"] == {"cloudrun": "RuntimeError: permission denied"}
+    project = m._projects["demo"]
+    assert set(project["live"]) == {"cloudrun"} and project["urls"] == {"cloudrun": "u2"}
+    assert project["last_status"] == "completed"
+
+
+def _cancel_setup(m, tmp_path, monkeypatch, fake_deploy):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(
+            target="local", language="python", dockerfile='FROM python:3.11-slim\nCMD ["python", "app.py"]\n'
+        ),
+    )
+    monkeypatch.setattr(m.deployer, "deploy", fake_deploy)
+    original_mkdtemp = m.tempfile.mkdtemp
+    monkeypatch.setattr(m.tempfile, "mkdtemp", lambda *a, **kw: original_mkdtemp(dir=tmp_path, **kw))
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+    return source, routes
+
+
+def _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    required = [
+        EnvRequirement(name="GITHUB_TOKEN", scope="build", secret=True, evidence=["build.gradle:3"]),
+        EnvRequirement(name="GITHUB_USERNAME", scope="build", secret=False),
+        EnvRequirement(name="SECRET_KEY", scope="runtime", secret=True, generate=True),
+        EnvRequirement(name="API_KEY", scope="runtime", secret=True),
+    ]
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(
+            target="local", language="python", dockerfile="FROM scratch\n", required_env=required
+        ),
+    )
+    monkeypatch.setattr(m.deployer, "deploy", fake_deploy)
+    original_mkdtemp = m.tempfile.mkdtemp
+
+    def mkdtemp_in_test_dir(*args, **kwargs):
+        if len(args) >= 3:
+            args = (*args[:2], args[2] or tmp_path, *args[3:])
+        else:
+            kwargs["dir"] = kwargs.get("dir") or tmp_path
+        return original_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(m.tempfile, "mkdtemp", mkdtemp_in_test_dir)
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+    return source, routes
+
+
+def _events(routes, deployment_id):
+    async def collect():
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        return [(e["event"], json.loads(e["data"])) async for e in response.body_iterator]
+
+    return asyncio.run(collect())
+
+
+def test_cancel_kills_the_build_and_skips_the_remaining_targets(m, tmp_path, monkeypatch):
+    building, released = threading.Event(), threading.Event()
+    calls, killed = [], []
+
+    def fake_deploy(directory, dockerfile, target):
+        calls.append(target)
+        building.set()
+        assert released.wait(5)
+        return DeployResult(success=False, target=target, exit_code=1, stderr="docker build killed")
+
+    def fake_pkill(cmd, **kwargs):
+        killed.append(cmd)
+        released.set()
+        return subprocess.CompletedProcess(cmd, 0)
+
+    source, routes = _cancel_setup(m, tmp_path, monkeypatch, fake_deploy)
+    monkeypatch.setattr(m.subprocess, "run", fake_pkill)
+
+    async def scenario():
+        deployment_id = (await routes["/deploy"](DeployRequest(source=str(source), name="demo"), ADMIN))[
+            "deployment_id"
+        ]
+        while not building.is_set():
+            await asyncio.sleep(0.001)
+        assert await routes["/deploy/{deployment_id}/cancel"](deployment_id, ADMIN) == {
+            "deployment_id": deployment_id,
+            "cancelled": True,
+        }
+        while not m._jobs[deployment_id].completed:
+            await asyncio.sleep(0.001)
+        with pytest.raises(m.HTTPException) as late:
+            await routes["/deploy/{deployment_id}/cancel"](deployment_id, ADMIN)
+        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id), late.value.status_code
+
+    deployment_id, status, late = asyncio.run(scenario())
+    assert calls == ["local"]  # cloudrun never started
+    assert killed[0][:2] == ["pkill", "-f"] and "cloudmorph-deploy-" in killed[0][2]
+    assert status["status"] == "cancelled" and late == 409
+    assert m._projects["demo"]["last_status"] == "cancelled"
+    events = _events(routes, deployment_id)
+    assert events[-1] == (
+        "error",
+        {**events[-1][1], "payload": {"message": "cancelled by user", "cancelled": True}},
+    )
+    assert not any(e == "stage" and d["stage"] == "heal" for e, d in events)  # healer never ran
+
+
+def test_cancel_stops_the_healer_before_its_next_redeploy(m, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_deploy(directory, dockerfile, target):
+        calls.append(target)
+        if len(calls) == 2:  # healer's first redeploy is in flight when the user cancels
+            next(iter(m._jobs.values())).cancel.set()
+            return DeployResult(
+                success=False,
+                target=target,
+                exit_code=1,
+                stderr="ModuleNotFoundError: No module named 'redis'",
+            )
+        return DeployResult(
+            success=False, target=target, exit_code=1, stderr="ModuleNotFoundError: No module named 'flask'"
+        )
+
+    source, routes = _cancel_setup(m, tmp_path, monkeypatch, fake_deploy)
+
+    async def scenario():
+        deployment_id = (
+            await routes["/deploy"](DeployRequest(source=str(source), targets=["local"], name="demo"), ADMIN)
+        )["deployment_id"]
+        while not m._jobs[deployment_id].completed:
+            await asyncio.sleep(0.001)
+        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id)
+
+    deployment_id, status = asyncio.run(scenario())
+    assert len(calls) == 2
+    assert status["status"] == "cancelled"
+    assert _events(routes, deployment_id)[-1][1]["payload"]["cancelled"] is True
+
+
+async def _until(check):
+    async def poll():
+        while not check():
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(poll(), timeout=5)
+
+
+def test_ask_env_waits_for_values_and_heal_redeploys_with_them(m, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        calls.append(options)
+        if len(calls) == 1:
+            return DeployResult(
+                success=False,
+                target=target,
+                exit_code=1,
+                stderr="ModuleNotFoundError: No module named 'flask'",
+            )
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=["local"], ask_env=True)
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        job = m._jobs[deployment_id]
+        await _until(lambda: job.state == "waiting_input")
+        assert calls == []  # nothing is built before the user answers
+        answer = EnvInput(
+            values={"GITHUB_TOKEN": "ghp_s3cret", "GITHUB_USERNAME": "octo", "API_KEY": "", "LD_PRELOAD": "x"}
+        )
+        assert await routes["/deploy/{deployment_id}/env"](deployment_id, answer, ADMIN) == {
+            "accepted": ["GITHUB_TOKEN", "GITHUB_USERNAME"]
+        }
+        with pytest.raises(HTTPException) as again:
+            await routes["/deploy/{deployment_id}/env"](deployment_id, answer, ADMIN)
+        assert again.value.status_code == 409
+        await _until(lambda: job.completed)
+        status = await routes["/deploy/{deployment_id}"](deployment_id)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        return status, [event async for event in response.body_iterator]
+
+    status, events = asyncio.run(scenario())
+    assert status["status"] == "completed", status
+    assert len(calls) == 2 and calls[0] == calls[1]  # healer's redeploy gets the same values
+    assert calls[0]["build_secrets"] == {"GITHUB_TOKEN": "ghp_s3cret"}
+    assert calls[0]["build_args"] == {"GITHUB_USERNAME": "octo"}
+    generated = calls[0]["env"]["SECRET_KEY"]
+    assert set(calls[0]["env"]) == {"SECRET_KEY"} and len(generated) >= 32
+    asked = [json.loads(e["data"]) for e in events if e["event"] == "input_required"]
+    assert [i["name"] for i in asked[0]["payload"]["items"]] == [
+        "GITHUB_TOKEN",
+        "GITHUB_USERNAME",
+        "SECRET_KEY",
+        "API_KEY",
+    ]
+    stream = "".join(e["data"] for e in events)
+    assert "ghp_s3cret" not in stream and generated not in stream and "octo" not in stream
+    assert m._jobs[status["deployment_id"]].env_values is None
+
+
+def _fake_env_store(m, monkeypatch, store):
+    monkeypatch.setattr(m.env_store, "load", lambda app, owner: dict(store.get((app, owner), {})))
+    monkeypatch.setattr(
+        m.env_store, "save", lambda app, owner, values: store.__setitem__((app, owner), dict(values))
+    )
+
+
+def test_named_app_keeps_its_values_across_redeploys_and_push(m, tmp_path, monkeypatch):
+    """Values are saved per app: the next dashboard deploy asks only what is still missing, a GitHub push
+    deploy (no ask_env) gets them too, and a generated SECRET_KEY stays the same."""
+    calls = []
+    store: dict[tuple[str, str], dict] = {}
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        calls.append(options)
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+    _fake_env_store(m, monkeypatch, store)
+
+    async def deploy(ask_env, answer=None):
+        request = DeployRequest(source=str(source), targets=["local"], name="gb", ask_env=ask_env)
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        job = m._jobs[deployment_id]
+        if answer is not None:
+            await _until(lambda: job.state == "waiting_input")
+            await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(values=answer), ADMIN)
+        await _until(lambda: job.completed)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        events = [event async for event in response.body_iterator]
+        return [
+            [i["name"] for i in json.loads(e["data"])["payload"]["items"]]
+            for e in events
+            if e["event"] == "input_required"
+        ]
+
+    async def scenario():
+        first = await deploy(True, {"GITHUB_TOKEN": "ghp_s3cret", "GITHUB_USERNAME": "octo"})
+        second = await deploy(True, {"API_KEY": "k-1"})
+        push = await deploy(False)
+        return first, second, push
+
+    first, second, push = asyncio.run(scenario())
+    assert first == [["GITHUB_TOKEN", "GITHUB_USERNAME", "SECRET_KEY", "API_KEY"]]
+    assert second == [["API_KEY"]]  # only what the first answer left blank
+    assert push == []
+    secret_key = store[("gb", m._source_identity(str(source)))]["SECRET_KEY"]
+    assert all(c["env"]["SECRET_KEY"] == secret_key for c in calls)
+    assert calls[1] == calls[2] and calls[2]["env"]["API_KEY"] == "k-1"
+    assert calls[2]["build_secrets"] == {"GITHUB_TOKEN": "ghp_s3cret"}
+
+
+def test_same_name_from_another_source_never_gets_the_saved_values(m, tmp_path, monkeypatch):
+    """Names are free-form: another repo deployed as `gb` is asked afresh and its container gets none of
+    the first app's keys, from the dashboard or from a push."""
+    calls = []
+    store: dict[tuple[str, str], dict] = {}
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        calls.append(options)
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "app.py").write_text("print(os.environ)")
+    _fake_env_store(m, monkeypatch, store)
+
+    async def deploy(src, ask_env, answer=None):
+        request = DeployRequest(source=str(src), targets=["local"], name="gb", ask_env=ask_env)
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        job = m._jobs[deployment_id]
+        if answer is not None:
+            await _until(lambda: job.state == "waiting_input")
+            await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(values=answer), ADMIN)
+        await _until(lambda: job.completed)
+
+    async def scenario():
+        await deploy(source, True, {"API_KEY": "k-victim", "GITHUB_TOKEN": "ghp_victim"})
+        await deploy(other, False)  # push-style: nothing to ask, and nothing saved for this source
+        await deploy(other, True, {})  # dashboard: asked again, answers nothing
+
+    asyncio.run(scenario())
+    victim, push, dashboard = calls
+    assert not push.get("env") and not push.get("build_secrets")
+    assert set(dashboard["env"]) == {"SECRET_KEY"} and not dashboard.get("build_secrets")
+    assert dashboard["env"]["SECRET_KEY"] != victim["env"]["SECRET_KEY"]  # its own, freshly generated
+    assert store[("gb", m._source_identity(str(source)))]["API_KEY"] == "k-victim"  # left untouched
+
+
+def test_source_identity_ignores_spelling_but_not_owner(m):
+    same = {
+        m._source_identity(u)
+        for u in (
+            "https://github.com/octo/app",
+            "https://GitHub.com/Octo/App.git",
+            "https://github.com/octo/app/",
+        )
+    }
+    assert same == {"git:github.com/octo/app"}
+    assert m._source_identity("https://github.com/mallory/app") != "git:github.com/octo/app"
+
+
+def test_ask_env_gives_up_when_nobody_answers(m, tmp_path, monkeypatch):
+    def fake_deploy(*args, **kwargs):
+        raise AssertionError("must not deploy without an answer")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+    monkeypatch.setattr(m, "ENV_INPUT_TIMEOUT_SECONDS", 0.01)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=["local"], ask_env=True)
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        await _until(lambda: m._jobs[deployment_id].completed)
+        return await routes["/deploy/{deployment_id}"](deployment_id)
+
+    status = asyncio.run(scenario())
+    assert status["status"] == "failed" and status["error"].startswith("TimeoutError")
+
+
+def test_without_ask_env_nothing_is_asked_or_injected(m, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        calls.append(options)
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+
+    async def scenario():
+        deployment_id = (
+            await routes["/deploy"](DeployRequest(source=str(source), targets=["local"]), ADMIN)
+        )["deployment_id"]
+        await _until(lambda: m._jobs[deployment_id].completed)
+        with pytest.raises(HTTPException) as not_waiting:
+            await routes["/deploy/{deployment_id}/env"](
+                deployment_id, EnvInput(values={"API_KEY": "x"}), ADMIN
+            )
+        assert not_waiting.value.status_code == 409
+        return await routes["/deploy/{deployment_id}"](deployment_id)
+
+    assert asyncio.run(scenario())["status"] == "completed"
+    assert calls == [{}]
+
+
+def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, lambda *a, **k: None)
+    (source / "app.py").write_text('import os\nDB = os.environ["DATABASE_URL"]\n')
+    required = [
+        EnvRequirement(name="DATABASE_URL", scope="runtime", secret=True, resource="postgres"),
+        EnvRequirement(name="REDIS_URL", scope="runtime", secret=True, resource="redis"),
+    ]
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(
+            target="local", language="python", dockerfile="FROM scratch\n", required_env=required
+        ),
+    )
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=["local"], ask_env=True)
+        deployment_id = (await routes["/deploy"](request, ADMIN))["deployment_id"]
+        job = m._jobs[deployment_id]
+        await _until(lambda: job.state == "waiting_input")
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        async for event in response.body_iterator:
+            if event["event"] == "input_required":
+                job.env_ready.set()  # let the worker finish
+                return json.loads(event["data"])["payload"]["items"]
+
+    items = asyncio.run(scenario())
+    # only Postgres is provisioned when left blank; Redis is not, so the card must not promise it
+    assert [(i["name"], i["auto"]) for i in items] == [("DATABASE_URL", True), ("REDIS_URL", False)]

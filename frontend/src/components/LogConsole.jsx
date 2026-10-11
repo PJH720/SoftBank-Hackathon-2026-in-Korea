@@ -63,11 +63,10 @@ function Row({ log }) {
   );
 }
 
-export default function LogConsole({ logs, running }) {
+export default function LogConsole({ logs, running, height = 460, active = true }) {
   const [filter, setFilter] = useState('key');
   const [target, setTarget] = useState('all');
   const [follow, setFollow] = useState(true);
-  const endRef = useRef(null);
   const boxRef = useRef(null);
 
   const targets = useMemo(() => [...new Set(logs.map((l) => l.target).filter(Boolean))], [logs]);
@@ -76,7 +75,8 @@ export default function LogConsole({ logs, running }) {
     return logs.filter((l) => (!f?.test || f.test(l)) && (target === 'all' || !l.target || l.target === target));
   }, [logs, filter, target]);
 
-  useEffect(() => { if (follow) endRef.current?.scrollIntoView({ block: 'end' }); }, [shown.length, follow]);
+  const scrollToEnd = () => { const box = boxRef.current; if (box) box.scrollTop = box.scrollHeight; };
+  useEffect(() => { if (follow && active) scrollToEnd(); }, [shown.length, follow, active]);
 
   const onScroll = () => {
     const el = boxRef.current;
@@ -93,25 +93,25 @@ export default function LogConsole({ logs, running }) {
       bodyClass="p-0"
       right={
         <>
-          <div className="flex rounded-lg bg-black/30 p-0.5 text-[11px]">
+          <div className="flex rounded-full border border-[rgba(150,160,215,0.2)] bg-black/40 p-0.5 text-[11px]">
             {FILTERS.map((f) => (
-              <button key={f.id} type="button" onClick={() => setFilter(f.id)} className={`rounded-md px-2 py-1 ${filter === f.id ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-slate-200'}`}>{f.label}</button>
+              <button key={f.id} type="button" onClick={() => setFilter(f.id)} className={`rounded-full px-2.5 py-1 transition ${filter === f.id ? 'bg-[#FFE27A] font-bold text-[#0b0d17] shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}>{f.label}</button>
             ))}
           </div>
           {targets.length > 1 && (
-            <select value={target} onChange={(e) => setTarget(e.target.value)} className="rounded-lg border border-white/10 bg-black/30 px-2 py-1 text-[11px] text-slate-300">
+            <select value={target} onChange={(e) => setTarget(e.target.value)} className="rounded-full border border-[rgba(150,160,215,0.2)] bg-[#0b0d17] px-2.5 py-1 text-[11px] text-slate-300 focus:outline-none focus:border-[#FFE27A]">
               <option value="all">모든 타깃</option>
               {targets.map((t) => <option key={t} value={t}>{t}</option>)}
             </select>
           )}
-          <button type="button" title="맨 아래로 따라가기" onClick={() => { setFollow(true); endRef.current?.scrollIntoView({ block: 'end' }); }}
-            className={`rounded-lg p-1.5 ${follow ? 'text-violet-300' : 'text-slate-500 hover:text-slate-200'}`}>
+          <button type="button" title="맨 아래로 따라가기" onClick={() => { setFollow(true); scrollToEnd(); }}
+            className={`rounded-full p-1.5 transition ${follow ? 'text-[#FFE27A] bg-[#FFE27A]/12' : 'text-slate-500 hover:text-slate-200'}`}>
             <ArrowDownToLine className="h-4 w-4" />
           </button>
         </>
       }
     >
-      <div ref={boxRef} onScroll={onScroll} className="h-[460px] overflow-y-auto px-2 py-2">
+      <div ref={boxRef} onScroll={onScroll} className="overflow-y-auto px-2 py-2" style={{ height }}>
         {shown.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-slate-500">
             <Sparkles className="h-6 w-6 text-slate-600" />
@@ -122,18 +122,17 @@ export default function LogConsole({ logs, running }) {
           shown.map((l) => <Row key={l.id} log={l} />)
         )}
         {running && (
-          <div className="flex items-center gap-2 py-2 pl-[86px] text-xs text-slate-500">
+          <div className="flex items-center gap-2 py-2 pl-[86px] text-xs text-slate-400">
             <span className="flex gap-1">
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-400 [animation-delay:-0.3s]" />
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-400 [animation-delay:-0.15s]" />
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-400" />
+              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#FFE27A] [animation-delay:-0.3s]" />
+              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#FFE27A] [animation-delay:-0.15s]" />
+              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#FFE27A]" />
             </span>
             진행 중
           </div>
         )}
-        <div ref={endRef} />
       </div>
-      <footer className="flex items-center justify-between border-t border-white/5 px-4 py-2 text-[11px] text-slate-500">
+      <footer className="flex items-center justify-between border-t border-[rgba(150,160,215,0.14)] px-4 py-2.5 text-[11px] text-slate-400 bg-white/[0.01]">
         <span>{shown.length} / {logs.length} 줄</span>
         <span>{follow ? '자동 스크롤' : '스크롤 일시정지 · 위로 올려 둔 상태'}</span>
       </footer>
