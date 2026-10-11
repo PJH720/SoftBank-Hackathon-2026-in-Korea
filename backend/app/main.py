@@ -1199,11 +1199,10 @@ def create_app() -> FastAPI:
             """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
             `auto` marks what the deployer provisions when left blank, so the card can say so honestly.
             Returns (values, targets the user picked or None)."""
-            postgres = deployer.wants_database(Path(source_dir), deployer.Config.from_env()) == "postgres"
-            job.required_env = [
-                e.model_copy(update={"auto": True}) if postgres and e.name == "DATABASE_URL" else e
-                for e in items
-            ]
+            # targets=[]: the user picks on this card, so promise only what every place provisions
+            places = targets or ["local", "cloudrun", "node"]
+            auto = deployer.provisioned_env(Path(source_dir), places, deployer.Config.from_env())
+            job.required_env = [e.model_copy(update={"auto": True}) if e.name in auto else e for e in items]
             payload = {
                 "items": [e.model_dump() for e in job.required_env],
                 "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,

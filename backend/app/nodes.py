@@ -237,23 +237,138 @@ def run_container(
         f"docker run -d --restart unless-stopped --name {shlex.quote(name)} --network {NETWORK} {env_flags} "
         f"-p {host_port}:{container_port} {shlex.quote(image)}"
     )
-    return ssh_text(node, cmd, timeout=60).strip()
+    cp = ssh(node, cmd, timeout=60)
+    if (
+        cp.returncode != 0
+    ):  # not ssh_text: its error repeats the command, and the command holds the env values
+        err = cp.stderr.decode(errors="replace")[-800:]
+        raise RuntimeError(f"ssh {node.name}: docker run {name} failed rc={cp.returncode}: {err}")
+    return cp.stdout.decode(errors="replace").strip()
 
 
-def ensure_postgres(node: Node, app: str, *, timeout: int = 120) -> str:
-    """Start (or reuse) a Postgres sidecar `<app>-db` on the node's cloudmorph network; return DATABASE_URL.
-    Data lives in a named volume `<app>-dbdata`, so redeploys of the app keep their rows."""
-    db = f"{app}-db"
-    cmd = (
-        f"docker network inspect {NETWORK} >/dev/null 2>&1 || docker network create {NETWORK} >/dev/null; "
-        f"docker start {db} >/dev/null 2>&1 || docker run -d --restart unless-stopped --name {db} --network {NETWORK} "
-        f"-e POSTGRES_USER=app -e POSTGRES_PASSWORD=app -e POSTGRES_DB=app -v {app}-dbdata:/var/lib/postgresql/data "
-        f"postgres:16-alpine >/dev/null; "
-        f"for i in $(seq 1 60); do docker exec {db} pg_isready -U app -q && exit 0; sleep 1; done; "
-        f"echo 'postgres not ready' >&2; exit 1"
+class SidecarRefused(RuntimeError):
+    """A sidecar that cannot start without losing or exposing data; a person has to decide."""
+
+
+@dataclass(frozen=True)
+class Sidecar:
+    """A database container next to the app on the cloudmorph network (local and node targets).
+    The password is random per sidecar and lives in the container's own env (`secret_env`), so a redeploy
+    reads it back from `docker inspect` instead of storing it anywhere else."""
+
+    engine: str
+    image: str
+    suffix: str  # container `<app>-<suffix>`
+    volume: str  # volume `<app>-<volume>`
+    data: str  # mount point of the volume
+    secret_env: str
+    url: str  # .format(scheme=, pw=, host=)
+    ready: str  # sh inside the container, exit 0 when it accepts the app's password
+    env: tuple[str, ...] = ()
+    command: tuple[str, ...] = ()
+    # sh that sets the password to $secret_env on a volume older than the container; None: cannot, so a
+    # volume whose container is gone is refused (its password is lost with the container)
+    reset: str | None = None
+    ready_timeout: int = 90
+
+
+SIDECARS = {
+    "postgres": Sidecar(
+        engine="postgres",
+        image="postgres:16-alpine",
+        suffix="db",
+        volume="dbdata",
+        data="/var/lib/postgresql/data",
+        secret_env="POSTGRES_PASSWORD",
+        env=("POSTGRES_USER=app", "POSTGRES_DB=app"),
+        url="{scheme}://app:{pw}@{host}:5432/app",
+        ready="pg_isready -U app -q",
+        # the image trusts connections from inside the container, so this needs no old password
+        reset="psql -U app -d app -qc \"ALTER USER app PASSWORD '$POSTGRES_PASSWORD'\"",
+    ),
+    "mysql": Sidecar(
+        engine="mysql",
+        image="mysql:8.4",
+        suffix="db",
+        volume="mysqldata",
+        data="/var/lib/mysql",
+        secret_env="MYSQL_PASSWORD",
+        env=("MYSQL_USER=app", "MYSQL_DATABASE=app", "MYSQL_RANDOM_ROOT_PASSWORD=yes"),
+        url="{scheme}://app:{pw}@{host}:3306/app",
+        # over TCP: the first-boot init server listens on the socket only, then restarts
+        ready='mysql -h127.0.0.1 -uapp -p"$MYSQL_PASSWORD" -e "SELECT 1" app >/dev/null 2>&1',
+        ready_timeout=180,
+    ),
+    "redis": Sidecar(
+        engine="redis",
+        image="redis:7-alpine",
+        suffix="redis",
+        volume="redisdata",
+        data="/data",
+        secret_env="REDIS_PASSWORD",
+        command=("sh", "-c", 'exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"'),
+        url="{scheme}://:{pw}@{host}:6379/0",
+        ready='redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG',
+        reset="true",  # the password comes from the command line on every start, not from the data
+    ),
+}
+
+
+def sidecar_script(sc: Sidecar, app: str, password: str) -> str:
+    """sh that starts (or reuses) the sidecar and prints the password it runs with."""
+    name, volume, q = f"{app}-{sc.suffix}", f"{app}-{sc.volume}", shlex.quote
+    run = " ".join(
+        [
+            f"docker run -d --restart unless-stopped --name {q(name)} --network {NETWORK}",
+            f"-e {q(f'{sc.secret_env}={password}')}",
+            *(f"-e {q(e)}" for e in sc.env),
+            f"-v {q(f'{volume}:{sc.data}')} {q(sc.image)}",
+            *(q(c) for c in sc.command),
+        ]
     )
-    ssh_text(node, cmd, timeout=timeout)
-    return f"postgresql://app:app@{db}:5432/app"
+    orphan = (
+        ""
+        if sc.reset
+        else f"if docker volume inspect {q(volume)} >/dev/null 2>&1; then echo {q(orphan_volume_message(sc, app))} >&2; exit 3; fi; "
+    )
+    reset = f'[ -n "$fresh" ] && docker exec {q(name)} sh -c {q(sc.reset)} >/dev/null; ' if sc.reset else ""
+    return (
+        f"docker network inspect {NETWORK} >/dev/null 2>&1 || docker network create {NETWORK} >/dev/null; "
+        f"fresh=; if docker inspect {q(name)} >/dev/null 2>&1; then docker start {q(name)} >/dev/null; "
+        f"else {orphan}{run} >/dev/null && fresh=1; fi; "
+        f"ok=; for i in $(seq 1 {sc.ready_timeout}); do docker exec {q(name)} sh -c {q(sc.ready)} && ok=1 && break; sleep 1; done; "
+        f'[ -n "$ok" ] || {{ echo {q(f"{sc.engine} sidecar {name} did not become ready")} >&2; exit 1; }}; '
+        f"{reset}"
+        f"docker inspect -f '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' {q(name)} | sed -n 's/^{sc.secret_env}=//p'"
+    )
+
+
+def orphan_volume_message(sc: Sidecar, app: str) -> str:
+    return (
+        f"volume {app}-{sc.volume} holds {sc.engine} data but its container {app}-{sc.suffix} is gone, so its "
+        f"password is lost; restore the container or remove the volume (docker volume rm {app}-{sc.volume})"
+    )
+
+
+def ensure_sidecar(node: Node, app: str, engine: str, *, scheme: str | None = None) -> str:
+    """Start (or reuse) the `engine` sidecar on the node's cloudmorph network; return its URL.
+    Data lives in a named volume, so redeploys of the app keep their rows."""
+    import secrets
+
+    sc = SIDECARS[engine]
+    cp = ssh(node, sidecar_script(sc, app, secrets.token_hex(16)), timeout=sc.ready_timeout + 60)
+    err = cp.stderr.decode(errors="replace").strip()
+    if cp.returncode == 3:
+        raise SidecarRefused(err)
+    if cp.returncode != 0:  # not ssh_text: its error repeats the command, and the command holds the password
+        raise RuntimeError(f"ssh {node.name}: {engine} sidecar failed rc={cp.returncode}: {err[-800:]}")
+    out = cp.stdout.decode(errors="replace").strip()
+    password = out.splitlines()[-1] if out else ""
+    return sc.url.format(scheme=scheme or engine, pw=password, host=f"{app}-{sc.suffix}")
+
+
+def ensure_postgres(node: Node, app: str) -> str:
+    return ensure_sidecar(node, app, "postgres", scheme="postgresql")
 
 
 def container_oom_killed(node: Node, name: str) -> bool:

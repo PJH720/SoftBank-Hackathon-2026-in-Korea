@@ -124,7 +124,11 @@ def test_cloudrun_deploy_passes_size_and_scaling(monkeypatch, tmp_path):
 
 def test_node_containers_and_their_replicas_get_the_limits(monkeypatch, tmp_path):
     sent: list[str] = []
-    monkeypatch.setattr(nodes, "ssh_text", lambda node, cmd, timeout=60: sent.append(cmd) or "cid")
+    monkeypatch.setattr(
+        nodes,
+        "ssh",
+        lambda node, cmd, timeout=60: sent.append(cmd) or subprocess.CompletedProcess(cmd, 0, b"cid", b""),
+    )
     nodes.run_container(nodes.Node(name="a", host="1"), "img", "c", 8000, 8080, limits=["--memory", "1024m"])
     assert " --memory 1024m -p 8000:8080 img" in sent[0]
 

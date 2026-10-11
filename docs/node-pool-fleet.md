@@ -74,9 +74,16 @@ Cloud SQL의 DB·계정 이름은 앱 이름과 소스(`main._source_identity`)�
 
 | 타깃 | DB | 방법 | 데이터 보존 |
 |---|---|---|---|
-| local | `postgres:16-alpine` 사이드카 `<app>-db` | docker network `cloudmorph`, 볼륨 `<app>-dbdata` | 재배포(healer 재시도) 후에도 유지. `cleanup`에서만 삭제 |
-| node | 같은 방식을 노드에서 SSH로 | 노드마다 사이드카 | 앱이 `stateful`로 표시되어 **자동 확장 제외** |
-| cloudrun | Cloud SQL 인스턴스 `cloudmorph-pg`(공유) | `gcloud sql databases/users create` → `--add-cloudsql-instances` + `DATABASE_URL=postgresql://u:p@/db?host=/cloudsql/<conn>` | 관리형 |
+| local | 사이드카: Postgres `postgres:16-alpine` / MySQL `mysql:8.4` → `<app>-db`, Redis `redis:7-alpine` → `<app>-redis` | docker network `cloudmorph`, 볼륨 `<app>-dbdata` / `<app>-mysqldata` / `<app>-redisdata` | 재배포(healer 재시도) 후에도 유지. `cleanup`에서만 삭제 |
+| node | 같은 방식을 노드에서 SSH로 (`nodes.sidecar_script` 하나를 local·node가 같이 씀) | 노드마다 사이드카 | 앱이 `stateful`로 표시되어 **자동 확장 제외** |
+| cloudrun | Cloud SQL 인스턴스 `cloudmorph-pg`(공유), Postgres만 | `gcloud sql databases/users create` → `--add-cloudsql-instances` + `DATABASE_URL=postgresql://u:p@/db?host=/cloudsql/<conn>` (Secret Manager `cloudmorph-db-<db>`를 `--set-secrets`로 마운트) | 관리형 |
+
+- 사이드카 비밀번호는 사이드카마다 무작위 값이고, 컨테이너 자신의 env에만 있다. 재배포는 `docker inspect`로 그 값을 읽어 쓴다(예전 `app` 비밀번호 사이드카도 그대로 동작). 같은 `cloudmorph` 네트워크의 다른 앱은 비밀번호 없이 접속하지 못한다.
+- 컨테이너가 지워지고 볼륨만 남은 Postgres는 새 컨테이너가 컨테이너 안 소켓(trust)으로 새 비밀번호를 설정한다. MySQL은 그렇게 할 수 없어서 `user_action_required`로 멈춘다(볼륨을 지우거나 컨테이너를 되살린다).
+- MySQL URL 스킴은 코드에 적힌 것을 따른다(`mysql+pymysql://` 등, 없으면 `mysql://`). Redis는 앱이 `REDIS_URL`을 읽을 때만 붙는다(`DEPLOYER_CACHE=0`이면 끔).
+- cloudrun에서 MySQL 앱은 `user_action_required`로 멈춘다(MySQL 서버의 `DATABASE_URL`을 주거나 local/node로 배포). Redis는 경고만 남긴다(Memorystore는 VPC 커넥터가 필요하다).
+- Cloud SQL 비밀번호는 Secret Manager에도 보관한다. 다른 머신에서 배포하거나 리비전 env에서 읽을 수 없어도(마운트된 secret) 비밀번호를 바꾸지 않는다. 런타임 서비스 계정에 `roles/secretmanager.secretAccessor`를 붙이지 못하면 예전처럼 env 변수로 넣는다(`DEPLOYER_DB_SECRET=0`이면 항상 env 변수).
+- env 값은 명령줄에 쓰지 않는다: local은 `docker run -e NAME`(값은 docker 프로세스 env), cloudrun/function은 0600 임시 파일 `--env-vars-file`. env가 없으면 `--clear-env-vars`로 이전 리비전의 값을 지운다.
 
 실측(sample-apps/guestbook): local 9.7초, cloudrun 44초(앱별 DB·계정 생성 포함), node 20초. 세 곳 모두 글 쓰기 → 읽기 확인, local은 재배포 후 데이터 유지 확인.
 Cloud SQL 생성 시 `--edition=ENTERPRISE`를 줘야 `db-f1-micro`를 쓸 수 있고, Cloud Run 서비스 계정에 `roles/cloudsql.client`가 필요하다.

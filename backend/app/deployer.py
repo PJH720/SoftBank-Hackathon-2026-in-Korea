@@ -44,9 +44,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -161,6 +163,8 @@ class Config:
     # Runtime identity of user apps on cloudrun/function. Untrusted code can read its token from the
     # metadata server, so on a shared server this must be an account with no roles beyond cloudsql.client.
     app_service_account: str | None = None
+    cache: bool = True  # Redis sidecar (local/node) for an app that reads REDIS_URL
+    db_secret: bool = True  # cloudrun: keep DATABASE_URL in Secret Manager and mount it (env var fallback)
     db_owner: str | None = None  # where the code comes from (main._source_identity): isolates shared DB names
     # instance size. cpu in vCPUs ("1", "2"), memory like "512Mi"/"1Gi"; None -> platform default.
     # Precedence: detected from dependencies < cpu/memory (env or override) < Dockerfile LABEL cloudmorph.*
@@ -191,6 +195,8 @@ class Config:
             probe_path=env.get("DEPLOYER_PROBE_PATH") or None,
             verify_timeout=int(env.get("DEPLOYER_VERIFY_TIMEOUT", "60")),
             database=env.get("DEPLOYER_DATABASE", "auto") or None,
+            cache=env.get("DEPLOYER_CACHE", "1") not in ("0", "false", "no", ""),
+            db_secret=env.get("DEPLOYER_DB_SECRET", "1") not in ("0", "false", "no", ""),
             cloudsql_instance=env.get("CLOUDSQL_INSTANCE", "cloudmorph-pg"),
             app_service_account=env.get("DEPLOYER_APP_SERVICE_ACCOUNT") or None,
             cpu=env.get("DEPLOYER_CPU") or None,
@@ -591,51 +597,113 @@ def db_identifier(app: str, owner: str | None) -> str:
     return f"{base[:23]}_{hashlib.sha256(owner.encode()).hexdigest()[:8]}"
 
 
-def ensure_local_postgres(app: str, r: Runner) -> str:
-    """Postgres sidecar `<app>-db` on the local docker network; data in volume `<app>-dbdata`."""
-    db, net = f"{app}-db", nodepool.NETWORK
-    r.run("docker network", ["docker", "network", "create", net], check=False)
-    exists = subprocess.run(
-        ["docker", "ps", "-aq", "-f", f"name=^{db}$"], capture_output=True, text=True, check=False
-    )
-    if exists.stdout.strip():  # a stopped sidecar still holds the name; `docker start` is a no-op if running
-        r.run("docker start (postgres)", ["docker", "start", db], stage="deploy")
-    else:
-        r.run(
-            "docker run (postgres)",
-            [
-                "docker",
-                "run",
-                "-d",
-                "--restart",
-                "unless-stopped",
-                "--name",
-                db,
-                "--network",
-                net,
-                "-e",
-                "POSTGRES_USER=app",
-                "-e",
-                "POSTGRES_PASSWORD=app",
-                "-e",
-                "POSTGRES_DB=app",
-                "-v",
-                f"{app}-dbdata:/var/lib/postgresql/data",
-                "postgres:16-alpine",
-            ],
-            stage="deploy",
+def ensure_local_sidecar(app: str, engine: str, r: Runner, *, scheme: str | None = None) -> str:
+    """`engine` sidecar `<app>-<suffix>` on the local docker network (nodes.SIDECARS); returns its URL.
+    Same script as the node target, run here. Not via Runner: the script carries the password."""
+    sc = nodepool.SIDECARS[engine]
+    t0 = time.time()
+    try:
+        cp = subprocess.run(
+            ["sh", "-c", nodepool.sidecar_script(sc, app, secrets.token_hex(16))],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=sc.ready_timeout + 60,
         )
-    deadline = time.time() + 90
-    while time.time() < deadline:
+    except subprocess.TimeoutExpired:
+        raise StepError(
+            "deploy", "timeout", f"{engine} sidecar {app}-{sc.suffix} did not start in time"
+        ) from None
+    err = cp.stderr.strip()
+    r.steps.append(
+        Step(
+            f"{engine} sidecar",
+            f"{app}-{sc.suffix} ({sc.image}, volume {app}-{sc.volume})",
+            cp.returncode,
+            time.time() - t0,
+            "",
+            err[-500:] if cp.returncode else "",
+        )
+    )
+    if cp.returncode == 3:
+        raise StepError("deploy", "user_action_required", err)
+    if cp.returncode != 0:
+        raise StepError("deploy", "deploy_error", f"{engine} sidecar {app}-{sc.suffix} failed: {err[-800:]}")
+    out = cp.stdout.strip()
+    return sc.url.format(
+        scheme=scheme or engine, pw=out.splitlines()[-1] if out else "", host=f"{app}-{sc.suffix}"
+    )
+
+
+def ensure_local_postgres(app: str, r: Runner) -> str:
+    return ensure_local_sidecar(app, "postgres", r, scheme="postgresql")
+
+
+_REDIS_URL = re.compile(r"\bREDIS_URL\b")
+_MYSQL_SCHEME = re.compile(r"\b(mysql(?:\+\w+)?)://", re.IGNORECASE)
+
+
+def _code_files(src_dir: Path):
+    """(relative path, text) of the files scan_database looks at."""
+    for p in sorted(src_dir.rglob("*")):
         if (
-            subprocess.run(
-                ["docker", "exec", db, "pg_isready", "-U", "app", "-q"], capture_output=True, check=False
-            ).returncode
-            == 0
+            p.is_file()
+            and not _SCAN_SKIP.intersection(p.parts)
+            and p.name not in _LOCKFILES
+            and (p.suffix in _SCAN_EXT or p.name in _MANIFESTS)
         ):
-            return f"postgresql://app:app@{db}:5432/app"
-        time.sleep(1)
-    raise StepError("deploy", "deploy_error", f"postgres sidecar {db} did not become ready")
+            try:
+                yield p.relative_to(src_dir).as_posix(), p.read_text(errors="ignore")[:200_000]
+            except OSError:
+                continue
+
+
+def cache_for(src_dir: Path, cfg: Config, r: Runner) -> str | None:
+    """'redis' when the app reads REDIS_URL (and DEPLOYER_CACHE is not off); recorded as a step."""
+    if not cfg.cache:
+        return None
+    hit = next((rel for rel, text in _code_files(src_dir) if _REDIS_URL.search(text)), None)
+    if hit:
+        r.steps.append(Step("cache", f"redis ({hit}: REDIS_URL)", 0, 0.0, "", ""))
+    return "redis" if hit else None
+
+
+def url_scheme(src_dir: Path, engine: str) -> str:
+    """URL scheme the app expects. MySQL drivers disagree (SQLAlchemy wants mysql+pymysql://), so a
+    scheme already written in the code wins; Postgres keeps postgresql:// (psycopg, pg, prisma all read it)."""
+    if engine == "mysql":
+        for _, text in _code_files(src_dir):
+            if m := _MYSQL_SCHEME.search(text):
+                return m.group(1).lower()
+    return {"postgres": "postgresql"}.get(engine, engine)
+
+
+SIDECAR_TARGETS = {"local", "node"}
+
+
+def provisioned_env(src_dir: Path, targets, cfg: Config) -> set[str]:
+    """Env names the deployer fills in on every one of `targets` when the user leaves them blank:
+    DATABASE_URL (Postgres everywhere but function; MySQL on sidecar targets), REDIS_URL (sidecar targets)."""
+    targets, r = set(targets), Runner()
+    names = set()
+    engine = wants_database(src_dir, cfg)
+    if engine and "function" not in targets and (engine == "postgres" or targets <= SIDECAR_TARGETS):
+        names.add("DATABASE_URL")
+    if targets <= SIDECAR_TARGETS and cache_for(src_dir, cfg, r):
+        names.add("REDIS_URL")
+    return names
+
+
+def _attach_sidecars(src_dir: Path, cfg: Config, r: Runner, out: Outcome, env: dict, ensure) -> None:
+    """DATABASE_URL / REDIS_URL from sidecars (local, node) unless the user gave their own.
+    `ensure(engine, scheme) -> url` starts the sidecar where the app runs."""
+    name = slug(src_dir.name)
+    if "DATABASE_URL" not in env and (engine := database_for(src_dir, cfg, r)):
+        env["DATABASE_URL"] = ensure(engine, url_scheme(src_dir, engine))
+        out.handles.update(database=engine, db_container=f"{name}-db")
+    if "REDIS_URL" not in env and cache_for(src_dir, cfg, r) == "redis":
+        env["REDIS_URL"] = ensure("redis", "redis")
+        out.handles.update(cache="redis", cache_container=f"{name}-redis")
 
 
 def _pg_socket_url(serving_url: str | None, name: str, conn: str) -> bool:
@@ -689,6 +757,8 @@ def ensure_cloudsql_database(
         r.steps.append(
             Step("cloudsql reuse", f"keep database {legacy} of the serving revision", 0, 0.0, "", "")
         )
+        if read_db_secret(cfg, legacy) != serving_url:
+            remember_db_url(cfg, r, legacy, str(serving_url))
         return conn, str(serving_url)
     dbname = user = db_identifier(app, cfg.db_owner)
     dbs = r.run(
@@ -720,10 +790,17 @@ def ensure_cloudsql_database(
         stage="deploy",
     )
     exists = user in users.stdout.split()
+    stored = read_db_secret(cfg, dbname)
     # Resetting the password would cut off the live revision (and any rollback to it) before the
-    # candidate has passed verify, so keep the one it already uses.
+    # candidate has passed verify, so keep the one it already uses; Secret Manager holds it when the
+    # revision's env cannot tell (mounted secret, or a deploy from another machine).
     if exists and _pg_socket_url(serving_url, dbname, conn):
+        if stored != serving_url:
+            remember_db_url(cfg, r, dbname, str(serving_url))
         return conn, str(serving_url)
+    if exists and _pg_socket_url(stored, dbname, conn):
+        r.steps.append(Step("cloudsql reuse", f"password of {user} from Secret Manager", 0, 0.0, "", ""))
+        return conn, str(stored)
     verb = "set-password" if exists else "create"
     cp = subprocess.run(
         [
@@ -758,7 +835,123 @@ def ensure_cloudsql_database(
         raise StepError(
             "deploy", "deploy_error", f"could not create/update Cloud SQL user {user}: {cp.stderr[-500:]}"
         )
-    return conn, f"postgresql://{user}:{password}@/{dbname}?host=/cloudsql/{conn}"
+    url = f"postgresql://{user}:{password}@/{dbname}?host=/cloudsql/{conn}"
+    remember_db_url(cfg, r, dbname, url)
+    return conn, url
+
+
+# DATABASE_URL of a Cloud SQL database, one secret per database: cloudmorph-db-<db name>. Values travel
+# through gcloud's stdin/stdout only, never a command line or a Step.
+DB_SECRET_PREFIX = "cloudmorph-db-"
+_SOCKET_DB = re.compile(r"@/(\w+)\?host=/cloudsql/")
+
+
+def db_secret_id(dbname: str) -> str:
+    return DB_SECRET_PREFIX + dbname
+
+
+def _gsecrets(cfg: Config, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+    cmd = ["gcloud", "secrets", *args, "--project", str(cfg.project), "--quiet"]
+    try:
+        return subprocess.run(cmd, input=stdin, capture_output=True, text=True, check=False, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+
+def read_db_secret(cfg: Config, dbname: str) -> str | None:
+    if not cfg.db_secret:
+        return None
+    cp = _gsecrets(cfg, "versions", "access", "latest", f"--secret={db_secret_id(dbname)}")
+    return (cp.stdout.strip() or None) if cp.returncode == 0 else None
+
+
+def remember_db_url(cfg: Config, r: Runner, dbname: str, url: str) -> bool:
+    """Store `url` as the latest version of the database's secret (created on first use)."""
+    if not cfg.db_secret:
+        return False
+    sid = db_secret_id(dbname)
+    cp = _gsecrets(cfg, "versions", "add", sid, "--data-file=-", stdin=url)
+    if cp.returncode != 0 and ("NOT_FOUND" in cp.stderr or "not found" in cp.stderr.lower()):
+        cp = _gsecrets(cfg, "create", sid, "--replication-policy=automatic", "--data-file=-", stdin=url)
+    r.steps.append(
+        Step(
+            "db secret",
+            f"store DATABASE_URL in {sid}",
+            cp.returncode,
+            0.0,
+            "",
+            cp.stderr[-300:] if cp.returncode else "",
+        )
+    )
+    return cp.returncode == 0
+
+
+def _runtime_service_account(service: str, cfg: Config) -> str | None:
+    """The identity the service runs as: its own, else the project's default compute account."""
+    cp = subprocess.run(
+        _gcr(cfg, "services", "describe", service, "--format=value(spec.template.spec.serviceAccountName)"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cp.returncode == 0 and cp.stdout.strip():
+        return cp.stdout.strip()
+    cp = subprocess.run(
+        ["gcloud", "projects", "describe", str(cfg.project), "--format=value(projectNumber)"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    number = cp.stdout.strip() if cp.returncode == 0 else ""
+    return f"{number}-compute@developer.gserviceaccount.com" if number.isdigit() else None
+
+
+def mount_db_secret(service: str, db_url: str, cfg: Config, r: Runner) -> str | None:
+    """Secret id to mount as DATABASE_URL, so the password is not readable in the console as a plain env var.
+    None (-> plain env var, as before) when the secret does not hold exactly `db_url` or the service
+    account cannot be given access to it."""
+    m = _SOCKET_DB.search(db_url)
+    if not cfg.db_secret or not m or read_db_secret(cfg, m.group(1)) != db_url:
+        return None
+    sid = db_secret_id(m.group(1))
+    account = _runtime_service_account(service, cfg)
+    cp = (
+        _gsecrets(
+            cfg,
+            "add-iam-policy-binding",
+            sid,
+            f"--member=serviceAccount:{account}",
+            "--role=roles/secretmanager.secretAccessor",
+        )
+        if account
+        else subprocess.CompletedProcess([], 1, "", "runtime service account unknown")
+    )
+    r.steps.append(
+        Step(
+            "db secret access",
+            f"{account or '?'} -> {sid}",
+            cp.returncode,
+            0.0,
+            "",
+            cp.stderr[-300:] if cp.returncode else "",
+        )
+    )
+    return sid if cp.returncode == 0 else None
+
+
+@contextmanager
+def env_vars_file(env: dict):
+    """A 0600 temp file for gcloud --env-vars-file (JSON is YAML), so values stay off the command line."""
+    if not env:
+        yield None
+        return
+    fd, path = tempfile.mkstemp(prefix="cloudmorph-env-", suffix=".yaml")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump({k: str(v) for k, v in env.items()}, f)
+        yield path
+    finally:
+        os.unlink(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -1089,11 +1282,14 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         out.stage = "deploy"
         r.run("docker network", ["docker", "network", "create", nodepool.NETWORK], check=False)
         env = dict(cfg.env)
-        if (
-            "DATABASE_URL" not in env and database_for(src_dir, cfg, r) == "postgres"
-        ):  # the user's own DB wins
-            env["DATABASE_URL"] = ensure_local_postgres(name, r)
-            out.handles.update(database="postgres", db_container=f"{name}-db")
+        _attach_sidecars(
+            src_dir,
+            cfg,
+            r,
+            out,
+            env,
+            lambda engine, scheme: ensure_local_sidecar(name, engine, r, scheme=scheme),
+        )
         run_cmd = [
             "docker",
             "run",
@@ -1105,12 +1301,12 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
             "-e",
             f"PORT={cfg.container_port}",
         ]
-        for k, v in env.items():
-            run_cmd += ["-e", f"{k}={v}"]
+        for k in env:  # name only: docker reads the value from its own env, so it stays off the command line
+            run_cmd += ["-e", k]
         size = size_for(src_dir, cfg, r)
         out.handles["size"] = size.as_dict()
         run_cmd += [*size.docker_flags(), "-p", f"{host_port}:{cfg.container_port}", image]
-        cp = r.run("docker run", run_cmd, stage="deploy")
+        cp = r.run("docker run", run_cmd, stage="deploy", env={k: str(v) for k, v in env.items()})
         out.handles["container_id"] = cp.stdout.strip()
 
         out.stage = "verify"
@@ -1311,6 +1507,8 @@ def _cloud_size_flags(
     for note in notes:
         r.steps.append(Step("instance size", note, 0, 0.0, "", ""))
     out.handles["size"] = size.as_dict()
+    if size.cpu and not size.memory_mib:
+        size.memory_mib = 512  # functions take --cpu only together with --memory
     flags = ["--cpu", _format_cpu(size.cpu)] if size.cpu else []
     flags += ["--memory", str(size.memory)] if size.memory_mib else []
     return flags + scaling_flags(cfg, database=database)
@@ -1337,21 +1535,34 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
     )
     env = dict(cfg.env)
     label = owner_label(cfg)
-    if "DATABASE_URL" not in env and database_for(src_dir, cfg, r) == "postgres":  # the user's own DB wins
+    db_secret = None
+    if "DATABASE_URL" not in env and (engine := database_for(src_dir, cfg, r)):  # the user's own DB wins
+        if engine != "postgres":
+            raise StepError(
+                "deploy",
+                "user_action_required",
+                f"the app uses {engine}; on cloudrun CloudMorph provisions Cloud SQL for PostgreSQL only. "
+                f"Give DATABASE_URL of your {engine} server, or deploy to local/node (a {engine} sidecar)",
+            )
         serving_url = _revision_env(prev, "DATABASE_URL", cfg) if prev else None
         mine = bool(prev) and service_owner(service, cfg) in (None, label)
         conn, db_url = ensure_cloudsql_database(name, cfg, r, serving_url, adopt_legacy=mine)
-        env["DATABASE_URL"] = db_url
         cmd += ["--add-cloudsql-instances", conn]
         out.handles.update(database="cloudsql", cloudsql_connection=conn)
+        if db_secret := mount_db_secret(service, db_url, cfg, r):
+            out.handles["db_secret"] = db_secret
+        else:
+            env["DATABASE_URL"] = db_url
+    if "REDIS_URL" not in env and cache_for(src_dir, cfg, r):
+        out.warnings.append(
+            "the app reads REDIS_URL, but cloudrun has no Redis sidecar; give REDIS_URL of a Redis server "
+            "(Memorystore, Upstash ...) or deploy to local/node"
+        )
+    # DATABASE_URL is either a mounted secret or a literal; switching kinds needs the other one cleared
+    cmd += [f"--set-secrets=DATABASE_URL={db_secret}:latest"] if db_secret else ["--clear-secrets"]
     if label:
         cmd += ["--update-labels", f"{OWNER_LABEL}={label}"]
     cmd += _cloud_size_flags(src_dir, cfg, r, out, database="cloudsql_connection" in out.handles)
-    if env:
-        cmd += [
-            "--set-env-vars",
-            "^|^" + "|".join(f"{k}={v}" for k, v in env.items()),
-        ]  # '|' delimiter: URLs contain ','-free but '='-rich values
     if prev:
         cmd.append("--no-traffic")
     if cfg.allow_unauthenticated:
@@ -1366,7 +1577,9 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         )
     else:
         cmd.append(f"--startup-probe=tcpSocket.port={cfg.container_port},periodSeconds=3,failureThreshold=10")
-    cp = r.run("gcloud run deploy", cmd, timeout=cfg.deploy_timeout, check=False, stage="deploy")
+    with env_vars_file(env) as env_file:  # every env var is set explicitly: left-over ones would linger
+        flags = ["--env-vars-file", env_file] if env_file else ["--clear-env-vars"]
+        cp = r.run("gcloud run deploy", cmd + flags, timeout=cfg.deploy_timeout, check=False, stage="deploy")
     if cp.returncode != 0:
         m = re.search(rf"{re.escape(service)}-\d{{5}}-[a-z0-9]{{3}}", cp.stderr + cp.stdout)
         rev = m.group(0) if m else latest_revision(service, cfg)
@@ -1528,17 +1741,22 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     t0 = time.time()
     try:
         env = dict(cfg.env)
-        if (
-            "DATABASE_URL" not in env and database_for(src_dir, cfg, r) == "postgres"
-        ):  # the user's own DB wins
-            env["DATABASE_URL"] = nodepool.ensure_postgres(node, name)
-            out.handles.update(database="postgres", db_container=f"{name}-db")
+        _attach_sidecars(
+            src_dir,
+            cfg,
+            r,
+            out,
+            env,
+            lambda engine, scheme: nodepool.ensure_sidecar(node, name, engine, scheme=scheme),
+        )
         size = size_for(src_dir, cfg, r)
         out.handles["size"] = size.as_dict()
         host_port = nodepool.free_port_on(node)
         cid = nodepool.run_container(
             node, image, cname, host_port, cfg.container_port, env, limits=size.docker_flags()
         )
+    except nodepool.SidecarRefused as e:
+        raise StepError("deploy", "user_action_required", str(e)) from None
     except RuntimeError as e:
         r.steps.append(
             Step("docker run (remote)", f"ssh {node.name} docker run ...", 1, time.time() - t0, "", str(e))
@@ -1589,7 +1807,7 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
                 cfg.container_port,
                 fleet.Replica(node=node.name, container=cname, host=node.host, port=host_port),
                 str(src_dir),
-                stateful=out.handles.get("database") is not None,
+                stateful=bool(out.handles.get("database") or out.handles.get("cache")),
                 limits=size.docker_flags(),
             )
             r.steps.append(
@@ -1752,9 +1970,11 @@ def deploy_function(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
     if sa := cfg.runtime_account():
         cmd += ["--service-account", sa]
     cmd += _cloud_size_flags(src_dir, cfg, r, out)  # gen2 functions run on Cloud Run: same size rules
-    if cfg.env:
-        cmd += ["--set-env-vars", "^|^" + "|".join(f"{k}={v}" for k, v in cfg.env.items())]
-    cp = r.run("gcloud functions deploy", cmd, timeout=cfg.deploy_timeout, check=False, stage="deploy")
+    with env_vars_file(cfg.env) as env_file:
+        flags = ["--env-vars-file", env_file] if env_file else []
+        cp = r.run(
+            "gcloud functions deploy", cmd + flags, timeout=cfg.deploy_timeout, check=False, stage="deploy"
+        )
     if cp.returncode != 0:
         raise StepError(
             "deploy", "function_error", (cp.stderr or cp.stdout)[-TAIL:], app_logs=function_logs(name, cfg, r)

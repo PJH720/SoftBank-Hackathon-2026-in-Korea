@@ -1468,3 +1468,17 @@ def test_move_takes_the_old_place_down_only_after_the_new_one_is_up(m, tmp_path,
     assert list(m._projects["gb"]["live"]) == ["cloudrun"] and "local" not in m._projects["gb"]["urls"]
     lines = [d["payload"].get("line", "") for e, d in _events(routes, deployment_id) if e == "log"]
     assert any(line.startswith("move: local 내림") for line in lines)
+
+
+def test_provisioned_env_follows_the_targets(tmp_path):
+    from app import deployer
+
+    (tmp_path / "app.py").write_text("import os\nos.environ['DATABASE_URL']\nos.environ['REDIS_URL']\n")
+    (tmp_path / "requirements.txt").write_text("pymysql\nredis\n")
+    cfg = deployer.Config()
+    # MySQL and Redis come from sidecars: promised on local/node only
+    assert deployer.provisioned_env(tmp_path, ["local", "node"], cfg) == {"DATABASE_URL", "REDIS_URL"}
+    assert deployer.provisioned_env(tmp_path, ["local", "cloudrun"], cfg) == set()
+    (tmp_path / "requirements.txt").write_text("psycopg\n")
+    assert deployer.provisioned_env(tmp_path, ["cloudrun"], cfg) == {"DATABASE_URL"}
+    assert deployer.provisioned_env(tmp_path, ["function"], cfg) == set()
