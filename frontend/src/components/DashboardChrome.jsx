@@ -89,17 +89,18 @@ export function RunHUD({ run, now, notice, onPanel, onCancel, cancelling, celebr
   );
 }
 
-export function ActivityDock({ run, project, onPanel }) {
+export function ActivityDock({ run, project, onPanel, children }) {
   const logs = recentKeyLogs(run.logs);
   const urls = liveEndpoints(run, project);
   return (
-    <footer className="activity-dock" aria-label="핵심 로그와 공개 URL">
+    <footer className={`activity-dock${children ? ' has-console' : ''}`} aria-label="핵심 로그와 공개 URL">
       <div className="dock-heading"><span><Terminal size={13} />LIVE ACTIVITY</span><button onClick={() => onPanel('details')}>전체 로그 보기</button></div>
       <ol className="key-logs" aria-live="polite" aria-relevant="additions text">
         {logs.length === 0 ? <li className="empty-log">새 배포를 눌러 시작하세요. 진행 상황이 이곳에 표시됩니다.</li> : logs.map((log) => (
           <li key={log.id} data-kind={log.kind}><time>{fmtTime(log.at)}</time><span title={log.text}>{log.text}</span></li>
         ))}
       </ol>
+      {children && <div className="dock-console">{children}</div>}
       {urls.length > 0 && <div className="live-links">{urls.map(({ target, label, url }) => <a key={target} href={url} target="_blank" rel="noopener noreferrer"><ExternalLink size={12} />{label} 열기</a>)}</div>}
     </footer>
   );

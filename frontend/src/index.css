@@ -75,6 +75,13 @@ code, pre, .font-mono { font-family: var(--mono); }
 .dock-heading > span { display: inline-flex; gap: 6px; align-items: center; }
 .dock-heading button { border: 0; background: transparent; font-size: 11px; color: var(--gold); cursor: pointer; letter-spacing: 0; }
 .key-logs { padding: 0; margin: 0; list-style: none; }
+/* Pipeline log at the bottom of the main screen: only where there is height for it, so the 3D scene and the
+   one-screen layout survive on short windows and phones (there the one-line key logs stay). */
+.dock-console { display: none; min-width: 0; }
+@media (min-height: 760px) and (min-width: 768px) {
+  .activity-dock.has-console .dock-console { display: block; }
+  .activity-dock.has-console .key-logs { display: none; }
+}
 .key-logs li { display: flex; gap: 12px; align-items: center; font-size: 12px; line-height: 21px; min-width: 0; color: #cbd5e1; }
 .key-logs time { font: 10px ui-monospace, monospace; color: #8a8ea6; flex-shrink: 0; }
 .key-logs li > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
