@@ -1,0 +1,51 @@
+name: Server CD
+
+# After CI passes on a push to main, roll the control-plane server (GCE VM) forward to that exact commit.
+# Manual run: Actions -> Server CD -> Run workflow (deploys the selected ref).
+# Setup (environment "production", main only): secrets SERVER_SSH_KEY, SERVER_KNOWN_HOSTS;
+# variables CLOUDMORPH_SERVER, CLOUDMORPH_DOMAIN. See docs/server-hosting.md.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# one deploy at a time; a newer push waits instead of cutting a running deploy short
+concurrency:
+  group: server-cd
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://${{ vars.CLOUDMORPH_DOMAIN }}
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: SSH key
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SERVER_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Deploy
+        env:
+          CLOUDMORPH_SERVER: ${{ vars.CLOUDMORPH_SERVER }}
+          CLOUDMORPH_DOMAIN: ${{ vars.CLOUDMORPH_DOMAIN }}
+        run: scripts/server-deploy.sh "$SHA"
