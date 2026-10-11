@@ -12,6 +12,7 @@ import DetailsModal from './components/DetailsModal';
 import { pendingInput } from './lib/dashboard';
 import SceneBoundary from './components/3d/SceneBoundary';
 import { shouldCelebrate } from './lib/victory';
+import { weatherStatus } from './lib/weather';
 import { EXPIRED_LOGS, canOpenLogs, canRedeploy, redeployRequest } from './lib/operations';
 import { DEMO_RUN_ID, buildDemoFleet, buildDemoHandoffProject, buildDemoProjects } from './lib/demoData';
 
@@ -19,6 +20,8 @@ import { DEMO_RUN_ID, buildDemoFleet, buildDemoHandoffProject, buildDemoProjects
 const PipelineJourney = lazy(() => import('./components/3d/PipelineJourney'));
 const InstancedFleetGrid = lazy(() => import('./components/3d/InstancedFleetGrid'));
 const VictoryCelebration = lazy(() => import('./components/3d/VictoryCelebration'));
+const GlobalFleetGlobe = lazy(() => import('./components/3d/GlobalFleetGlobe'));
+const CloudWeatherBackground = lazy(() => import('./components/3d/CloudWeatherBackground'));
 
 const FLEET_DEMO_MAX = 500;
 const FINISHED_RUN = new Set(['completed', 'partial_failure', 'failed', 'cancelled']);
@@ -45,6 +48,18 @@ function SceneMessage({ children }) {
   return <div className="scene-message" role="status">{children}</div>;
 }
 
+const FLEET_VIEWS = [['grid', '그리드'], ['globe', '지구본']];
+
+function FleetViewToggle({ view, onView }) {
+  return (
+    <div className="fleet-view-toggle" role="group" aria-label="노드 풀 보기 방식">
+      {FLEET_VIEWS.map(([id, label]) => (
+        <button key={id} type="button" aria-pressed={view === id} onClick={() => onView(id)}>{label}</button>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
   const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', targets: { local: true, cloudrun: true, node: false, function: false } });
   const [run, setRun] = useState(() => emptyRun());
@@ -58,6 +73,7 @@ export default function App() {
   const [me, setMe] = useState(null);
   const [meChecked, setMeChecked] = useState(false); // false until the first /projects/me answer
   const [activeScene, setActiveScene] = useState('journey');
+  const [fleetView, setFleetView] = useState('grid');
   const [panel, setPanel] = useState(null);
   const [fullscreen, setFullscreen] = useState(false);
   const shell = useRef(null);
@@ -291,7 +307,7 @@ export default function App() {
     return () => { alive = false; };
   }, [token]);
 
-  const onDeploy = async () => {
+  const onDeploy = async (llmConfig) => {
     const name = form.name.trim();
     if (launchLock.current || tracking.current.status === 'running' || stopLocks.current.has(name)) return;
     launchLock.current = { name };
@@ -300,7 +316,7 @@ export default function App() {
     // lock the button before the request returns, otherwise a double click starts two deployments
     setStarting(true);
     try {
-      const id = await startDeploy({ source: form.source.trim(), targets, name: form.name.trim() || undefined, ref: form.ref.trim() || undefined });
+      const id = await startDeploy({ source: form.source.trim(), targets, name: form.name.trim() || undefined, ref: form.ref.trim() || undefined, ...(llmConfig ? { llm_config: llmConfig } : {}) });
       attach(id, { source: form.source, targets, name: form.name || null, trigger: 'api' });
     } catch (e) {
       setRun({ ...emptyRun(), status: 'failed', error: e.message, logs: [{ id: 0, at: new Date(), kind: 'error', stage: 'failed', text: `배포 요청 실패: ${e.message}` }] });
@@ -469,6 +485,18 @@ export default function App() {
     }
   };
 
+  const weather = weatherStatus(run);
+  // same element while the weather is unchanged, so HUD ticks and log events skip the header canvas
+  const headerBackdrop = useMemo(() => (
+    <SceneBoundary fallback={null}>
+      <Suspense fallback={null}>
+        <CloudWeatherBackground status={weather} className="absolute inset-0 pointer-events-none" />
+      </Suspense>
+    </SceneBoundary>
+  ), [weather]);
+  const showFleetToggle = activeScene === 'fleet' && !celebrate && !showBoard;
+  const sceneKey = celebrate ? `victory-${run.id}` : activeScene === 'fleet' ? `fleet-${fleetView}` : activeScene;
+
   // no token, or one that maps to nobody (expired login): log in / sign up first
   if (!meChecked) return <div className="dashboard-shell" />; // don't flash the dashboard first
   if (!me) return <AuthScreen onAuthed={saveToken} healthy={healthy} />;
@@ -476,7 +504,7 @@ export default function App() {
   return (
     <div ref={shell} className="dashboard-shell">
       <div className="dashboard-page" inert={panel ? true : undefined}>
-        <DashboardHeader scene={activeScene} onScene={selectScene} healthy={healthy} onPanel={setPanel} fullscreen={fullscreen} onFullscreen={toggleFullscreen} demoMode={demoMode} onToggleDemo={onToggleDemo} user={me.user} onLogout={token ? onLogout : null} />
+        <DashboardHeader background={headerBackdrop} scene={activeScene} onScene={selectScene} healthy={healthy} onPanel={setPanel} fullscreen={fullscreen} onFullscreen={toggleFullscreen} demoMode={demoMode} onToggleDemo={onToggleDemo} user={me.user} onLogout={token ? onLogout : null} />
         <main className="dashboard-stage">
           <RunHUD run={run} now={now} notice={notice} onPanel={setPanel} onCancel={onCancel} cancelling={cancelling === run.id} celebrate={celebrate} onShowApp={canHandoff ? showInApps : null} />
           <div id="scene-view" className="scene-view" role="tabpanel" aria-labelledby={`scene-tab-${activeScene}`}>
@@ -507,14 +535,16 @@ export default function App() {
                 setScenario={onSelectDemoScenario}
                 onEnableDemo={() => { setDemoMode(true); flash('시각 검증(데모) 모드가 켜졌습니다.'); setActiveScene('apps'); }}
               />
-            ) : <SceneBoundary key={celebrate ? `victory-${run.id}` : activeScene} fallback={<SceneMessage>3D 화면을 사용할 수 없습니다. 상태와 상세 패널에서 배포를 계속 확인할 수 있습니다.</SceneMessage>}>
+            ) : <SceneBoundary key={sceneKey} fallback={<SceneMessage>3D 화면을 사용할 수 없습니다. 상태와 상세 패널에서 배포를 계속 확인할 수 있습니다.</SceneMessage>}>
               <Suspense fallback={<SceneMessage>3D 장면을 준비하고 있습니다…</SceneMessage>}>
                 {celebrate ? <VictoryCelebration open run={run} presentation="stage" onClose={dismissVictory} />
                   : activeScene === 'journey' ? <PipelineJourney run={run} presentation="stage" />
+                    : fleetView === 'globe' ? <GlobalFleetGlobe fleet={fleet} healthy={healthy} presentation="stage" />
                     : fleet ? <InstancedFleetGrid fleet={fleet} demoCount={fleetDemo} presentation="stage" />
                       : <SceneMessage>노드 풀 데이터를 불러오지 못했습니다. 연결 상태와 설정을 확인해 주세요.</SceneMessage>}
               </Suspense>
             </SceneBoundary>}
+            {showFleetToggle && <FleetViewToggle view={fleetView} onView={setFleetView} />}
           </div>
           <ActivityDock run={run} project={currentProject} onPanel={setPanel}>
             {/* the full pipeline log under the scene on tall screens; short ones keep the one-line key logs */}

@@ -1,12 +1,12 @@
-import React, { Component, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import React, { Component, Suspense, useEffect, useMemo, useRef } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { ContactShadows, Sparkles, useAnimations, useGLTF } from '@react-three/drei';
 import * as THREE from 'three';
 import { ExternalLink, Wrench, X } from 'lucide-react';
 import { summarizeHeal } from '../../lib/victory';
 import SceneBoundary from './SceneBoundary';
+import usePrefersReducedMotion from './usePrefersReducedMotion';
 
-const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
 const REDUCED_MOTION_SCALE = 0.25;
 
 const STAGE_RADIUS = 2.2;
@@ -65,17 +65,6 @@ function fitToHeight(scene) {
 
 const pickAction = (actions, names, clip) => actions[clip] || (names[0] ? actions[names[0]] : null);
 
-function usePrefersReducedMotion() {
-  const [reduced, setReduced] = useState(() => typeof window !== 'undefined' && !!window.matchMedia?.(REDUCED_MOTION_QUERY).matches);
-  useEffect(() => {
-    const mq = window.matchMedia?.(REDUCED_MOTION_QUERY);
-    if (!mq) return undefined;
-    const onChange = (e) => setReduced(e.matches);
-    mq.addEventListener('change', onChange);
-    return () => mq.removeEventListener('change', onChange);
-  }, []);
-  return reduced;
-}
 
 const smoothstep = (x) => x * x * (3 - 2 * x);
 
