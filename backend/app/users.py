@@ -7,7 +7,8 @@
 A login hands out a random session token that accounts.identify() maps to the user, exactly like a
 per-user API token, so ownership of projects/deployments works the same for both.
 Passwords are kept as scrypt(salt) and sessions only as sha256(token): a leaked file gives no usable
-password or token. Repeated wrong passwords for one name are refused for a while (LOGIN_LOCK_SECONDS).
+password or token. Repeated wrong passwords are refused for a while (LOGIN_LOCK_SECONDS), counted per
+client IP: 5 for one id (so a stranger elsewhere can't lock someone out) and 20 for any id from that IP.
 """
 
 from __future__ import annotations
@@ -26,11 +27,15 @@ from pathlib import Path
 USER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{2,31}")  # a subset of accounts' names, at least 3 chars
 MIN_PASSWORD, MAX_PASSWORD = 8, 128
 SCRYPT = {"n": 2**14, "r": 8, "p": 1, "dklen": 32}
-LOGIN_FAILURES, LOGIN_LOCK_SECONDS = 5, 300
+LOGIN_FAILURES, LOGIN_FAILURES_PER_IP, LOGIN_LOCK_SECONDS = 5, 20, 300
+MAX_TRACKED_FAILURES = 10_000  # failure keys kept in memory; random ids must not grow it without bound
 
 _lock = threading.Lock()
-_failures: dict[str, list[float]] = {}  # name -> recent failure times (in memory; a restart clears it)
+# "ip|name" and "ip|*" -> recent failure times, least recently failed first (in memory; a restart clears it)
+_failures: dict[str, list[float]] = {}
 _DUMMY_SALT = secrets.token_bytes(16)
+# (path, inode, mtime_ns, size) -> parsed store. identify() looks a session up on every protected request.
+_cache: tuple[tuple, dict] | None = None
 
 
 class AuthError(ValueError):
@@ -57,7 +62,26 @@ def _read() -> dict:
     return data
 
 
+def _stamp(path: Path) -> tuple:
+    try:
+        st = path.stat()
+    except OSError:
+        return (path, None)
+    return (path, st.st_ino, st.st_mtime_ns, st.st_size)  # _write's os.replace always gives a new inode
+
+
+def _cached() -> dict:
+    """The store for lookups, re-read only when the file changed. Read-only: writers use _read()."""
+    global _cache
+    stamp, cache = _stamp(_path()), _cache
+    if cache is None or cache[0] != stamp:
+        cache = (stamp, _read())
+        _cache = cache
+    return cache[1]
+
+
 def _write(data: dict) -> None:
+    global _cache
     path = _path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -65,6 +89,7 @@ def _write(data: dict) -> None:
     with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2, sort_keys=True)
     os.replace(tmp, path)
+    _cache = None  # the next lookup re-reads, even if the stamp happens to match
 
 
 def _hash_password(password: str, salt: bytes) -> bytes:
@@ -90,8 +115,23 @@ def _new_session(data: dict, name: str) -> str:
     return token
 
 
+def _recent(key: str, now: float) -> int:
+    return sum(1 for t in _failures.get(key, ()) if now - t < LOGIN_LOCK_SECONDS)
+
+
+def _record_failure(keys: tuple[str, ...], now: float) -> None:
+    for key in keys:
+        times = [t for t in _failures.pop(key, ()) if now - t < LOGIN_LOCK_SECONDS]
+        _failures[key] = [*times, now]  # re-inserted: the dict stays ordered by last failure
+    if len(_failures) > MAX_TRACKED_FAILURES:
+        for key in [k for k, times in _failures.items() if now - times[-1] >= LOGIN_LOCK_SECONDS]:
+            del _failures[key]
+        while len(_failures) > MAX_TRACKED_FAILURES:
+            del _failures[next(iter(_failures))]
+
+
 def has_users() -> bool:
-    return bool(_read()["users"])
+    return bool(_cached()["users"])
 
 
 def signup(name: str, password: str, code: str | None = None, *, taken: Iterable[str] = ()) -> str:
@@ -116,23 +156,23 @@ def signup(name: str, password: str, code: str | None = None, *, taken: Iterable
     return token
 
 
-def login(name: str, password: str) -> str:
+def login(name: str, password: str, client: str = "") -> str:
+    """`client`: the caller's IP, so failed logins lock that caller out and not the account everywhere."""
     now = time.time()
+    keys = (f"{client}|{name}", f"{client}|*")
     with _lock:
-        recent = [t for t in _failures.get(name, []) if now - t < LOGIN_LOCK_SECONDS]
-        _failures[name] = recent
-        if len(recent) >= LOGIN_FAILURES:
+        if _recent(keys[0], now) >= LOGIN_FAILURES or _recent(keys[1], now) >= LOGIN_FAILURES_PER_IP:
             raise AuthError(429, "too many failed logins; try again in a few minutes")
-        user = _read()["users"].get(name)
+        user = _cached()["users"].get(name)
     # hash even for an unknown id so response time does not reveal which ids exist
     salt = bytes.fromhex(user["salt"]) if user else _DUMMY_SALT
     digest = _hash_password(password[:MAX_PASSWORD], salt)
     if not user or not hmac.compare_digest(digest, bytes.fromhex(user["hash"])):
         with _lock:
-            _failures.setdefault(name, []).append(now)
+            _record_failure(keys, now)
         raise AuthError(401, "wrong id or password")
     with _lock:
-        _failures.pop(name, None)
+        _failures.pop(keys[0], None)  # the per-IP count stays: logging into your own id must not reset it
         data = _read()
         token = _new_session(data, name)
         _write(data)
@@ -150,7 +190,7 @@ def user_for(token: str) -> str | None:
     """Account name for a live session token, else None."""
     if not token:
         return None
-    session = _read()["sessions"].get(_token_key(token))
+    session = _cached()["sessions"].get(_token_key(token))
     if not session or session["expires"] <= time.time():
         return None
     return session["user"]

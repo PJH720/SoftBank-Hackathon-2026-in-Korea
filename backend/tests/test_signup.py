@@ -127,3 +127,55 @@ def test_without_any_token_configured_signing_up_turns_the_guard_on(client, monk
     assert local.get("/projects/me").json()["admin"] is True  # local dev, nobody signed up yet
     _signup(local, "alice")
     assert local.get("/projects/me").status_code == 401  # accounts exist now: a token is needed
+
+
+def _login(client, name="alice", password="nope nope", **kw):
+    return client.post("/auth/login", json={"username": name, "password": password}, **kw)
+
+
+def test_a_lockout_from_one_ip_does_not_lock_the_owner_out_elsewhere(client):
+    _signup(client, "alice")
+    for _ in range(users.LOGIN_FAILURES):
+        _login(client)
+    assert _login(client, password="correct horse").status_code == 429
+    owner = TestClient(main.create_app(), client=("198.51.100.7", 4000))
+    assert _login(owner, password="correct horse").status_code == 200
+
+
+def test_one_ip_guessing_many_ids_is_locked_too(client):
+    for i in range(users.LOGIN_FAILURES_PER_IP):
+        assert _login(client, name=f"user{i}").status_code == 401
+    assert _login(client, name="someone-new").status_code == 429
+
+
+def test_behind_a_local_proxy_the_forwarded_ip_counts(client):
+    proxy = TestClient(main.create_app(), client=("127.0.0.1", 5000))
+    _signup(proxy, "alice")
+    for _ in range(users.LOGIN_FAILURES):
+        _login(proxy, headers={"X-Forwarded-For": "203.0.113.50"})
+    # only the right-most entry (added by the proxy) is trusted; a spoofed left part changes nothing
+    assert _login(proxy, headers={"X-Forwarded-For": "1.2.3.4, 203.0.113.50"}).status_code == 429
+    assert (
+        _login(proxy, password="correct horse", headers={"X-Forwarded-For": "203.0.113.51"}).status_code
+        == 200
+    )
+
+
+def test_failure_records_stay_bounded(client, monkeypatch):
+    monkeypatch.setattr(users, "MAX_TRACKED_FAILURES", 10)
+    for i in range(30):
+        _login(client, name=f"random{i}")
+    assert len(users._failures) <= 10
+
+
+def test_session_lookups_do_not_reparse_the_store(client, monkeypatch):
+    token = _signup(client, "alice").json()["token"]
+    assert users.user_for(token) == "alice"
+    reads = []
+    real_read = users._read
+    monkeypatch.setattr(users, "_read", lambda: reads.append(1) or real_read())
+    for _ in range(5):
+        assert users.user_for(token) == "alice"
+    assert reads == []
+    users.logout(token)  # a write invalidates the cache
+    assert users.user_for(token) is None

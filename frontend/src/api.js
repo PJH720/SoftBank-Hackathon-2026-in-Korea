@@ -80,6 +80,13 @@ export async function getMe() {
   return res.ok ? res.json() : null
 }
 
+/** Whether `token` maps to a user, checked before it replaces the stored one. */
+export async function checkToken(token) {
+  const res = await fetch('/projects/me', { headers: { 'X-API-Token': token } }).catch(() => null)
+  if (!res) throw new Error('백엔드에 연결할 수 없습니다')
+  return res.ok
+}
+
 async function postJson(path, body) {
   const res = await fetch(path, { method: 'POST', headers: headers(), body: JSON.stringify(body) })
   const data = await res.json().catch(() => ({}))

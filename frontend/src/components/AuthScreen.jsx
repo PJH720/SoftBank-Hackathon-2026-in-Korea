@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Cloud, KeyRound, LogIn, UserPlus } from 'lucide-react';
-import { getAuthConfig, logIn, signUp } from '../api';
+import { checkToken, getAuthConfig, logIn, signUp } from '../api';
 import { Card, Dot } from './ui';
 
 const input = 'w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 focus:border-violet-500/60 focus:outline-none';
@@ -15,6 +15,8 @@ export default function AuthScreen({ onAuthed, healthy }) {
   const [error, setError] = useState('');
   const [showToken, setShowToken] = useState(false);
   const [token, setToken] = useState('');
+  const [tokenError, setTokenError] = useState('');
+  const [tokenBusy, setTokenBusy] = useState(false);
 
   useEffect(() => { getAuthConfig().then((c) => setNeedCode(!!c.signup_code)); }, []);
 
@@ -33,6 +35,23 @@ export default function AuthScreen({ onAuthed, healthy }) {
       setError(err.message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  // an unknown token would just leave this screen up with no hint, so check it first
+  const submitToken = async (e) => {
+    e.preventDefault();
+    const t = token.trim();
+    if (!t) return;
+    setTokenError('');
+    setTokenBusy(true);
+    try {
+      if (await checkToken(t)) onAuthed(t);
+      else setTokenError('유효하지 않은 API 토큰입니다');
+    } catch (err) {
+      setTokenError(err.message);
+    } finally {
+      setTokenBusy(false);
     }
   };
 
@@ -82,9 +101,12 @@ export default function AuthScreen({ onAuthed, healthy }) {
 
         <div className="text-center text-xs text-slate-500">
           {showToken ? (
-            <form className="flex gap-2" onSubmit={(e) => { e.preventDefault(); if (token.trim()) onAuthed(token.trim()); }}>
-              <input className={input} type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder="API 토큰" autoFocus />
-              <button type="submit" className="rounded-lg border border-white/10 px-3 text-slate-300 hover:text-white">접속</button>
+            <form className="space-y-2" onSubmit={submitToken}>
+              <div className="flex gap-2">
+                <input className={input} type="password" value={token} onChange={(e) => { setToken(e.target.value); setTokenError(''); }} placeholder="API 토큰" autoFocus />
+                <button type="submit" disabled={tokenBusy} className="rounded-lg border border-white/10 px-3 text-slate-300 hover:text-white disabled:opacity-50">{tokenBusy ? '확인 중…' : '접속'}</button>
+              </div>
+              {tokenError && <p className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-left text-xs text-rose-200">{tokenError}</p>}
             </form>
           ) : (
             <button type="button" onClick={() => setShowToken(true)} className="inline-flex items-center gap-1 hover:text-slate-300">

@@ -111,6 +111,16 @@ def _is_direct_local_request(request: Request) -> bool:
     return not any(h in request.headers for h in _PROXY_HEADERS)
 
 
+def _client_ip(request: Request) -> str:
+    """The caller's IP. Behind our own proxy (Caddy, cloudflared, vite all reach uvicorn on loopback)
+    that is the right-most X-Forwarded-For entry, the one the proxy added; the rest is client-supplied."""
+    host = request.client.host if request.client else ""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if host in _LOOPBACK_HOSTS and forwarded:
+        return forwarded.rsplit(",", 1)[-1].strip() or host
+    return host
+
+
 @dataclass
 class Job:
     created_at: float = field(default_factory=time.time)
@@ -567,10 +577,10 @@ def create_app() -> FastAPI:
         return {"token": token, "user": body.username.strip().lower()}
 
     @app.post("/auth/login")
-    async def auth_login(body: AuthRequest) -> dict:
+    async def auth_login(body: AuthRequest, request: Request) -> dict:
         name = body.username.strip().lower()
         try:
-            token = await asyncio.to_thread(users.login, name, body.password)
+            token = await asyncio.to_thread(users.login, name, body.password, _client_ip(request))
         except users.AuthError as exc:
             raise HTTPException(status_code=exc.status, detail=exc.detail) from None
         return {"token": token, "user": name}
