@@ -185,3 +185,19 @@ export function subscribe(id, onEvent, onFail) {
   es.onerror = () => onFail && onFail()
   return () => es.close()
 }
+
+// --- admin console (#/admin). Apps come from getProjects()/stopProject(): admin already sees every app. ---
+/** Everyone who can own apps: [{ name, kind: admin|account|token|owner, apps, live, sessions, created_at, last_login }]. */
+export async function getAdminUsers() {
+  const res = await fetch('/admin/users', { headers: headers() })
+  if (!res.ok) throw new Error(`${res.status}`)
+  return (await res.json()).users
+}
+
+const adminUser = (name, action) => `/admin/users/${encodeURIComponent(name)}/${action}`
+/** New password for an account; its current logins end. */
+export const resetUserPassword = (name, password) => postJson(adminUser(name, 'password'), { password })
+/** Log the account out everywhere -> { ended }. */
+export const logOutUser = (name) => postJson(adminUser(name, 'logout'), {})
+/** Remove the account. Its apps stay (and keep the id reserved). */
+export const deleteUser = (name) => postJson(adminUser(name, 'delete'), {})

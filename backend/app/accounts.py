@@ -4,6 +4,7 @@
     CLOUDMORPH_USERS         "alice:<token>,bob:<token>"          per-user tokens (optional)
     CLOUDMORPH_USERS_FILE    JSON {"alice": "<token>", ...}       same, from a file (optional)
     sign-up / login          users.py: ID + password accounts; a login's session token works like the above
+    CLOUDMORPH_ADMIN_PASSWORD  "admin" can also log in with this password; that session is admin as well
 
 A user only sees and changes their own projects, deployments and CD links. An app name belongs to the
 user who deployed it first (Cloud Run service names are shared across the whole GCP project, so two
@@ -75,5 +76,5 @@ def identify(supplied: str) -> User | None:
     # login sessions are looked up by sha256(token), so there is nothing to compare one by one
     session_user = users.user_for(supplied)
     if found is None and session_user:
-        found = User(session_user)
+        found = LOCAL_ADMIN if session_user == ADMIN else User(session_user)
     return found
