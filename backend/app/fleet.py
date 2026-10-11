@@ -29,10 +29,12 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field
+from functools import wraps
 from pathlib import Path
 
 from app import nodes as nodepool
 from app.nodes import Registry
+from app.storage import file_lock, write_json
 
 log = logging.getLogger("fleet")
 STATE_FILE = Path(__file__).resolve().parents[1] / ".fleet" / "fleet.json"
@@ -95,8 +97,22 @@ def load_state() -> State:
 
 
 def save_state(state: State) -> None:
-    STATE_FILE.parent.mkdir(exist_ok=True)
-    STATE_FILE.write_text(json.dumps(asdict(state), ensure_ascii=False, indent=2))
+    write_json(STATE_FILE, asdict(state))
+
+
+def serialized(fn):
+    """Hold one fleet-wide lock from snapshot read through router update and persistence.
+
+    The file lock also covers a separate CLI/watcher process on this control host.
+    scale_out/scale_in accept an existing snapshot and run inside these entry points.
+    """
+
+    @wraps(fn)
+    def run(*args, **kwargs):
+        with file_lock(STATE_FILE.with_suffix(".lock")):
+            return fn(*args, **kwargs)
+
+    return run
 
 
 # --------------------------------------------------------------------------- #
@@ -105,6 +121,7 @@ def save_state(state: State) -> None:
 INIT_CONFIG = {"admin": {"listen": "0.0.0.0:2019"}, "apps": {"http": {"servers": {}}}}
 
 
+@serialized
 def init_router(reg: Registry) -> str:
     """Start Caddy on the router VM. Ports are *published* (-p) rather than host-networked because
     Container-Optimized OS drops inbound traffic on the host by default; Docker's port mapping bypasses that.
@@ -195,6 +212,7 @@ def push_config(reg: Registry, state: State) -> None:
 # --------------------------------------------------------------------------- #
 # Registration (called by deployer.deploy_node) and scaling
 # --------------------------------------------------------------------------- #
+@serialized
 def register(
     app_name: str,
     image: str,
@@ -334,11 +352,8 @@ def _wait_ready(rep: Replica) -> bool:
     for _ in range(READY_TRIES):
         try:
             with urllib.request.urlopen(f"http://{rep.upstream}/", timeout=3) as resp:
-                if resp.status < 500:
+                if 200 <= resp.status < 300:
                     return True
-        except urllib.error.HTTPError as e:
-            if e.code < 500:  # 404 on "/" still means the server is up and serving
-                return True
         except Exception as e:  # noqa: BLE001 — not up yet
             log.debug("replica %s not ready: %s", rep.upstream, e)
         time.sleep(READY_INTERVAL)
@@ -357,7 +372,10 @@ def scale_in(app: App, reg: Registry, state: State, reason: str) -> None:
     save_state(state)
 
 
+@serialized
 def scale(app_name: str, n: int) -> App:
+    if n < 1:
+        raise ValueError("replica count must be at least 1")
     reg, state = nodepool.load_registry(), load_state()
     app = state.apps[app_name]
     while len(app.replicas) < n:
@@ -374,6 +392,7 @@ def spread(app_name: str) -> App:
     return scale(app_name, len(providers))
 
 
+@serialized
 def remove(app_name: str) -> None:
     reg, state = nodepool.load_registry(), load_state()
     app = state.apps.pop(app_name, None)
@@ -416,6 +435,7 @@ def sample(app: App, reg: Registry) -> list[tuple[Replica, float | None]]:
     return out
 
 
+@serialized
 def tick(emit=None) -> list[dict]:
     """One monitoring pass. Returns a summary per app (also sent through `emit` for the dashboard)."""
     reg, state = nodepool.load_registry(), load_state()

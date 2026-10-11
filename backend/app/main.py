@@ -49,7 +49,19 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from app import accounts, agents, analyzer, deployer, env_store, fixpr, healer, incident, users, webhooks
+from app import (
+    accounts,
+    agents,
+    analyzer,
+    deployer,
+    env_store,
+    fixpr,
+    healer,
+    incident,
+    job_store,
+    users,
+    webhooks,
+)
 from app import fleet as fleetmod
 from app import nodes as nodepool
 from app.accounts import User
@@ -63,10 +75,11 @@ from app.schemas import (
     EnvRequirement,
     PipelineEvent,
 )
+from app.storage import write_json
 
 load_dotenv()
 
-# Single-process, in-memory demo job registry. Run uvicorn with --workers 1.
+# One API worker; durable checkpoints restore jobs after restart (not command replay).
 MAX_JOBS = 30
 MAX_EVENTS = 1000
 MAX_SOURCE_BYTES = 200 * 1024 * 1024
@@ -144,6 +157,8 @@ class DeployCancelled(Exception):
 
 @dataclass
 class Job:
+    deployment_id: str | None = None
+    app_name: str | None = None
     created_at: float = field(default_factory=time.time)
     state: str = "queued"
     events: deque[PipelineEvent] = field(default_factory=lambda: deque(maxlen=MAX_EVENTS))
@@ -161,6 +176,10 @@ class Job:
     env_ready: threading.Event = field(default_factory=threading.Event)
     target_options: list[str] = field(default_factory=list)  # offered when CloudMorph picks the target
     env_targets: list[str] | None = None
+    live: dict[str, dict] = field(default_factory=dict)
+    target_dirs: dict[str, str] = field(default_factory=dict)
+    retire: list[str] = field(default_factory=list)
+    checkpoint_lock: threading.RLock = field(default_factory=threading.RLock)
 
 
 _jobs: dict[str, Job] = {}
@@ -183,15 +202,118 @@ def _load_projects() -> dict[str, dict]:
 
 def _save_projects() -> None:
     try:
-        PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PROJECTS_FILE.touch(mode=0o600)
-        PROJECTS_FILE.chmod(0o600)  # holds per-project webhook secrets
-        PROJECTS_FILE.write_text(json.dumps(_projects, ensure_ascii=False, indent=2))
+        write_json(PROJECTS_FILE, _projects)
     except OSError:
-        pass  # persistence is best-effort; the in-memory copy is still correct
+        _logger.exception("could not persist projects")
 
 
 _projects: dict[str, dict] = _load_projects()
+
+
+def _job_directory() -> Path:
+    return PROJECTS_FILE.with_name(f"{PROJECTS_FILE.stem}-jobs")
+
+
+def _checkpoint_job(job: Job) -> None:
+    if job.deployment_id is None:
+        return  # ephemeral jobs constructed by callers/tests
+    with job.checkpoint_lock:
+        job_store.save(
+            _job_directory(),
+            job.deployment_id,
+            {
+                "created_at": job.created_at,
+                "state": job.state,
+                "completed": job.completed,
+                "owner": job.owner,
+                "app_name": job.app_name,
+                "error": job.error,
+                "targets": {
+                    t: {"success": r.get("success"), "url": r.get("url")}
+                    for t, r in job.targets.copy().items()
+                },
+                "live": dict(job.live),
+                "target_dirs": dict(job.target_dirs),
+                "retire": list(job.retire),
+            },
+        )
+
+
+def _restore_jobs() -> None:
+    """Restore status/SSE and known resources before the incident watcher starts."""
+    records = job_store.load(_job_directory())
+    recorded = {job_id for job_id, _ in records}
+    for name, project in _projects.items():
+        job_id = project.get("last_deployment_id")
+        if (
+            job_id
+            and job_id not in recorded
+            and project.get("last_status") in ("running", "queued", "waiting_input")
+        ):
+            # Upgrade from the old in-memory registry: do not leave a phantom running job.
+            records.append(
+                (
+                    job_id,
+                    {
+                        "app_name": name,
+                        "owner": project.get("owner", accounts.ADMIN),
+                        "created_at": project.get("updated_at", time.time()),
+                        "state": "running",
+                        "completed": False,
+                        "live": {},
+                        "targets": {t: {"success": None, "url": None} for t in project.get("targets", [])},
+                    },
+                )
+            )
+    for job_id, original in records:
+        if job_id in _jobs:
+            continue
+        saved = job_store.recover(original)
+        job = Job(
+            deployment_id=job_id,
+            app_name=saved["app_name"],
+            owner=saved["owner"],
+            created_at=saved["created_at"],
+            state=saved["state"],
+            completed=True,
+            error=saved.get("error"),
+            targets=saved["targets"],
+            live=saved["live"],
+            target_dirs=saved.get("target_dirs", {}),
+            retire=saved.get("retire", []),
+        )
+        for target, result in job.targets.items():
+            job.events.append(
+                PipelineEvent(
+                    type="done" if result.get("success") else "error",
+                    payload={
+                        "target": target,
+                        "url": result.get("url"),
+                        "message": job.error or "Restored deployment result after restart.",
+                    },
+                )
+            )
+        if job.error:
+            job.events.append(PipelineEvent(type="error", payload={"message": job.error}))
+        _jobs[job_id] = job
+        project = _projects.get(job.app_name)
+        if not original["completed"] and project and project.get("last_deployment_id") == job_id:
+            project.update(
+                last_status=job.state,
+                live={**project.get("live", {}), **job.live},
+                urls={
+                    **project.get("urls", {}),
+                    **{t: r["url"] for t, r in job.targets.items() if r.get("success")},
+                },
+                updated_at=time.time(),
+            )
+        _checkpoint_job(job)
+    _save_projects()
+    # Use the same retention limit as normal launch; recovered jobs are all terminal.
+    for job_id in sorted(_jobs, key=lambda key: _jobs[key].created_at)[:-MAX_JOBS]:
+        if _jobs[job_id].completed:
+            job_store.forget(_job_directory(), job_id)
+            del _jobs[job_id]
 
 
 def _public_project(p: dict) -> dict:
@@ -761,6 +883,8 @@ def _publish(job: Job, event: PipelineEvent | None) -> None:
                     "url": event.payload.get("url") or event.payload.get("final_url"),
                     "detail": event.payload,
                 }
+    if event is None or event.type in ("stage", "input_required", "done", "error"):
+        _checkpoint_job(job)
     for subscriber in list(job.subscribers):
         subscriber.put_nowait(event)
 
@@ -913,6 +1037,10 @@ def create_app() -> FastAPI:
     fleet_events: deque[dict] = deque(maxlen=200)
 
     @app.on_event("startup")
+    async def restore_deployments() -> None:
+        _restore_jobs()
+
+    @app.on_event("startup")
     async def start_fleet_watcher() -> None:
         # Opt-in: CLOUDMORPH_FLEET_WATCH=1 starts the auto scale-out watcher inside the API process.
         if os.getenv("CLOUDMORPH_FLEET_WATCH") == "1" and nodepool.load_registry().nodes:
@@ -1055,14 +1183,26 @@ def create_app() -> FastAPI:
             finished = [key for key, val in _jobs.items() if val.completed]
             if not finished:
                 raise HTTPException(status_code=503, detail="deployment capacity reached")
-            _jobs.pop(min(finished, key=lambda key: _jobs[key].created_at))
+            oldest = min(finished, key=lambda key: _jobs[key].created_at)
+            job_store.forget(_job_directory(), oldest)
+            _jobs.pop(oldest)
 
         deployment_id = uuid.uuid4().hex[:12]
         app_name = name or f"cloudmorph-{deployment_id}"
         existing = _projects.get(app_name)
         if existing is not None and existing.get("owner", accounts.ADMIN) != owner:
             raise HTTPException(status_code=409, detail=f"app name {app_name!r} is used by another user")
-        job = Job(targets={t: {"success": None, "url": None} for t in targets}, owner=owner)
+        job = Job(
+            deployment_id=deployment_id,
+            app_name=app_name,
+            targets={t: {"success": None, "url": None} for t in targets},
+            owner=owner,
+            retire=list(retire or []),
+        )
+        try:
+            _checkpoint_job(job)  # no external work starts if the durable record cannot be written
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail="deployment journal unavailable") from exc
         _jobs[deployment_id] = job
         project = _projects.setdefault(
             app_name, {"name": app_name, "source": source, "ref": ref, "history": [], "owner": owner}
@@ -1079,13 +1219,21 @@ def create_app() -> FastAPI:
         )
         project["history"] = [*project["history"][-19:], deployment_id]
         _save_projects()
-        live: dict[str, dict] = {}  # target -> deployer handles of what this job left serving (for stop)
+        live = job.live  # checkpointed handles keep successful targets stoppable after a restart
         loop = asyncio.get_running_loop()
 
         def emit(event: PipelineEvent) -> None:
             # every stage boundary (analyze, deploy, heal, redeploy — healer's too) is a cancellation point
             if event.type == "stage" and job.cancel.is_set():
                 raise DeployCancelled
+            if event.type in ("done", "error") and (target := event.payload.get("target")):
+                # Durable target result before the worker can remove its source workspace.
+                job.targets[target] = {
+                    "success": event.type == "done",
+                    "url": event.payload.get("url") or event.payload.get("final_url"),
+                    "detail": event.payload,
+                }
+                _checkpoint_job(job)
             loop.call_soon_threadsafe(_publish, job, event)
 
         def execute() -> None:
@@ -1175,6 +1323,8 @@ def create_app() -> FastAPI:
                         target_dir = work_root / f"{app_name}-{target}"
                         try:
                             target_dir = Path(_copy_for_target(source_dir, target_dir))
+                            job.target_dirs[target] = str(target_dir)
+                            _checkpoint_job(job)
                             if (
                                 run_pipeline(
                                     target_dir,
@@ -1189,6 +1339,7 @@ def create_app() -> FastAPI:
                                 and target != "agent"
                             ):  # the agent's container is on the user's PC
                                 live[target] = deployer.last_handles(target_dir)
+                                _checkpoint_job(job)  # before removing a Cloud Run source workspace
                         except DeployCancelled:
                             raise
                         except Exception as exc:  # noqa: BLE001 — isolate target failures
