@@ -4,14 +4,17 @@
 계약은 [`interfaces.md`](interfaces.md) 그대로이고, 코드는 `backend/app/analyzer.py`(정책·Claude 검사관)와
 `backend/app/quick.py`(빠른 분석)에 있다.
 
-## 빠른 분석: 로컬 clef-flash로 1초 안에 서비스를 고른다
+## 빠른 분석: Jev나 로컬 clef-flash로 1초 안에 서비스를 고른다
 
 ```
-전처리 (코드 읽기, 모델 없음)  →  판단 (clef-flash 1회, 1초 안)  →  검사 (clef-flash 1~2회)  →  analyze_with (울타리·정책 그대로)
+전처리 (코드 읽기, 모델 없음)  →  판단 (판정 모델 1회, 1초 안)  →  검사 (판정 모델 1~2회)  →  analyze_with (울타리·정책 그대로)
 ```
 
 - **clef-flash**: Cloudflare가 공개한 9B 판정 모델(Apache-2.0). 글을 만들지 않고, 질문의 선택지마다 확률을 한 번에 매긴다.
   로컬 Ollama(0.35.1 이상)의 `POST /v1/systemone`으로 부른다. TypeSafe의 Jev와 같은 API다.
+- **Jev**: TypeSafe의 호스팅 판정 모델. `TYPESAFE_API_KEY`가 있으면 clef-flash보다 먼저 쓴다 (장애 대응과 같은 순서).
+  호스팅 서비스라 모델에 보내는 코드 줄·Dockerfile 줄의 비밀값은 `systemone.redact()`로 가린다.
+  아래 수치(12/12, 0.45~0.67초)는 clef-flash에서 잰 것이다. Jev는 `JEV_LIVE=1` 실측(맨 아래)으로 따로 확인한다.
 - **전처리**: 저장소를 한 번 훑어 매니페스트·시작 명령 후보·환경변수 이름·신호별 *후보 줄*을 모은다. 패턴에 걸린 줄은 판정이 아니라
   "모델에게 보여 줄 줄"일 뿐이다. 비밀값은 `***`로 가린 뒤 모델에 보낸다. 실측 1~4ms.
 - **판단 (1초 예산)**: 찾은 것만 적은 약 250토큰 요약에 선택형 질문 하나(`serverless_container` / `vm` / `static_site` /
@@ -26,12 +29,15 @@
   - 의심 줄이 해롭다고 판단되면(50% 이상) 분석을 멈춘다. 검사하지 못해도 멈춘다.
 - **Claude 검사관과 다른 점**: 후보 줄이 없는 신호는 "아니오"다. Dockerfile은 템플릿 그대로다 (AI가 고치지 않는다).
   "기타 위험"은 찾지 않는다. 분석 1건이 약 90초에서 0.3~2초로 줄어든다.
-- **고르는 방법** (`ANALYZER_MODE`): `auto`(기본)는 clef-flash가 켜져 있으면 빠른 분석, 아니면 Claude 검사관.
-  빠른 분석이 만들 수 없는 저장소(템플릿 없는 언어 등)는 키가 있으면 Claude 검사관으로 넘어간다. `fast`는 clef-flash만, `full`은 Claude만.
-- **켜기**: `scripts/clef-up.sh` — 내 Ollama는 건드리지 않는다. PATH의 Ollama가 0.35.1보다 낮으면 공식 릴리스를 받아(체크섬 확인)
-  `~/.cache/cloudmorph`에 두고 11436 포트에 따로 띄운다. 모델(약 12GB)을 받고 한 번 불러 둔 뒤 `CLEF_BASE_URL`을 알려 준다.
-  `scripts/demo-up.sh`는 이것을 자동으로 부른다.
-- 실측 확인: `cd backend && CLEF_LIVE=1 uv run pytest tests/analysis/test_quick.py -k live -s` (샘플 앱 4개, 1초 예산을 잰다).
+- **고르는 방법** (`ANALYZER_MODE`): `auto`(기본)는 Jev 키가 있거나 clef-flash가 켜져 있으면 빠른 분석, 아니면 Claude 검사관.
+  빠른 분석이 만들 수 없는 저장소(템플릿 없는 언어 등)나 판정 모델이 멈춘 때는 키가 있으면 Claude 검사관으로 넘어간다.
+  `fast`는 빠른 분석만, `full`은 Claude만.
+- **켜기**: Jev는 `.env`에 `TYPESAFE_API_KEY`만 넣으면 된다. clef-flash는 `scripts/clef-up.sh` — 내 Ollama는 건드리지 않는다.
+  PATH의 Ollama가 0.35.1보다 낮으면 공식 릴리스를 받아(체크섬 확인) `~/.cache/cloudmorph`에 두고 11436 포트에 따로 띄운다.
+  모델(약 12GB)을 받고 한 번 불러 둔 뒤 `CLEF_BASE_URL`을 알려 준다. `scripts/demo-up.sh`는 Jev 키가 없을 때만 이것을 자동으로 부른다.
+- 실측 확인 (샘플 앱 4개의 판단·1초 예산·분석 전체 + 악성 postinstall에서 멈추는지):
+  `cd backend && CLEF_LIVE=1 uv run pytest tests/analysis/test_quick.py -k live -s` (clef-flash),
+  `JEV_LIVE=1`이면 Jev (`TYPESAFE_API_KEY`는 환경변수나 저장소 맨 위 `.env`에서 읽는다).
 
 ## 어떻게 판정하나
 
@@ -93,8 +99,9 @@ AI 검사관 18개 (Claude, 동시에)  →  울타리 (코드)  →  타깃  �
 | `ANALYZER_MODEL` | `claude-haiku-5-5` | 검사관 모델 |
 | `ANALYZER_MAX_LLM_CALLS` | `6` | 서버 전체에서 동시에 도는 검사관 호출 수. 분석이 여러 건 겹치면 나머지는 기다린다 |
 | `ANALYZER_MAX_TURNS` | `15` | 검사관 하나가 파일을 읽으며 주고받는 최대 횟수 |
-| `ANALYZER_MODE` | `auto` | `auto`: clef-flash가 켜져 있으면 빠른 분석 · `fast`: clef-flash만 · `full`: Claude 검사관만 |
-| `CLEF_BASE_URL` | | 로컬 clef-flash (`scripts/clef-up.sh`가 알려 준다, 예: `http://127.0.0.1:11436`). 비우면 빠른 분석을 하지 않는다 |
+| `ANALYZER_MODE` | `auto` | `auto`: Jev나 clef-flash가 있으면 빠른 분석 · `fast`: 빠른 분석만 · `full`: Claude 검사관만 |
+| `TYPESAFE_API_KEY` | | Jev 키. 있으면 빠른 분석을 Jev로 한다 (`JEV_MODEL` 기본 `jev-latest`, `JEV_BASE_URL`) |
+| `CLEF_BASE_URL` | | 로컬 clef-flash (`scripts/clef-up.sh`가 알려 준다, 예: `http://127.0.0.1:11436`). Jev 키도 이것도 없으면 빠른 분석을 하지 않는다 |
 | `CLEF_MODEL` | `clef-flash` | 판정 모델 이름 |
 
 실제 Claude로 확인: `cd backend && ANALYZER_LIVE=1 uv run pytest tests/analysis -k live -s` (키는 저장소 맨 위 `.env`에서 읽는다).
