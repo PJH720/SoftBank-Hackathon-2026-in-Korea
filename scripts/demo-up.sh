@@ -54,7 +54,9 @@ say "backend  -> http://127.0.0.1:$BACKEND_PORT"
 (cd "$ROOT/backend" && nohup uv run uvicorn app.main:app --host 127.0.0.1 --port "$BACKEND_PORT" --workers 1 \
    > "$STATE/backend.log" 2>&1 & echo $! > "$STATE/backend.pid")
 say "frontend -> http://127.0.0.1:$FRONT_PORT"
-(cd "$ROOT/frontend" && VITE_BACKEND_URL="http://127.0.0.1:$BACKEND_PORT" nohup npm run dev -- --host 127.0.0.1 --port "$FRONT_PORT" \
+# env -u: vite.config.js would otherwise put this token on every proxied request, so anyone with the
+# tunnel URL would act as admin without one. The browser sends its own token instead.
+(cd "$ROOT/frontend" && VITE_BACKEND_URL="http://127.0.0.1:$BACKEND_PORT" nohup env -u CLOUDMORPH_API_TOKEN npm run dev -- --host 127.0.0.1 --port "$FRONT_PORT" \
    </dev/null > "$STATE/frontend.log" 2>&1 & echo $! > "$STATE/frontend.pid")
 for i in $(seq 1 30); do curl -sf "http://127.0.0.1:$BACKEND_PORT/health" >/dev/null && break; sleep 1; done
 curl -sf "http://127.0.0.1:$BACKEND_PORT/health" >/dev/null || die "backend did not come up, see $STATE/backend.log"
