@@ -25,6 +25,8 @@ Environment (all optional):
     DEPLOYER_PROBE_PATH=/health  if set, Cloud Run uses an HTTP startup probe on this path (default: TCP)
     DEPLOYER_VERIFY_TIMEOUT=60   seconds to wait for the app to answer
     DEPLOYER_SERVICE_NAME        Cloud Run service name (default: slug of src_dir basename)
+    DEPLOYER_APP_SERVICE_ACCOUNT runtime identity of deployed cloudrun/function apps ("name" -> name@<project>.iam…).
+                                 Unset -> the project's default compute account (Editor!) — set it on any shared server.
 
 CLI (manual testing):
     uv run python -m app.deployer <src_dir> local|cloudrun [--dockerfile PATH] [--no-tunnel] [--service NAME]
@@ -153,6 +155,15 @@ class Config:
     node_exclude: tuple = ()  # node names to skip (used by fleet scale-out)
     database: str | None = "auto"  # "auto": Postgres when the app reads DATABASE_URL; "postgres"; None: never
     cloudsql_instance: str = "cloudmorph-pg"  # Cloud SQL instance (cloudrun target)
+    # Runtime identity of user apps on cloudrun/function. Untrusted code can read its token from the
+    # metadata server, so on a shared server this must be an account with no roles beyond cloudsql.client.
+    app_service_account: str | None = None
+
+    def runtime_account(self) -> str | None:
+        sa = self.app_service_account
+        if sa and "@" not in sa and self.project:
+            return f"{sa}@{self.project}.iam.gserviceaccount.com"
+        return sa
 
     @classmethod
     def from_env(cls) -> Config:
@@ -168,6 +179,7 @@ class Config:
             verify_timeout=int(env.get("DEPLOYER_VERIFY_TIMEOUT", "60")),
             database=env.get("DEPLOYER_DATABASE", "auto") or None,
             cloudsql_instance=env.get("CLOUDSQL_INSTANCE", "cloudmorph-pg"),
+            app_service_account=env.get("DEPLOYER_APP_SERVICE_ACCOUNT") or None,
         )
 
 
@@ -957,6 +969,8 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         cmd.append("--no-traffic")
     if cfg.allow_unauthenticated:
         cmd.append("--allow-unauthenticated")
+    if sa := cfg.runtime_account():
+        cmd += ["--service-account", sa]
     # Probe settings are inherited from the previous revision, so always pass them explicitly.
     if cfg.probe_path:
         cmd.append(
@@ -1340,6 +1354,8 @@ def deploy_function(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
     ]
     if cfg.allow_unauthenticated:
         cmd.append("--allow-unauthenticated")
+    if sa := cfg.runtime_account():
+        cmd += ["--service-account", sa]
     if cfg.env:
         cmd += ["--set-env-vars", "^|^" + "|".join(f"{k}={v}" for k, v in cfg.env.items())]
     cp = r.run("gcloud functions deploy", cmd, timeout=cfg.deploy_timeout, check=False, stage="deploy")

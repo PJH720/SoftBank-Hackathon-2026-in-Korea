@@ -1,0 +1,17 @@
+# Keep user containers away from the GCE metadata server. Apps deployed to the "local" target run in this
+# VM's Docker; without this rule they can fetch the VM service account's token (run/sql/secret/storage admin)
+# from 169.254.169.254. DOCKER-USER only filters forwarded container traffic, so the backend itself is unaffected.
+[Unit]
+Description=CloudMorph: block containers from the GCE metadata server
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -d 169.254.169.254/32 -j REJECT 2>/dev/null || iptables -I DOCKER-USER -d 169.254.169.254/32 -j REJECT'
+ExecStop=-/usr/sbin/iptables -D DOCKER-USER -d 169.254.169.254/32 -j REJECT
+
+[Install]
+WantedBy=multi-user.target docker.service

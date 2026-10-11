@@ -26,8 +26,10 @@ rsync -az --delete "$BUILD/frontend/dist/" "$SERVER:cloudmorph-web/"
 
 say "config"
 scp -q "$BUILD/deploy/server/Caddyfile" "$SERVER:Caddyfile"
-scp -q "$BUILD/deploy/server/cloudmorph-backend.service" "$SERVER:/tmp/cloudmorph-backend.service"
-ssh "$SERVER" "sudo mv /tmp/cloudmorph-backend.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable -q cloudmorph-backend && sudo systemctl restart cloudmorph-backend"
+scp -q "$BUILD/deploy/server/cloudmorph-backend.service" "$BUILD/deploy/server/cloudmorph-egress-guard.service" "$SERVER:/tmp/"
+ssh "$SERVER" "sudo mv /tmp/cloudmorph-backend.service /tmp/cloudmorph-egress-guard.service /etc/systemd/system/ && sudo systemctl daemon-reload \
+  && sudo systemctl enable -q cloudmorph-egress-guard && sudo systemctl restart cloudmorph-egress-guard \
+  && sudo systemctl enable -q cloudmorph-backend && sudo systemctl restart cloudmorph-backend"
 ssh "$SERVER" "docker rm -f cloudmorph-caddy >/dev/null 2>&1; docker run -d --name cloudmorph-caddy --restart unless-stopped --network host \
   -e CLOUDMORPH_DOMAIN='$DOMAIN' -v \$HOME/Caddyfile:/etc/caddy/Caddyfile:ro -v \$HOME/cloudmorph-web:/srv:ro \
   -v cloudmorph_caddy_data:/data -v cloudmorph_caddy_config:/config caddy:2 >/dev/null"
